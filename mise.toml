@@ -1,0 +1,68 @@
+min_version = "2026.1.0"
+
+[settings]
+lockfile = true
+# Rust remains declared only in rust-toolchain.toml. mise reads it to preserve
+# one-command bootstrapping without creating another source of truth.
+idiomatic_version_file_enable_tools = ["rust"]
+
+[tools]
+cargo-binstall = "1.21.1"
+"cargo:cargo-llvm-cov" = "0.9.0"
+"aqua:EmbarkStudios/cargo-deny" = "0.20.2"
+"aqua:crate-ci/committed" = "1.1.11"
+taplo = "0.10.0"
+
+[env]
+# Enable backtraces so a panic is diagnosable on the first run.
+#
+# Warning denial belongs to the `lint` task. CI denies warnings, but exploratory
+# local commands do not; setting `RUSTFLAGS = "-D warnings"` here would violate
+# docs/operations.md section 12.2.
+RUST_BACKTRACE = "1"
+
+[tasks.fmt]
+description = "Format Rust and TOML"
+run = ["cargo fmt --all", "taplo fmt"]
+
+[tasks."fmt:check"]
+description = "Check formatting without changing files"
+run = ["cargo fmt --all --check", "taplo fmt --check"]
+
+[tasks.check]
+description = "Check all workspace targets"
+run = "cargo check --workspace --all-targets"
+
+[tasks.lint]
+description = "Run Clippy with warnings denied"
+run = "cargo clippy --workspace --all-targets --all-features -- -D warnings"
+
+[tasks.test]
+description = "Run tests that do not require Docker"
+run = "cargo test --workspace"
+
+[tasks."test:docker"]
+description = "Run integration tests against real containers"
+run = "cargo test -p warden-tracer --features docker -- --nocapture"
+
+[tasks.coverage]
+description = "Generate line and region coverage as HTML and a terminal summary"
+run = [
+  "cargo llvm-cov --workspace --no-report",
+  "cargo llvm-cov report --html --output-dir coverage",
+  "cargo llvm-cov report --summary-only",
+]
+
+[tasks.deny]
+description = "Check advisories, licenses, sources, and bans across the workspace"
+# `--workspace` must precede the subcommand. Without it, cargo-deny 0.20 checks only
+# the nearly empty root package graph and misses SQLx, rmcp, and their dependencies.
+run = "cargo deny --workspace check"
+
+[tasks.msrv]
+description = "Verify that the workspace compiles on the declared MSRV"
+run = "cargo +1.94.0 check --workspace --all-targets"
+
+[tasks.ci]
+description = "Run the complete CI-equivalent gate"
+depends = ["fmt:check", "check", "lint", "test", "deny"]

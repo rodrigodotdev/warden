@@ -1,0 +1,23 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# Coverage
+/coverage/
+*.profraw
+*.profdata
+
+# Secrets and local environment—never commit a DSN
+.env
+.env.*
+!.env.example
+/secrets/
+
+# Editors
+.idea/
+.vscode/
+*.swp
+
+# Operating systems
+.DS_Store
+Thumbs.db

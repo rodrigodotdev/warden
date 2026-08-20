@@ -1,0 +1,22 @@
+# committed.toml — Conventional Commits
+style = "conventional"
+allowed_types = [
+  "feat",
+  "fix",
+  "docs",
+  "test",
+  "refactor",
+  "perf",
+  "build",
+  "ci",
+  "chore",
+  "revert",
+]
+# Descriptive subjects may use up to 72 characters while remaining readable in an
+# 80-column `git log --oneline`. Verified with committed 1.1.11.
+subject_length = 72
+line_length = 80
+subject_capitalized = false
+subject_not_punctuated = true
+imperative_subject = false
+merge_commit = false

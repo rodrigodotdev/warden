@@ -1,0 +1,21 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      # A sqlparser update requires the complete corpus and review of new AST
+      # variants (docs/testing.md section 3.3), so it remains isolated.
+      parser:
+        patterns: ["sqlparser"]
+      patch:
+        update-types: ["patch"]
+
+  # Actions are pinned to commit SHAs. Dependabot updates both the SHA and version
+  # comment.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
