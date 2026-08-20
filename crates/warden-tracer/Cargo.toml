@@ -35,3 +35,13 @@ tokio = { workspace = true, features = [
 [[test]]
 name = "mcp_stdio"
 path = "tests/mcp_stdio.rs"
+
+[[test]]
+name = "postgres"
+path = "tests/postgres.rs"
+required-features = ["docker"]
+
+[[test]]
+name = "mysql"
+path = "tests/mysql.rs"
+required-features = ["docker"]
