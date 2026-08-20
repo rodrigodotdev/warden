@@ -1,0 +1,138 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+  # mise rejects untrusted configuration; the checked-out repository is trusted here.
+  MISE_TRUSTED_CONFIG_PATHS: ${{ github.workspace }}
+
+# Third-party actions are pinned to commit SHAs, not mutable tags. This is an
+# OpenSSF Scorecard requirement and a minimum safeguard for a security product.
+# Dependabot keeps the SHAs current.
+jobs:
+  gate:
+    name: fmt · check · lint · test · deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Do not persist GITHUB_TOKEN in .git/config, where later steps or
+          # dependency build scripts could read it.
+          persist-credentials: false
+
+      - name: Install tools from mise.lock
+        uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
+        with:
+          version: 2026.8.8
+          install: true
+          install_args: taplo aqua:EmbarkStudios/cargo-deny
+          cache: true
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: gate
+
+      # Keep commands explicit: mise provisions auxiliary tools without redefining
+      # the documented Cargo gate semantics.
+      - run: cargo fmt --all --check
+      - run: taplo fmt --check
+      - run: cargo check --workspace --all-targets
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace
+      - run: cargo deny --workspace check
+
+  docker:
+    name: container integration
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: docker
+
+      - name: Integration tests (Testcontainers)
+        run: cargo test -p warden-tracer --features docker -- --nocapture
+        timeout-minutes: 20
+
+  msrv:
+    name: MSRV 1.94
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # A minimal profile is sufficient because this job only runs `cargo check`.
+      - name: Install the MSRV toolchain
+        run: rustup toolchain install 1.94.0 --profile minimal --no-self-update
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: msrv
+
+      # `rust-version = "1.94"` is a compatibility promise. This job catches the
+      # first accidental use of a newer language or library feature.
+      - run: cargo +1.94.0 check --workspace --all-targets
+
+  commits:
+    name: commit convention
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
+        with:
+          version: 2026.8.8
+          install: true
+          install_args: aqua:crate-ci/committed
+          cache: true
+
+      - run: committed ${{ github.event.pull_request.base.sha }}..HEAD
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
+        with:
+          version: 2026.8.8
+          install: true
+          install_args: cargo:cargo-llvm-cov
+          cache: true
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: coverage
+
+      # No numeric gate yet: with only a few hundred lines, a threshold measures
+      # noise. The report makes security-rule coverage visible from the start; add
+      # the gate once the policy engine exists in Milestone 2.
+      - run: cargo llvm-cov --workspace --no-report
+      - run: cargo llvm-cov report --html --output-dir coverage
+      - run: cargo llvm-cov report --summary-only
