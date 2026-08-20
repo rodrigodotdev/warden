@@ -1,0 +1,37 @@
+[package]
+name = "warden-tracer"
+version = "0.0.0"
+description = "Disposable M0.5 tracer bullet to remove after M12"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Enables tests that require an accessible Docker daemon.
+docker = []
+
+[dependencies]
+rmcp = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "io-std"] }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+sqlx = { workspace = true }
+testcontainers-modules = { workspace = true }
+tokio = { workspace = true, features = [
+  "rt-multi-thread",
+  "macros",
+  "process",
+  "time",
+  "io-util",
+] }
+
+[[test]]
+name = "mcp_stdio"
+path = "tests/mcp_stdio.rs"
