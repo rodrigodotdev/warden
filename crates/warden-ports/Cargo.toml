@@ -1,0 +1,14 @@
+[package]
+name = "warden-ports"
+version = "0.1.0"
+description = "Capability traits for analysis, execution, inspection, explain, audit, and registry"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]

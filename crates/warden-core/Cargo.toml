@@ -1,0 +1,14 @@
+[package]
+name = "warden-core"
+version = "0.1.0"
+description = "Warden domain types for dialects, connections, queries, results, schemas, and errors"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]

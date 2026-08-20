@@ -1,0 +1,14 @@
+[package]
+name = "warden-postgres"
+version = "0.1.0"
+description = "PostgreSQL adapter for analysis, execution, inspection, explain, normalization, and connections"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]

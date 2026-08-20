@@ -1,0 +1,122 @@
+[workspace]
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.94"
+authors = ["Rodrigo <rodrigodotdev@proton.me>"]
+repository = "https://github.com/rodrigodotdev/warden"
+publish = false
+
+[workspace.dependencies]
+# Internal crates
+warden-core = { path = "crates/warden-core" }
+warden-policy = { path = "crates/warden-policy" }
+warden-ports = { path = "crates/warden-ports" }
+warden-mysql = { path = "crates/warden-mysql" }
+warden-postgres = { path = "crates/warden-postgres" }
+warden-service = { path = "crates/warden-service" }
+warden-mcp = { path = "crates/warden-mcp" }
+warden-config = { path = "crates/warden-config" }
+
+# Runtime
+tokio = { version = "1.53", default-features = false }
+tokio-util = { version = "0.7", default-features = false }
+
+# Database — docs/operations.md section 2.2.
+# SQLx 0.9 defaults enable `any`/`AnyPool` and the DDL migration executor,
+# contradicting ADR-0005 and the read-only design. Disabling `any` turns the
+# AnyPool prohibition into a compile-time rule. `bigdecimal` preserves large
+# NUMERIC values that the 96-bit `rust_decimal` would truncate.
+sqlx = { version = "0.9.0", default-features = false, features = [
+  "runtime-tokio",
+  "tls-rustls-ring-webpki",
+  "mysql",
+  "postgres",
+  "json",
+  "time",
+  "uuid",
+  "bigdecimal",
+] }
+
+# MCP — docs/operations.md section 2.3.
+# rmcp 3.1.3 defaults include `base64`, but it gates only image/blob helpers in
+# `model/prompt.rs`; Warden exposes tools, not MCP prompts. `server` already implies
+# `schemars` and `transport-async-rw`; listing `schemars` is redundant but explicit.
+#
+# `transport-streamable-http-server` is deferred to Milestone 14. So is `auth`,
+# whose manifest pulls in `dep:async-trait`, banned by `deny.toml` under ADR-0013
+# except through the `testcontainers`/`tonic` wrappers. Enabling `auth` requires an
+# explicit ADR-0013 decision, not merely another feature name.
+rmcp = { version = "3.1.3", default-features = false, features = [
+  "server",
+  "macros",
+  "schemars",
+  "transport-io",
+] }
+
+# Parser — docs/operations.md section 2.4. Keep the default `recursive-protection`
+# feature to prevent stack overflow on deeply nested SQL.
+sqlparser = { version = "0.62.0" }
+
+# Serialization and errors
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "1.1"
+thiserror = "2.0"
+anyhow = "1.0"
+
+# Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Secrets and types
+secrecy = "0.10"
+time = { version = "0.3", features = ["formatting", "parsing"] }
+uuid = { version = "1.24", features = ["v4"] }
+bigdecimal = "0.4"
+base64 = "0.23"
+
+# Tests. Depend only on `testcontainers-modules`, which re-exports `testcontainers`.
+# A direct dependency would select incompatible 0.28 and compile two copies whose
+# types do not unify.
+testcontainers-modules = { version = "0.15", features = ["postgres", "mysql"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unreachable_pub = "warn"
+missing_debug_implementations = "warn"
+
+[workspace.lints.clippy]
+print_stdout = "deny"
+print_stderr = "allow"
+unwrap_used = "deny"
+expect_used = "deny"
+dbg_macro = "deny"
+todo = "deny"
+unimplemented = "deny"
+disallowed_methods = "deny"
+
+[package]
+name = "warden"
+version = "0.1.0"
+description = "Secure, read-only, auditable query gateway for AI agents"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+serde_json = { workspace = true }
+toml = { workspace = true }
+
+# Per-task panic containment depends on unwinding; see docs/security.md section 14.
+[profile.release]
+panic = "unwind"

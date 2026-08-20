@@ -1,0 +1,14 @@
+[package]
+name = "warden-config"
+version = "0.1.0"
+description = "Configuration model, loading, validation, and secrets"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]

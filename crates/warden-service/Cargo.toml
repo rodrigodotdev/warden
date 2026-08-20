@@ -1,0 +1,14 @@
+[package]
+name = "warden-service"
+version = "0.1.0"
+description = "Application services for queries, schemas, explain, registry, limits, and redaction"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]

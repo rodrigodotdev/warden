@@ -1,0 +1,4 @@
+# `sqlx::raw_sql` accepts multiple statements, violating SPEC section 6, invariant 2.
+disallowed-methods = [
+  { path = "sqlx::raw_sql", reason = "multi-statement API; use sqlx::query with binds (SPEC section 6, invariant 2)" },
+]
