@@ -7,7 +7,7 @@ use warden_core::connection::ConnectionMetadata;
 use warden_core::context::RequestContext;
 use warden_core::limits::ExecutionLimits;
 
-use crate::decision::{DenyReason, PolicyDecision, PolicyRejection};
+use crate::decision::{DenyCode, DenyReason, PolicyDecision, PolicyRejection};
 use crate::input::{PolicyContext, PolicyInput};
 use crate::policy::{ObjectAccessPolicy, Policy};
 use crate::settings::PolicySettings;
@@ -103,6 +103,14 @@ impl PolicyEngine {
     /// The caller needs the statement kind and the fingerprint for the audit attempt
     /// on both paths, so read them from the `AnalyzedQuery` before calling: this
     /// method takes ownership.
+    ///
+    /// This is also the only place that can compare the request's own
+    /// `warden_core::connection::ConnectionName` against `connection.name`: a
+    /// `Policy` never sees the request (`crate::input`), so only `authorize` holds
+    /// both halves of "this evidence describes the connection it is about to run
+    /// against" (`crate::policies::analysis_integrity`). A mismatch is appended to
+    /// the same aggregate `evaluate` produced rather than returned early, so it
+    /// joins other denials instead of pre-empting them (ADR-0012).
     pub fn authorize(
         &self,
         context: &RequestContext,
@@ -110,7 +118,23 @@ impl PolicyEngine {
         query: AnalyzedQuery,
         limits: ExecutionLimits,
     ) -> Result<AuthorizedQuery, PolicyRejection> {
-        let reasons = self.evaluate(context, connection, query.analysis(), limits);
+        let mut reasons = self.evaluate(context, connection, query.analysis(), limits);
+        if query.connection() != &connection.name {
+            let mut reason = DenyReason::with_detail(
+                // The residual code: a connection mismatch means nothing the
+                // policies concluded can be trusted, since they evaluated the wrong
+                // connection's rules against this evidence.
+                DenyCode::UnknownConstruct,
+                format!(
+                    "analysis targets connection {} but authorization is against \
+                     connection {}",
+                    query.connection(),
+                    connection.name
+                ),
+            );
+            reason.attribute("connection_identity");
+            reasons.push(reason);
+        }
         if let Some(rejection) = PolicyRejection::new(reasons) {
             return Err(rejection);
         }
@@ -195,6 +219,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use warden_core::dialect::Dialect;
+    use warden_core::query::{InputLimits, QueryRequest};
 
     use super::*;
     use crate::decision::DenyCode;
@@ -209,6 +234,94 @@ mod tests {
         let connection = testing::connection(Dialect::MySql);
         let analyzed = testing::analyzed(testing::analysis(Dialect::MySql));
         engine.authorize(&context, &connection, analyzed, ExecutionLimits::default())
+    }
+
+    /// An `AnalyzedQuery` built for `staging-db`, paired with a `connection`
+    /// resolved for `production-db` (`testing::connection`'s fixed name). Same
+    /// dialect on both sides, so `AnalysisIntegrityPolicy` sees nothing wrong: only
+    /// the connection-name comparison in `authorize` can catch this.
+    fn mismatched_connection_query(
+        dialect: Dialect,
+    ) -> (RequestContext, ConnectionMetadata, AnalyzedQuery) {
+        let context = testing::request_context();
+        let connection = testing::connection(dialect);
+        let request = QueryRequest::new(
+            "staging-db".parse().unwrap(),
+            "SELECT id FROM orders".to_owned(),
+            Vec::new(),
+            &InputLimits::default(),
+        )
+        .unwrap();
+        let query = AnalyzedQuery::new(request, testing::analysis(dialect));
+        (context, connection, query)
+    }
+
+    #[test]
+    fn a_same_dialect_different_connection_query_is_denied() {
+        let engine = engine(vec![Box::new(AlwaysAllow("harmless"))]);
+        let (context, connection, query) = mismatched_connection_query(Dialect::MySql);
+
+        let rejection = engine
+            .authorize(&context, &connection, query, ExecutionLimits::default())
+            .unwrap_err();
+
+        assert_eq!(rejection.primary_code(), DenyCode::UnknownConstruct);
+    }
+
+    #[test]
+    fn the_mismatch_detail_names_both_connections_and_the_message_names_neither() {
+        let engine = engine(vec![Box::new(AlwaysAllow("harmless"))]);
+        let (context, connection, query) = mismatched_connection_query(Dialect::MySql);
+
+        let rejection = engine
+            .authorize(&context, &connection, query, ExecutionLimits::default())
+            .unwrap_err();
+
+        let detail = rejection.reasons()[0]
+            .internal_detail()
+            .expect("a connection mismatch must carry detail");
+        assert!(detail.contains("staging-db"), "{detail}");
+        assert!(detail.contains("production-db"), "{detail}");
+
+        for text in [rejection.public_message(), &rejection.to_string()] {
+            assert!(!text.contains("staging-db"), "{text}");
+            assert!(!text.contains("production-db"), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_matching_connection_still_authorizes() {
+        // Guards against over-denying: the comparison must not fire when the
+        // request's connection genuinely is the one the caller resolved.
+        let engine = engine(vec![Box::new(AlwaysAllow("harmless"))]);
+        assert!(authorize(&engine).is_ok());
+    }
+
+    #[test]
+    fn the_mismatch_is_aggregated_with_other_denials_not_short_circuited() {
+        let engine = engine(vec![Box::new(AlwaysDeny(
+            "locking_read",
+            DenyCode::LockingRead,
+        ))]);
+        let (context, connection, query) = mismatched_connection_query(Dialect::MySql);
+
+        let rejection = engine
+            .authorize(&context, &connection, query, ExecutionLimits::default())
+            .unwrap_err();
+
+        assert_eq!(rejection.reasons().len(), 2);
+        assert!(
+            rejection
+                .reasons()
+                .iter()
+                .any(|reason| reason.code() == DenyCode::LockingRead)
+        );
+        assert!(
+            rejection
+                .reasons()
+                .iter()
+                .any(|reason| reason.code() == DenyCode::UnknownConstruct)
+        );
     }
 
     #[test]

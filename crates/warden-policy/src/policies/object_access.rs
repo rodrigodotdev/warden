@@ -181,6 +181,14 @@ impl ObjectAccessPolicy for SchemaAllowListPolicy {
 /// So `deny = ["app.secrets"]` still stops `SELECT * FROM secrets`, and
 /// `allow = ["app.orders"]` does not accept a bare `orders` it cannot prove is the
 /// same table. Both sides err toward denial (ADR-0011).
+///
+/// The asymmetry above is about the *object* side of the comparison — whether the
+/// query's reference is qualified. The *rule* side is symmetric and deliberately
+/// broad in the other direction: an **unqualified** rule, `allow = ["orders"]` or
+/// `deny = ["secrets"]`, has no qualifier to compare, so it matches that table name
+/// in every schema (`internal.orders`, `staging.orders`, ...), not just an
+/// unqualified reference. Write `allow = ["app.orders"]` to restrict a rule to one
+/// schema.
 #[derive(Debug, Clone)]
 pub struct TableAllowDenyPolicy {
     allow: Option<Vec<ObjectRule>>,

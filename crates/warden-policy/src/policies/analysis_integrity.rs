@@ -1,4 +1,11 @@
 //! The evidence must describe the connection it is evaluated against.
+//!
+//! That property has two halves. This file is the dialect half. The connection-name
+//! half — the evidence must also target the same *named* connection, not merely one
+//! with the same dialect — lives in `PolicyEngine::authorize`, because a `Policy`
+//! never sees the request that carries the connection name
+//! (`crate::input::PolicyInput` deliberately withholds it) and the engine is the one
+//! place holding both.
 
 use crate::decision::{DenyCode, DenyReason, PolicyDecision};
 use crate::input::PolicyInput;
@@ -13,6 +20,11 @@ use crate::policy::Policy;
 /// and the cost of checking is one comparison. A mismatch means the evidence
 /// describes some other engine's grammar, so nothing else the policies concluded can
 /// be trusted.
+///
+/// This is only the dialect half of connection-identity checking. Two distinct
+/// connections that share a dialect — the common case, two PostgreSQL databases with
+/// different allowlists — cannot be told apart from here, because `PolicyInput`
+/// carries no connection name. `PolicyEngine::authorize` closes that gap directly.
 #[derive(Debug, Clone, Copy)]
 pub struct AnalysisIntegrityPolicy;
 

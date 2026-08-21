@@ -20,6 +20,19 @@ use crate::settings::Relaxations;
 ///
 /// This overlaps [`super::LockingReadPolicy`], [`super::SessionMutationPolicy`],
 /// [`super::FunctionSafetyPolicy`], and the two statement-shape policies on purpose.
+///
+/// **A relaxation tradeoff worth naming.** The "relaxed flag does not resurface as
+/// an unexplained side effect" rule (see `evaluate`) treats *any* reported risk flag
+/// as sufficient explanation for `has_side_effects`, regardless of which flag it was.
+/// For `RiskFlag::LockingRead` that is airtight: the lock the flag names *is* the
+/// side effect the analyzer saw. For `RiskFlag::UserDefinedFunction` it is weaker —
+/// `allow_unknown_functions` could relax a call to a function whose side effect is
+/// unrelated to the one `has_side_effects` flags, and the combination would still
+/// pass. This is deliberate, not incidental: no Milestone 2 analyzer exists to
+/// produce that shape (there is no analyzer at all yet), so it is unreachable today.
+/// It becomes reachable once the M4/M5 analyzers can set both fields on the same
+/// statement, and revisiting it is a decision for whichever milestone first produces
+/// that combination, not a silent gap.
 #[derive(Debug, Clone, Copy)]
 pub struct RiskEvidencePolicy {
     relaxations: Relaxations,
@@ -82,10 +95,13 @@ impl Policy for RiskEvidencePolicy {
 
         // An adapter that reports a side effect it could not name has told us the
         // most important thing it knows: something happens that Warden cannot
-        // describe. The condition is narrow on purpose — if any flag exists, the
-        // side effect is explained, and relaxing a flag must not resurface here as
-        // an unexplained one.
-        if violations.is_empty() && analysis.risks().is_empty() && analysis.has_side_effects() {
+        // describe. The condition is narrow on purpose — if any risk flag was
+        // reported at all, the side effect is explained (even one relaxed away),
+        // and relaxing a flag must not resurface here as an unexplained one. Only
+        // `risks().is_empty()` is checked: it is stricter than "no violation
+        // survived relaxation" and implies it, since `violations` is filtered from
+        // `risks`.
+        if analysis.risks().is_empty() && analysis.has_side_effects() {
             violations.push((DenyCode::UnknownConstruct, "unnamed side effect"));
         }
 

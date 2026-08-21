@@ -112,6 +112,16 @@ but public material does not present it as a security boundary.
   - MySQL: compare case-insensitively by default and document the dependency on
     `lower_case_table_names`.
   Without this rule, policy has silent false negatives.
+
+  **Current state (Milestone 2).** `warden_core::analysis::ObjectRef` does not yet
+  record whether a name was quoted, so the quoted/unquoted split above cannot be
+  implemented until an analyzer produces that bit. `folding.rs` compares both
+  dialects ASCII-case-insensitively behind a function that matches `Dialect`
+  exhaustively, so a quoted PostgreSQL `"Users"` currently matches a rule spelled
+  `users`. This is acceptable in the interim because the allowlist is not the
+  read-scope boundary — the dedicated role's `GRANT SELECT` is (ADR-0023) — and it
+  is tracked as parser-dependent work for the M4/M5 analyzers (`docs/milestones.md`),
+  which is where the quoted/unquoted rule above lands.
 - **CTE names and subquery aliases are not `ObjectRef`.** The analyzer must distinguish
   `WITH x AS (SELECT * FROM secrets) SELECT * FROM x`; `secrets` is the relation, and
   `x` is not an object.
@@ -148,7 +158,7 @@ pub enum PolicyDecision {
     Deny(DenyReason),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize)]
 pub enum DenyCode {
     MultipleStatements,
     ParserRecursionLimit,
