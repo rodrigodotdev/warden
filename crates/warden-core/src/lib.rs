@@ -43,5 +43,7 @@ pub mod connection;
 pub mod context;
 pub mod dialect;
 pub mod error;
+pub mod parameter;
+pub mod query;
 
 pub use identifier::{IdentifierError, IdentifierViolation};

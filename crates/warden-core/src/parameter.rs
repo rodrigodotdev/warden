@@ -1,0 +1,218 @@
+//! Values bound to placeholders in agent SQL.
+//!
+//! The set is deliberately small for v0.1 (`docs/data-model.md` section 3).
+//! PostgreSQL callers cast explicitly, as in `WHERE id = $1::uuid`. Warden does not
+//! infer complex SQL types from arbitrary strings.
+
+use std::fmt;
+
+use serde::de::{self, Deserialize, Deserializer, Visitor};
+
+use crate::MAX_EXACT_JSON_INTEGER;
+
+/// A supplied value that cannot be bound without losing information.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ParameterError {
+    /// The number was NaN or an infinity.
+    #[error("parameter is not a finite number")]
+    NotFinite,
+    /// The number reached Warden as a float whose integral value is at least 2^53.
+    #[error(
+        "parameter is an integer of magnitude 2^53 or greater and cannot be bound \
+         exactly; pass it as a string and cast it in SQL"
+    )]
+    InexactInteger,
+}
+
+impl crate::error::PublicError for ParameterError {
+    fn public_code(&self) -> crate::error::PublicErrorCode {
+        // The request could not be turned into an executable statement. There is no
+        // separate parameter code in `docs/security.md` section 10, and inventing
+        // one would widen a user-facing contract outside its own milestone.
+        crate::error::PublicErrorCode::QueryParseError
+    }
+}
+
+/// One bound parameter.
+///
+/// Deliberately does **not** implement `Serialize`. Parameters are not audited or
+/// logged by default (SPEC section 6, invariant 23), and the simplest way to keep
+/// that true is to make serializing one impossible.
+#[derive(Clone, PartialEq)]
+pub enum ParameterValue {
+    /// SQL `NULL`.
+    Null,
+    /// Boolean.
+    Bool(bool),
+    /// Signed 64-bit integer.
+    I64(i64),
+    /// Unsigned 64-bit integer.
+    U64(u64),
+    /// Finite double-precision float.
+    F64(f64),
+    /// UTF-8 text.
+    String(String),
+}
+
+impl ParameterValue {
+    /// Builds a float parameter, rejecting values JSON cannot carry exactly.
+    ///
+    /// `serde_json` discards the literal text of a number, so an integer larger
+    /// than `u64::MAX` is indistinguishable from a float once parsed. Rejecting the
+    /// whole integral range at or above 2^53 is conservative and keeps the promise
+    /// in `docs/data-model.md` section 3.1 that Warden never silently wraps or
+    /// truncates a value.
+    pub fn float(value: f64) -> Result<Self, ParameterError> {
+        if !value.is_finite() {
+            return Err(ParameterError::NotFinite);
+        }
+        if value.fract() == 0.0 && value.abs() >= MAX_EXACT_JSON_INTEGER as f64 {
+            return Err(ParameterError::InexactInteger);
+        }
+        Ok(Self::F64(value))
+    }
+}
+
+/// Prints shape, never content: a parameter can hold an email address, a token, or
+/// a private message (`docs/security.md` section 11.3).
+impl fmt::Debug for ParameterValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Null => f.write_str("Null"),
+            Self::Bool(_) => f.write_str("Bool(<redacted>)"),
+            Self::I64(_) => f.write_str("I64(<redacted>)"),
+            Self::U64(_) => f.write_str("U64(<redacted>)"),
+            Self::F64(_) => f.write_str("F64(<redacted>)"),
+            Self::String(value) => write!(f, "String(<redacted {} bytes>)", value.len()),
+        }
+    }
+}
+
+struct ParameterValueVisitor;
+
+impl Visitor<'_> for ParameterValueVisitor {
+    type Value = ParameterValue;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("null, a boolean, a finite number, or a string")
+    }
+
+    fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(ParameterValue::Null)
+    }
+
+    fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+        Ok(ParameterValue::Null)
+    }
+
+    fn visit_bool<E: de::Error>(self, value: bool) -> Result<Self::Value, E> {
+        Ok(ParameterValue::Bool(value))
+    }
+
+    fn visit_i64<E: de::Error>(self, value: i64) -> Result<Self::Value, E> {
+        Ok(ParameterValue::I64(value))
+    }
+
+    fn visit_u64<E: de::Error>(self, value: u64) -> Result<Self::Value, E> {
+        Ok(ParameterValue::U64(value))
+    }
+
+    fn visit_f64<E: de::Error>(self, value: f64) -> Result<Self::Value, E> {
+        ParameterValue::float(value).map_err(de::Error::custom)
+    }
+
+    fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
+        Ok(ParameterValue::String(value.to_owned()))
+    }
+
+    fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
+        Ok(ParameterValue::String(value))
+    }
+}
+
+impl<'de> Deserialize<'de> for ParameterValue {
+    /// A hand-written visitor, not `#[serde(untagged)]`: the visitor sees the JSON
+    /// number's arm directly, which is what makes rejecting an inexact integer
+    /// possible at all.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_any(ParameterValueVisitor)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    #[test]
+    fn accepts_the_v01_value_set() {
+        let values: Vec<ParameterValue> =
+            serde_json::from_str(r#"[null, true, -7, 42, 1.5, "customer_123"]"#).unwrap();
+        assert_eq!(
+            values,
+            vec![
+                ParameterValue::Null,
+                ParameterValue::Bool(true),
+                ParameterValue::I64(-7),
+                ParameterValue::U64(42),
+                ParameterValue::F64(1.5),
+                ParameterValue::String("customer_123".to_owned()),
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_integers_that_json_cannot_carry_exactly() {
+        // `serde_json` parses this as an f64 because it exceeds u64::MAX, which is
+        // exactly the silent-truncation path this rule exists to close.
+        let error = serde_json::from_str::<ParameterValue>("18446744073709551616")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("2^53"), "{error}");
+    }
+
+    #[test]
+    fn accepts_the_largest_exact_integers() {
+        assert_eq!(
+            serde_json::from_str::<ParameterValue>("18446744073709551615").unwrap(),
+            ParameterValue::U64(u64::MAX)
+        );
+        assert_eq!(
+            serde_json::from_str::<ParameterValue>("-9223372036854775808").unwrap(),
+            ParameterValue::I64(i64::MIN)
+        );
+    }
+
+    #[test]
+    fn rejects_out_of_range_and_non_finite_numbers() {
+        // serde_json itself rejects this one before the visitor sees it.
+        assert!(serde_json::from_str::<ParameterValue>("1e400").is_err());
+        assert_eq!(
+            ParameterValue::float(f64::NAN),
+            Err(ParameterError::NotFinite)
+        );
+        assert_eq!(
+            ParameterValue::float(f64::INFINITY),
+            Err(ParameterError::NotFinite)
+        );
+        assert_eq!(
+            ParameterValue::float(1.5).unwrap(),
+            ParameterValue::F64(1.5)
+        );
+    }
+
+    #[test]
+    fn rejects_composite_json() {
+        assert!(serde_json::from_str::<ParameterValue>(r#"{"a":1}"#).is_err());
+        assert!(serde_json::from_str::<ParameterValue>("[1]").is_err());
+    }
+
+    #[test]
+    fn debug_never_prints_a_value() {
+        let rendered = format!("{:?}", ParameterValue::String("hunter2".to_owned()));
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        assert_eq!(rendered, "String(<redacted 7 bytes>)");
+        assert_eq!(format!("{:?}", ParameterValue::I64(42)), "I64(<redacted>)");
+    }
+}
