@@ -87,6 +87,10 @@ testcontainers-modules = { version = "0.15", features = ["postgres", "mysql"] }
 unsafe_code = "forbid"
 unreachable_pub = "warn"
 missing_debug_implementations = "warn"
+# An auditable security gateway documents its public surface. CI denies warnings,
+# so this makes an undocumented public item a build failure — including in test
+# files, which need a `//!` header.
+missing_docs = "warn"
 
 [workspace.lints.clippy]
 print_stdout = "deny"

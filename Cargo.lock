@@ -2945,6 +2945,12 @@ version = "0.1.0"
 [[package]]
 name = "warden-core"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror",
+ "toml",
+]
 
 [[package]]
 name = "warden-mcp"
