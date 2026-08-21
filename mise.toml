@@ -54,8 +54,8 @@ run = "cargo doc --workspace --no-deps --document-private-items"
 description = "Generate line and region coverage as HTML and a terminal summary"
 run = [
   "cargo llvm-cov --workspace --no-report",
-  "cargo llvm-cov report --html --output-dir coverage",
-  "cargo llvm-cov report --summary-only",
+  "cargo llvm-cov report --workspace --html --output-dir coverage",
+  "cargo llvm-cov report --workspace --summary-only --fail-under-lines 95",
 ]
 
 [tasks.deny]

@@ -41,6 +41,11 @@ ignore = true
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Internal workspace crates are versionless path dependencies by design
+# (`{ workspace = true }`); the wildcard ban exists to catch an unpinned *external*
+# crate, which would still float onto whatever crates.io publishes next. This does
+# not relax that check for third-party crates.
+allow-wildcard-paths = true
 highlight = "all"
 
 deny = [

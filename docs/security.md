@@ -123,6 +123,7 @@ but public material does not present it as a security boundary.
 
 ```rust
 pub trait ObjectAccessPolicy: Send + Sync {
+    fn name(&self) -> &'static str;
     fn check(&self, object: &ObjectRef, ctx: &PolicyContext) -> PolicyDecision;
 }
 ```
@@ -147,23 +148,26 @@ pub enum PolicyDecision {
     Deny(DenyReason),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DenyCode {
     MultipleStatements,
+    ParserRecursionLimit,
     WriteStatement,
     NestedWrite,
     Ddl,
-    LockingRead,
+    StatementNotAllowed,
+    SessionMutation,
+    ObjectNotAllowed,
     DangerousFunction,
     UnknownFunction,
-    SessionMutation,
+    LockingRead,
     UnknownConstruct,
-    ObjectNotAllowed,
-    ParserRecursionLimit,
 }
 
 pub struct DenyReason {
     code: DenyCode,
+    /// Which policy produced it. Stamped by the engine, not by the policy.
+    policy: Option<&'static str>,
     /// Internal detail for auditing and tracing. Never crosses the MCP boundary.
     internal_detail: Option<String>,
 }
@@ -179,6 +183,17 @@ in the audit event.
 **The agent receives one `DenyCode` and curated fixed-table text.** The text never
 includes query identifiers or policy configuration.
 
+**Declaration order is precedence order.** A query that breaks four rules produces
+four `DenyReason` values, and the agent receives exactly one code, so the winner must
+be deterministic. `DenyCode` derives `Ord`; the engine sorts the aggregated reasons by
+it and reports the first. The order runs from the most categorical violation to the
+least specific, with `UnknownConstruct` last as the residual code. Reordering the enum
+changes what agents are told and requires the same review as adding a variant.
+
+`StatementNotAllowed` covers a statement the analyzer recognized and this tool does
+not accept, such as `SHOW`, `EXPLAIN`, `CALL`, or `BEGIN` (ADR-0020). It exists so
+that denying a `SHOW` does not have to be recorded as a write.
+
 ```text
 LockingRead     -> "locking reads are not allowed"
 UnknownFunction -> "the query uses a function not classified as safe"
@@ -189,14 +204,18 @@ to typos and duplicate codes.
 
 ### 6.1 Initial policies
 
-1. `SingleStatementPolicy`
-2. `ReadOnlyRootStatementPolicy`
-3. `NestedWritePolicy`
-4. `LockingReadPolicy`
-5. `FunctionSafetyPolicy`
-6. `SessionMutationPolicy`
-7. `UnknownConstructPolicy`
-8. `ObjectAccessPolicy`, a separate contract described in section 5.2
+1. `AnalysisIntegrityPolicy` — the analysis must describe this connection's dialect
+2. `SingleStatementPolicy`
+3. `ReadOnlyRootStatementPolicy`
+4. `NestedWritePolicy`
+5. `SessionMutationPolicy`
+6. `LockingReadPolicy`
+7. `FunctionSafetyPolicy`
+8. `RiskEvidencePolicy` — every `RiskFlag` is a denial by default, plus a side effect
+   the analyzer reported without naming. This replaces v0.3's `UnknownConstructPolicy`,
+   which covered one of the sixteen flags; matching all of them in one exhaustive
+   `match` is what makes adding a flag break the build.
+9. `ObjectAccessPolicy`, a separate contract described in section 5.2
 
 Resource limits are **not parser policies**. They belong to execution configuration.
 
