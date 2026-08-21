@@ -53,6 +53,9 @@ jobs:
       - run: taplo fmt --check
       - run: cargo check --workspace --all-targets
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo doc --workspace --no-deps --document-private-items
+        env:
+          RUSTDOCFLAGS: -D warnings
       - run: cargo test --workspace
       - run: cargo deny --workspace check
 

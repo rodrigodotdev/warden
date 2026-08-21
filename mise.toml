@@ -45,6 +45,11 @@ run = "cargo test --workspace"
 description = "Run integration tests against real containers"
 run = "cargo test -p warden-tracer --features docker -- --nocapture"
 
+[tasks.doc]
+description = "Build the API documentation with warnings denied"
+env = { RUSTDOCFLAGS = "-D warnings" }
+run = "cargo doc --workspace --no-deps --document-private-items"
+
 [tasks.coverage]
 description = "Generate line and region coverage as HTML and a terminal summary"
 run = [
@@ -65,4 +70,4 @@ run = "cargo +1.94.0 check --workspace --all-targets"
 
 [tasks.ci]
 description = "Run the complete CI-equivalent gate"
-depends = ["fmt:check", "check", "lint", "test", "deny"]
+depends = ["fmt:check", "check", "lint", "doc", "test", "deny"]
