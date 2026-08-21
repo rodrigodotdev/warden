@@ -2974,6 +2974,7 @@ dependencies = [
 name = "warden-ports"
 version = "0.1.0"
 dependencies = [
+ "serde_json",
  "thiserror",
  "time",
  "tokio",

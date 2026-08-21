@@ -41,6 +41,9 @@ use std::pin::Pin;
 
 pub mod analyzer;
 pub mod error;
+pub mod executor;
+pub mod explainer;
+pub mod inspector;
 
 #[cfg(test)]
 mod testing;
@@ -49,6 +52,9 @@ pub use analyzer::QueryAnalyzer;
 pub use error::{
     AnalyzeError, AuditError, ConnectionError, ExecuteError, ExplainError, SchemaError,
 };
+pub use executor::QueryExecutor;
+pub use explainer::Explainer;
+pub use inspector::SchemaInspector;
 
 /// The future a dynamically dispatched port returns.
 ///

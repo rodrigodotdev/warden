@@ -27,6 +27,8 @@ time = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+# `QueryPlan::plan` is a `serde_json::Value`, so the explainer fake needs the crate.
+serde_json = { workspace = true }
 # `test-util` provides `#[tokio::test(start_paused = true)]`, which makes every
 # deadline and queue-wait test deterministic and instant.
 tokio = { workspace = true, features = ["macros", "rt", "test-util"] }

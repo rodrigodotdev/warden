@@ -15,19 +15,32 @@
 #![allow(dead_code)]
 
 use std::num::NonZeroUsize;
+use std::time::Duration;
 
+use tokio::time::{Instant, sleep, sleep_until};
+use tokio_util::sync::CancellationToken;
 use warden_core::analysis::{QueryAnalysis, QueryAnalysisParts, StatementKind};
 use warden_core::connection::{Capabilities, ConnectionMetadata, Environment};
 use warden_core::context::RequestContext;
 use warden_core::dialect::Dialect;
+use warden_core::explain::{PlanSummary, QueryPlan};
 use warden_core::limits::ExecutionLimits;
 use warden_core::query::{InputLimits, QueryRequest};
+use warden_core::result::{QueryStats, ResultColumn, ResultSet, ResultValue};
+use warden_core::schema::{
+    ColumnDescription, MatchReason, Schema, SchemaDescribeRequest, SchemaDescription, SchemaMatch,
+    SchemaSearchRequest, SchemaSearchResult, Table, TableKind,
+};
 use warden_policy::{
     AnalyzedQuery, AuthorizedQuery, PolicyEngine, PolicyRejection, PolicySettings,
 };
 
+use crate::BoxFuture;
 use crate::analyzer::QueryAnalyzer;
-use crate::error::AnalyzeError;
+use crate::error::{AnalyzeError, ExecuteError, ExplainError, SchemaError};
+use crate::executor::QueryExecutor;
+use crate::explainer::Explainer;
+use crate::inspector::SchemaInspector;
 
 /// The statement every fixture uses.
 pub(crate) const SQL: &str = "SELECT id FROM orders";
@@ -171,5 +184,188 @@ impl QueryAnalyzer for FakeAnalyzer {
             Ok(()) => Ok(AnalyzedQuery::new(request, analysis(self.dialect))),
             Err(error) => Err(error.clone()),
         }
+    }
+}
+
+/// A bounded search request against the fixture connection.
+pub(crate) fn search_request() -> SchemaSearchRequest {
+    SchemaSearchRequest::new("production-db".parse().unwrap(), "orders", 10).unwrap()
+}
+
+/// A bounded describe request against the fixture connection.
+pub(crate) fn describe_request() -> SchemaDescribeRequest {
+    SchemaDescribeRequest::new(
+        "production-db".parse().unwrap(),
+        vec!["app.orders".parse().unwrap()],
+    )
+    .unwrap()
+}
+
+/// One normalized row, so a fake result is a valid result.
+pub(crate) fn result_set() -> ResultSet {
+    ResultSet {
+        columns: vec![ResultColumn {
+            name: "id".to_owned(),
+            database_type: "BIGINT".to_owned(),
+            nullable: Some(false),
+        }],
+        rows: vec![vec![ResultValue::I64(1)]],
+        truncated: false,
+        stats: QueryStats {
+            rows_returned: 1,
+            bytes: 1,
+            duration: Duration::from_millis(1),
+        },
+    }
+}
+
+/// An executor that pretends the database takes `duration`.
+#[derive(Debug, Default)]
+pub(crate) struct FakeExecutor {
+    duration: Duration,
+}
+
+impl FakeExecutor {
+    /// An executor whose query takes the given time to finish.
+    pub(crate) fn taking(duration: Duration) -> Self {
+        Self { duration }
+    }
+}
+
+impl QueryExecutor for FakeExecutor {
+    fn execute_read_only<'a>(
+        &'a self,
+        query: &'a AuthorizedQuery,
+        deadline: Instant,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'a, Result<ResultSet, ExecuteError>> {
+        Box::pin(async move {
+            // The real adapters race the same three futures. A real one also issues
+            // a cancel request or a KILL QUERY on the last two arms, which is the
+            // whole reason the token is a parameter (ADR-0024).
+            tokio::select! {
+                () = sleep(self.duration) => {}
+                () = cancel.cancelled() => return Err(ExecuteError::Cancelled),
+                () = sleep_until(deadline) => return Err(ExecuteError::Timeout),
+            }
+            assert_eq!(query.sql(), SQL, "the executed SQL is the analyzed SQL");
+            Ok(result_set())
+        })
+    }
+}
+
+/// An inspector with a fixed outcome.
+#[derive(Debug, Default)]
+pub(crate) struct FakeInspector {
+    rejects: bool,
+}
+
+impl FakeInspector {
+    /// An inspector whose object rules deny everything.
+    pub(crate) fn rejecting() -> Self {
+        Self { rejects: true }
+    }
+
+    fn guard(&self, cancel: &CancellationToken) -> Result<(), SchemaError> {
+        if cancel.is_cancelled() {
+            return Err(SchemaError::Cancelled);
+        }
+        if self.rejects {
+            return Err(SchemaError::Rejected(rejection()));
+        }
+        Ok(())
+    }
+}
+
+impl SchemaInspector for FakeInspector {
+    fn search_schema<'a>(
+        &'a self,
+        _request: &'a SchemaSearchRequest,
+        _deadline: Instant,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'a, Result<SchemaSearchResult, SchemaError>> {
+        Box::pin(async move {
+            self.guard(&cancel)?;
+            Ok(SchemaSearchResult {
+                matches: vec![SchemaMatch {
+                    schema: "app".to_owned(),
+                    table: "orders".to_owned(),
+                    kind: TableKind::Table,
+                    reason: MatchReason::ExactTable,
+                }],
+                truncated: false,
+            })
+        })
+    }
+
+    fn describe_schema<'a>(
+        &'a self,
+        _request: &'a SchemaDescribeRequest,
+        _deadline: Instant,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'a, Result<SchemaDescription, SchemaError>> {
+        Box::pin(async move {
+            self.guard(&cancel)?;
+            Ok(SchemaDescription {
+                schemas: vec![Schema {
+                    name: "app".to_owned(),
+                    tables: vec![Table {
+                        schema: "app".to_owned(),
+                        name: "orders".to_owned(),
+                        kind: TableKind::Table,
+                        columns: vec![ColumnDescription {
+                            name: "id".to_owned(),
+                            database_type: "BIGINT".to_owned(),
+                            nullable: false,
+                            default: None,
+                            comment: None,
+                        }],
+                        primary_key: vec!["id".to_owned()],
+                        foreign_keys: Vec::new(),
+                        indexes: Vec::new(),
+                    }],
+                }],
+            })
+        })
+    }
+}
+
+/// An explainer with a fixed outcome.
+#[derive(Debug, Default)]
+pub(crate) struct FakeExplainer {
+    failure: Option<ExplainError>,
+}
+
+impl FakeExplainer {
+    /// An explainer that always fails the same way.
+    pub(crate) fn failing(error: ExplainError) -> Self {
+        Self {
+            failure: Some(error),
+        }
+    }
+}
+
+impl Explainer for FakeExplainer {
+    fn explain<'a>(
+        &'a self,
+        query: &'a AuthorizedQuery,
+        _deadline: Instant,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'a, Result<QueryPlan, ExplainError>> {
+        Box::pin(async move {
+            if cancel.is_cancelled() {
+                return Err(ExplainError::Cancelled);
+            }
+            if let Some(error) = &self.failure {
+                return Err(error.clone());
+            }
+            Ok(QueryPlan {
+                dialect: query.dialect(),
+                summary: PlanSummary {
+                    estimated_rows: Some(1200),
+                },
+                plan: serde_json::json!({ "Node Type": "Seq Scan" }),
+            })
+        })
     }
 }
