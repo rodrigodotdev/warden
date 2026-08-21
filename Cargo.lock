@@ -2973,6 +2973,15 @@ dependencies = [
 [[package]]
 name = "warden-ports"
 version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "time",
+ "tokio",
+ "tokio-util",
+ "uuid",
+ "warden-core",
+ "warden-policy",
+]
 
 [[package]]
 name = "warden-postgres"
