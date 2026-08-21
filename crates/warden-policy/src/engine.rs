@@ -10,6 +10,7 @@ use warden_core::limits::ExecutionLimits;
 use crate::decision::{DenyReason, PolicyDecision, PolicyRejection};
 use crate::input::{PolicyContext, PolicyInput};
 use crate::policy::{ObjectAccessPolicy, Policy};
+use crate::settings::PolicySettings;
 use crate::state::{AllowDecision, AnalyzedQuery, AuthorizedQuery};
 
 /// An engine that could not be built.
@@ -28,6 +29,9 @@ pub enum PolicyEngineError {
         /// The maximum an `AllowDecision` can record.
         max: u16,
     },
+    /// A configured object rule could not be parsed.
+    #[error(transparent)]
+    ObjectRule(#[from] crate::policies::ObjectRuleError),
 }
 
 /// Evaluates every policy and aggregates every denial.
@@ -65,6 +69,18 @@ impl PolicyEngine {
             object_policies,
             evaluated_policies,
         })
+    }
+
+    /// Builds the engine every deployment uses.
+    ///
+    /// This is the only place the default rule set is named. A composition root
+    /// that assembled its own list could quietly omit one, so it calls this instead
+    /// and `PolicyEngine::new` stays available for tests and for a future profile
+    /// that genuinely needs a different set.
+    pub fn with_defaults(settings: &PolicySettings) -> Result<Self, PolicyEngineError> {
+        let policies = crate::policies::default_policies(settings.relaxations);
+        let object_policies = crate::policies::default_object_policies(&settings.objects)?;
+        Self::new(policies, object_policies)
     }
 
     /// The names of the statement policies, in evaluation order.
@@ -348,5 +364,279 @@ mod tests {
         assert_send_sync::<AuthorizedQuery>();
         assert_send_sync::<AnalyzedQuery>();
         assert_send_sync::<PolicyRejection>();
+    }
+}
+
+#[cfg(test)]
+mod default_engine_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use warden_core::analysis::{
+        FunctionClassification, QueryAnalysis, QueryAnalysisParts, RiskFlag, StatementKind,
+    };
+    use warden_core::dialect::Dialect;
+
+    use super::*;
+    use crate::decision::DenyCode;
+    use crate::settings::{ObjectRules, Relaxations};
+    use crate::testing;
+
+    fn engine(settings: &PolicySettings) -> PolicyEngine {
+        PolicyEngine::with_defaults(settings).unwrap()
+    }
+
+    fn judge(
+        engine: &PolicyEngine,
+        parts: QueryAnalysisParts,
+    ) -> Result<AuthorizedQuery, PolicyRejection> {
+        let context = testing::request_context();
+        let connection = testing::connection(parts.dialect);
+        let analyzed = testing::analyzed(QueryAnalysis::new(parts));
+        engine.authorize(&context, &connection, analyzed, ExecutionLimits::default())
+    }
+
+    #[test]
+    fn the_default_set_is_the_documented_one() {
+        let engine = engine(&PolicySettings::default());
+        assert_eq!(
+            engine.policy_names(),
+            [
+                "analysis_integrity",
+                "single_statement",
+                "read_only_root_statement",
+                "nested_write",
+                "session_mutation",
+                "locking_read",
+                "function_safety",
+                "risk_evidence",
+            ]
+        );
+        // No object rules configured, so no object policy exists at all.
+        assert!(engine.object_policy_names().is_empty());
+    }
+
+    #[test]
+    fn a_plain_select_is_authorized() {
+        let engine = engine(&PolicySettings::default());
+        let authorized = judge(&engine, testing::parts(Dialect::MySql)).unwrap();
+        assert_eq!(authorized.sql(), "SELECT id FROM orders");
+        assert_eq!(authorized.evaluated_policies(), 8);
+    }
+
+    #[test]
+    fn a_delete_hidden_in_a_cte_is_denied_by_two_independent_policies() {
+        // WITH changed AS (DELETE FROM orders RETURNING *) SELECT * FROM changed
+        let mut parts = testing::parts(Dialect::PostgreSql);
+        parts.nested_kinds = vec![StatementKind::Delete];
+        parts.risks = vec![RiskFlag::DataModifyingCte];
+        parts.has_side_effects = true;
+
+        let engine = engine(&PolicySettings::default());
+        let rejection = judge(&engine, parts).unwrap_err();
+
+        assert_eq!(rejection.primary_code(), DenyCode::NestedWrite);
+        assert_eq!(
+            rejection
+                .reasons()
+                .iter()
+                .map(|reason| reason.policy())
+                .collect::<Vec<_>>(),
+            [Some("nested_write"), Some("risk_evidence")]
+        );
+    }
+
+    #[test]
+    fn a_query_that_breaks_four_rules_reports_all_of_them_in_precedence_order() {
+        let mut parts = testing::parts(Dialect::PostgreSql);
+        parts.statement_count = std::num::NonZeroUsize::new(2).unwrap();
+        parts.root_kind = StatementKind::Delete;
+        parts.has_locking_clause = true;
+        parts.risks = vec![RiskFlag::LockingRead, RiskFlag::UnknownConstruct];
+        parts.functions = vec![testing::function(
+            "pg_sleep",
+            FunctionClassification::KnownDangerous,
+        )];
+
+        let engine = engine(&PolicySettings::default());
+        let rejection = judge(&engine, parts).unwrap_err();
+
+        assert_eq!(rejection.primary_code(), DenyCode::MultipleStatements);
+        assert_eq!(
+            rejection
+                .reasons()
+                .iter()
+                .map(|reason| (reason.code(), reason.policy()))
+                .collect::<Vec<_>>(),
+            [
+                (DenyCode::MultipleStatements, Some("single_statement")),
+                (DenyCode::WriteStatement, Some("read_only_root_statement")),
+                (DenyCode::DangerousFunction, Some("function_safety")),
+                (DenyCode::LockingRead, Some("locking_read")),
+                (DenyCode::LockingRead, Some("risk_evidence")),
+            ]
+        );
+    }
+
+    #[test]
+    fn only_select_survives_the_composed_engine() {
+        let engine = engine(&PolicySettings::default());
+        for kind in StatementKind::ALL {
+            let mut parts = testing::parts(Dialect::MySql);
+            parts.root_kind = kind;
+            let outcome = judge(&engine, parts);
+            assert_eq!(
+                outcome.is_ok(),
+                kind == StatementKind::Select,
+                "unexpected outcome for root {}",
+                kind.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn every_risk_flag_stops_the_composed_engine() {
+        let engine = engine(&PolicySettings::default());
+        for flag in RiskFlag::ALL {
+            let mut parts = testing::parts(Dialect::MySql);
+            parts.risks = vec![flag];
+            assert!(
+                judge(&engine, parts).is_err(),
+                "{} was authorized",
+                flag.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn every_unsafe_function_classification_stops_the_composed_engine() {
+        let engine = engine(&PolicySettings::default());
+        for classification in FunctionClassification::ALL {
+            let mut parts = testing::parts(Dialect::MySql);
+            parts.functions = vec![testing::function("f", classification)];
+            assert_eq!(
+                judge(&engine, parts).is_ok(),
+                classification == FunctionClassification::KnownSafe,
+                "unexpected outcome for {classification:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn configured_object_rules_reach_the_engine() {
+        let settings = PolicySettings {
+            relaxations: Relaxations::default(),
+            objects: ObjectRules {
+                schemas: Some(vec!["app".to_owned()]),
+                allow_tables: None,
+                deny_tables: vec!["app.secrets".to_owned()],
+            },
+        };
+        let engine = engine(&settings);
+        assert_eq!(
+            engine.object_policy_names(),
+            ["schema_allow_list", "table_allow_deny"]
+        );
+
+        let mut allowed = testing::parts(Dialect::MySql);
+        allowed.objects = vec![testing::table(Some("app"), "orders")];
+        assert!(judge(&engine, allowed).is_ok());
+
+        let mut denied = testing::parts(Dialect::MySql);
+        denied.objects = vec![testing::table(Some("app"), "secrets")];
+        assert_eq!(
+            judge(&engine, denied).unwrap_err().primary_code(),
+            DenyCode::ObjectNotAllowed
+        );
+
+        let mut other_schema = testing::parts(Dialect::MySql);
+        other_schema.objects = vec![testing::table(Some("internal"), "orders")];
+        assert_eq!(
+            judge(&engine, other_schema).unwrap_err().primary_code(),
+            DenyCode::ObjectNotAllowed
+        );
+    }
+
+    #[test]
+    fn a_malformed_object_rule_stops_the_engine_from_being_built() {
+        let settings = PolicySettings {
+            relaxations: Relaxations::default(),
+            objects: ObjectRules {
+                schemas: None,
+                allow_tables: None,
+                deny_tables: vec!["a.b.c".to_owned()],
+            },
+        };
+        let error = PolicyEngine::with_defaults(&settings).unwrap_err();
+        assert!(error.to_string().contains("a.b.c"), "{error}");
+    }
+
+    #[test]
+    fn nothing_the_agent_receives_names_an_object_a_function_or_a_rule() {
+        let mut parts = testing::parts(Dialect::PostgreSql);
+        parts.root_kind = StatementKind::Delete;
+        parts.objects = vec![testing::table(Some("app"), "customer_secrets")];
+        parts.functions = vec![testing::function(
+            "pg_advisory_lock",
+            FunctionClassification::KnownDangerous,
+        )];
+
+        let settings = PolicySettings {
+            relaxations: Relaxations::default(),
+            objects: ObjectRules {
+                schemas: None,
+                allow_tables: None,
+                deny_tables: vec!["app.customer_secrets".to_owned()],
+            },
+        };
+        let rejection = judge(&engine(&settings), parts).unwrap_err();
+
+        for text in [rejection.public_message(), &rejection.to_string()] {
+            assert!(!text.contains("customer_secrets"), "{text}");
+            assert!(!text.contains("pg_advisory_lock"), "{text}");
+            assert!(!text.contains("app"), "{text}");
+        }
+        // The auditor sees everything the agent does not.
+        let details: Vec<&str> = rejection
+            .reasons()
+            .iter()
+            .filter_map(DenyReason::internal_detail)
+            .collect();
+        assert!(
+            details.iter().any(|d| d.contains("customer_secrets")),
+            "{details:?}"
+        );
+        assert!(
+            details.iter().any(|d| d.contains("pg_advisory_lock")),
+            "{details:?}"
+        );
+    }
+
+    #[test]
+    fn relaxations_reach_the_policies_that_honor_them() {
+        let permissive = engine(&PolicySettings {
+            relaxations: Relaxations {
+                locking_reads: true,
+                unknown_functions: true,
+            },
+            objects: ObjectRules::default(),
+        });
+
+        let mut locking = testing::parts(Dialect::PostgreSql);
+        locking.has_locking_clause = true;
+        locking.risks = vec![RiskFlag::LockingRead];
+        assert!(judge(&permissive, locking).is_ok());
+
+        let mut unknown = testing::parts(Dialect::PostgreSql);
+        unknown.functions = vec![testing::function(
+            "mystery",
+            FunctionClassification::Unknown,
+        )];
+        unknown.risks = vec![RiskFlag::UserDefinedFunction];
+        assert!(judge(&permissive, unknown).is_ok());
+
+        // And nothing else moved.
+        let mut write = testing::parts(Dialect::PostgreSql);
+        write.root_kind = StatementKind::Update;
+        assert!(judge(&permissive, write).is_err());
     }
 }

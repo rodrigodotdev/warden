@@ -45,5 +45,5 @@ pub use decision::{DenyCode, DenyReason, PolicyDecision, PolicyRejection};
 pub use engine::{PolicyEngine, PolicyEngineError};
 pub use input::{PolicyContext, PolicyInput};
 pub use policy::{ObjectAccessPolicy, Policy};
-pub use settings::Relaxations;
+pub use settings::{ObjectRules, PolicySettings, Relaxations};
 pub use state::{AllowDecision, AnalyzedQuery, AuthorizedQuery};
