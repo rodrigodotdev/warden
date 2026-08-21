@@ -44,10 +44,12 @@ pub mod connection;
 pub mod context;
 pub mod dialect;
 pub mod error;
+pub mod explain;
 pub mod fingerprint;
 pub mod limits;
 pub mod parameter;
 pub mod query;
 pub mod result;
+pub mod schema;
 
 pub use identifier::{IdentifierError, IdentifierViolation};
