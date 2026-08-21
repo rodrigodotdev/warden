@@ -45,7 +45,9 @@ pub mod context;
 pub mod dialect;
 pub mod error;
 pub mod fingerprint;
+pub mod limits;
 pub mod parameter;
 pub mod query;
+pub mod result;
 
 pub use identifier::{IdentifierError, IdentifierViolation};
