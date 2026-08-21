@@ -11,11 +11,19 @@
 //! crate's build instead of passing silently through a wildcard (ADR-0021).
 
 pub mod analysis_integrity;
+pub mod function_safety;
+pub mod locking_read;
 pub mod nested_write;
+pub mod risk_evidence;
 pub mod root_statement;
+pub mod session_mutation;
 pub mod single_statement;
 
 pub use analysis_integrity::AnalysisIntegrityPolicy;
+pub use function_safety::FunctionSafetyPolicy;
+pub use locking_read::LockingReadPolicy;
 pub use nested_write::NestedWritePolicy;
+pub use risk_evidence::RiskEvidencePolicy;
 pub use root_statement::ReadOnlyRootStatementPolicy;
+pub use session_mutation::SessionMutationPolicy;
 pub use single_statement::SingleStatementPolicy;

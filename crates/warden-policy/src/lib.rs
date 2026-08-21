@@ -34,6 +34,7 @@ pub mod engine;
 pub mod input;
 pub mod policies;
 pub mod policy;
+pub mod settings;
 pub mod state;
 
 #[cfg(test)]
@@ -43,4 +44,5 @@ pub use decision::{DenyCode, DenyReason, PolicyDecision, PolicyRejection};
 pub use engine::{PolicyEngine, PolicyEngineError};
 pub use input::{PolicyContext, PolicyInput};
 pub use policy::{ObjectAccessPolicy, Policy};
+pub use settings::Relaxations;
 pub use state::{AllowDecision, AnalyzedQuery, AuthorizedQuery};
