@@ -32,6 +32,7 @@
 pub mod decision;
 pub mod engine;
 pub mod input;
+pub mod policies;
 pub mod policy;
 pub mod state;
 
