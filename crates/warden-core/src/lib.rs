@@ -39,10 +39,12 @@ pub const MAX_EXACT_JSON_INTEGER: u64 = 9_007_199_254_740_992;
 
 mod identifier;
 
+pub mod analysis;
 pub mod connection;
 pub mod context;
 pub mod dialect;
 pub mod error;
+pub mod fingerprint;
 pub mod parameter;
 pub mod query;
 
