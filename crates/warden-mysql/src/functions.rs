@@ -29,11 +29,6 @@
 //! rather than through a counter, the way `UUID_SHORT` does. All of them land
 //! in `Unknown` and are denied.
 
-// This module's `pub(crate)` item gains its first caller in Task 5's analyzer.
-// Until then only this file's own `#[cfg(test)]` block reaches it, which the
-// non-test build cannot see, so `dead_code` would otherwise fire here.
-#![allow(dead_code)]
-
 use warden_core::analysis::{FunctionClassification, RiskFlag};
 
 /// Functions that do something other than compute a value, and the risk each one is.

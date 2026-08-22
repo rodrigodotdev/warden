@@ -31,8 +31,12 @@
 //! of which are classified. A `warden-core` security enum never gets a wildcard at
 //! all (ADR-0021).
 
+mod analyzer;
+mod fingerprint;
 mod functions;
 mod parse;
 mod statement;
 mod tokens;
 mod visit;
+
+pub use analyzer::MySqlAnalyzer;

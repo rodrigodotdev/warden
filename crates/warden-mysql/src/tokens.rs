@@ -11,11 +11,6 @@
 //! it sound: `SELECT 'into outfile' FROM t` tokenizes to a single string literal with
 //! no word tokens, and a comment produces none either, so neither can trip the guard.
 
-// This module's `pub(crate)` item gains its first caller in Task 5's analyzer.
-// Until then only this file's own `#[cfg(test)]` block reaches it, which the
-// non-test build cannot see, so `dead_code` would otherwise fire here.
-#![allow(dead_code)]
-
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::tokenizer::{Token, Tokenizer, Word};
 use warden_core::analysis::RiskFlag;

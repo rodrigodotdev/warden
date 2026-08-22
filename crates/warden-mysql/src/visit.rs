@@ -6,11 +6,6 @@
 //! `docs/security.md` section 7.1 asks for. Classification is where the wildcards
 //! live, and every one of them maps to something denied.
 
-// This module's `pub(crate)` item gains its first caller in Task 5's analyzer.
-// Until then only this file's own `#[cfg(test)]` block reaches it, which the
-// non-test build cannot see, so `dead_code` would otherwise fire here.
-#![allow(dead_code)]
-
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{

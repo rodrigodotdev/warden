@@ -1,10 +1,5 @@
 //! Turning MySQL text into a statement list, or into the one reason it could not be.
 
-// This module's `pub(crate)` items gain their first caller in Task 5's analyzer.
-// Until then only this file's own `#[cfg(test)]` block reaches them, which the
-// non-test build cannot see, so `dead_code` would otherwise fire on every item here.
-#![allow(dead_code)]
-
 use sqlparser::ast::Statement;
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::{Parser, ParserError};

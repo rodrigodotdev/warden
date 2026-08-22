@@ -1,10 +1,5 @@
 //! Mapping a parsed MySQL statement to its security category.
 
-// This module's `pub(crate)` item gains its first caller in Task 5's analyzer.
-// Until then only this file's own `#[cfg(test)]` block reaches it, which the
-// non-test build cannot see, so `dead_code` would otherwise fire here.
-#![allow(dead_code)]
-
 use sqlparser::ast::Statement;
 use warden_core::analysis::StatementKind;
 
