@@ -71,7 +71,13 @@ fn code_lines(source: &str) -> Vec<&str> {
 /// The body of one `pub trait` block, as non-comment lines.
 ///
 /// rustfmt puts a top-level item's closing brace in column zero, which is what makes
-/// this reliable without parsing Rust.
+/// this reliable without parsing Rust. This also assumes the trait's opening line —
+/// `pub trait Name: Send + Sync {` — is not itself wrapped across multiple lines: no
+/// shipped port has generic parameters or a `where` clause, so the opener always fits
+/// on one line today. A trait that grew one and wrapped its declaration would have
+/// its extra opener lines and its `{` folded silently into the captured body instead
+/// of failing loudly, so a future maintainer doing that should keep the opener on one
+/// line, or update this scan first.
 fn trait_body<'a>(source: &'a str, name: &str) -> Vec<&'a str> {
     let opener = format!("pub trait {name}");
     let mut inside = false;

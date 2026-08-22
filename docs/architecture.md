@@ -231,6 +231,7 @@ impl ConnectionRuntime {
     pub fn inspector(&self) -> &dyn SchemaInspector;
     pub fn explainer(&self) -> &dyn Explainer;
     pub async fn acquire_query_permit(&self) -> Result<QueryPermit, ConnectionError>;
+    pub fn available_permits(&self) -> usize;
 }
 
 pub trait ConnectionRegistry: Send + Sync {
@@ -247,6 +248,11 @@ returns `ConnectionError::Busy`, which is the `server_busy` of invariant 16, so 
 bounds are structural rather than a caller's responsibility. `ConnectionRuntime::new`
 validates the limits and rejects an analyzer whose dialect differs from the
 connection's.
+
+`available_permits` returns a copied `usize`, not the semaphore itself, so it hands
+out no way to raise the limit — only to read it. Diagnostics and tests use it; no
+caller needs it to acquire a slot correctly, since `acquire_query_permit` already
+does that.
 
 Fields are private. The concrete registry implementation uses a `HashMap` that becomes
 immutable after startup. Dynamic configuration reload is future work.
