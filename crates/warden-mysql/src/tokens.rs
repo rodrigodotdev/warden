@@ -56,10 +56,13 @@ pub(crate) fn scan(sql: &str) -> Vec<RiskFlag> {
 
 /// `INTO OUTFILE` or `INTO DUMPFILE`, written as two bare words.
 ///
-/// Both words must be unquoted. A backticked `` `into` `` is an identifier, never the
-/// keyword, so requiring that removes the one realistic false positive — a query
-/// naming two adjacent columns or tables spelled `into` and `outfile`, which MySQL
-/// would force to be quoted anyway because `INTO` is reserved.
+/// Both words must be unquoted; a backticked `` `into` `` is an identifier, never
+/// the keyword. That does not make the guard exact: `OUTFILE` is reserved in
+/// MySQL, but `DUMPFILE` is not, so `INSERT INTO dumpfile VALUES (1)` against a
+/// table literally named `dumpfile` does trip it. That false positive costs
+/// nothing, because every shape that puts a bare word directly after `INTO` — an
+/// `INSERT`, a `REPLACE`, or a table-form `SELECT ... INTO` — is already a write
+/// this analyzer denies on its own terms.
 fn is_file_output(left: &Word, right: &Word) -> bool {
     left.quote_style.is_none()
         && right.quote_style.is_none()

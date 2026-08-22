@@ -14,7 +14,7 @@
 use core::ops::ControlFlow;
 
 use sqlparser::ast::{
-    BinaryOperator, Expr, ObjectName, Query, Statement, TableFactor, Visit, Visitor,
+    BinaryOperator, Expr, ObjectName, Query, Select, Statement, TableFactor, Visit, Visitor,
 };
 use warden_core::analysis::{
     FunctionRef, ObjectKind, ObjectRef, RiskFlag, SqlIdentifier, StatementKind,
@@ -42,6 +42,28 @@ pub(crate) struct Evidence {
     pub(crate) risks: Vec<RiskFlag>,
     /// Whether any query carried a row-locking clause.
     pub(crate) has_locking_clause: bool,
+    /// Current statement nesting depth during the walk. The root statement is
+    /// depth 1; a statement reached only by descending into another statement,
+    /// such as the `DELETE` inside `WITH x AS (DELETE ...) SELECT ...`, is
+    /// deeper than that.
+    depth: usize,
+    /// Whether a write statement was seen at a depth greater than the root.
+    has_nested_write: bool,
+}
+
+/// Whether a statement kind is a write, for nested-write detection during the walk.
+///
+/// This is the same set of kinds `collect`'s exhaustive match treats as a write; kept
+/// as its own function because the walk needs the answer before that match runs.
+fn is_write_kind(kind: StatementKind) -> bool {
+    matches!(
+        kind,
+        StatementKind::Insert
+            | StatementKind::Update
+            | StatementKind::Delete
+            | StatementKind::Merge
+            | StatementKind::Copy
+    )
 }
 
 impl Evidence {
@@ -130,11 +152,25 @@ impl Visitor for Evidence {
     type Break = ();
 
     fn pre_visit_statement(&mut self, statement: &Statement) -> ControlFlow<()> {
-        self.kinds.push(kind_of(statement));
+        self.depth += 1;
+        let kind = kind_of(statement);
+        if self.depth > 1 && is_write_kind(kind) {
+            // Reached only by descending into another statement, not by being one
+            // of the top-level statements in the batch: the `WITH x AS (DELETE
+            // ...)` shape of `docs/security.md` section 6.3, whatever syntax
+            // produced it.
+            self.has_nested_write = true;
+        }
+        self.kinds.push(kind);
         if let Statement::Explain { analyze: true, .. } = statement {
             // ADR-0017: `EXPLAIN ANALYZE` runs the query it claims to describe.
             self.flag(RiskFlag::ExplainAnalyze);
         }
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_statement(&mut self, _statement: &Statement) -> ControlFlow<()> {
+        self.depth -= 1;
         ControlFlow::Continue(())
     }
 
@@ -148,11 +184,17 @@ impl Visitor for Evidence {
             self.has_locking_clause = true;
             self.flag(RiskFlag::LockingRead);
         }
-        if let Some(select) = query.body.as_select()
-            && select.into.is_some()
-        {
+        ControlFlow::Continue(())
+    }
+
+    fn pre_visit_select(&mut self, select: &Select) -> ControlFlow<()> {
+        if select.into.is_some() {
             // On MySQL every `SELECT ... INTO` form writes somewhere: a table, a
-            // file, or a session variable. Only the table form parses here.
+            // file, or a session variable. Only the table form parses here. This
+            // hook fires for every `Select`, including one that is only an arm of
+            // a `UNION`/`EXCEPT`/`INTERSECT`, so `SELECT ... INTO t FROM a UNION
+            // SELECT ...` is not missed the way reading only `Query::body` would
+            // miss it.
             self.flag(RiskFlag::SelectInto);
         }
         ControlFlow::Continue(())
@@ -169,6 +211,13 @@ impl Visitor for Evidence {
                     None => ObjectKind::Unknown,
                 };
                 self.record_object(name, kind);
+                if args.is_some() {
+                    // `FROM sleep(5)` calls a function in relation position. The
+                    // relation is recorded above; this also classifies the call
+                    // itself, exactly as `sleep(5)` in expression position would be
+                    // (SPEC section 6, invariant 7; `functions.rs`'s own header).
+                    self.record_function(name);
+                }
             }
             // A derived table and a nested join contain relations the visitor reaches
             // on its own; they name nothing themselves.
@@ -210,7 +259,7 @@ impl Visitor for Evidence {
 /// **The CTE subtraction is deliberately blunt.** `docs/security.md` section 5.1
 /// requires that CTE names and subquery aliases are not `ObjectRef` values, and this
 /// analyzer implements it by dropping every *unqualified* relation whose name folds
-/// equal to any CTE alias anywhere in the statement — it does not track which
+/// equal to any CTE alias anywhere in the input — it does not track which
 /// subquery each alias is visible in. A query that declares a CTE named `orders` and
 /// also reads a real table `orders` in a different scope therefore loses the real
 /// reference from the object list. That errs toward reporting fewer objects, which
@@ -227,7 +276,8 @@ pub(crate) fn collect(statements: &[Statement]) -> Evidence {
         evidence.flag(RiskFlag::MultipleStatements);
     }
 
-    for (position, kind) in evidence.kinds.clone().into_iter().enumerate() {
+    for index in 0..evidence.kinds.len() {
+        let kind = evidence.kinds[index];
         // Exhaustive over `StatementKind`: a new variant must be decided here rather
         // than fall through a wildcard (ADR-0021).
         match kind {
@@ -236,21 +286,22 @@ pub(crate) fn collect(statements: &[Statement]) -> Evidence {
             | StatementKind::Update
             | StatementKind::Delete
             | StatementKind::Merge
-            | StatementKind::Copy => {
-                evidence.flag(RiskFlag::WriteStatement);
-                if position > 0 {
-                    // A write reached by descending into a statement is the
-                    // `WITH x AS (DELETE ...)` shape of `docs/security.md`
-                    // section 6.3, whatever syntax produced it.
-                    evidence.flag(RiskFlag::DataModifyingCte);
-                }
-            }
+            | StatementKind::Copy => evidence.flag(RiskFlag::WriteStatement),
             StatementKind::Ddl => evidence.flag(RiskFlag::Ddl),
             StatementKind::SessionControl => evidence.flag(RiskFlag::SessionMutation),
             StatementKind::Call => evidence.flag(RiskFlag::StoredRoutine),
             StatementKind::TransactionControl | StatementKind::Utility => {}
             StatementKind::Unknown => evidence.flag(RiskFlag::UnknownConstruct),
         }
+    }
+
+    if evidence.has_nested_write {
+        // Depth is tracked during the walk itself (`pre_visit_statement` /
+        // `post_visit_statement`), not inferred from a flat batch position, so a
+        // write that is merely the second statement of a batch — `SELECT 1;
+        // DELETE FROM t` — does not trip this, while a write actually nested
+        // inside another statement — `WITH x AS (DELETE ...) SELECT ...` — does.
+        evidence.flag(RiskFlag::DataModifyingCte);
     }
 
     let cte_names = std::mem::take(&mut evidence.cte_names);
@@ -308,6 +359,38 @@ mod tests {
     }
 
     #[test]
+    fn a_name_with_more_than_three_parts_is_unknown_construct_not_dropped_silently() {
+        let evidence = evidence("SELECT * FROM db.sch.tbl.extra");
+        assert!(evidence.objects.is_empty());
+        assert!(evidence.risks.contains(&RiskFlag::UnknownConstruct));
+    }
+
+    #[test]
+    fn a_table_factor_this_analyzer_cannot_describe_is_unknown_construct() {
+        // `JSON_TABLE` is its own `TableFactor` variant, distinct from `Table`,
+        // `Derived`, `NestedJoin` and `Function` — it can only be reached through
+        // the wildcard arm, which is what this test exercises.
+        assert!(
+            evidence("SELECT * FROM JSON_TABLE('[1,2]', '$[*]' COLUMNS(a INT PATH '$')) AS jt")
+                .risks
+                .contains(&RiskFlag::UnknownConstruct)
+        );
+    }
+
+    #[test]
+    fn the_visitor_descends_into_an_expression_subquery() {
+        // Nothing else in this suite proves the walk reaches a relation that is
+        // reachable only through an `Expr`, not through `Query`/`TableFactor`
+        // directly.
+        assert_eq!(
+            names(&evidence(
+                "SELECT * FROM t WHERE id IN (SELECT id FROM secrets)"
+            )),
+            ["t", "secrets"]
+        );
+    }
+
+    #[test]
     fn quoting_survives_into_the_object_reference() {
         let quoted = evidence("SELECT * FROM `Orders`");
         assert_eq!(quoted.objects[0].name.value(), "Orders");
@@ -357,6 +440,26 @@ mod tests {
     }
 
     #[test]
+    fn a_function_called_in_relation_position_is_classified() {
+        let evidence = evidence("SELECT * FROM sleep(5)");
+        assert_eq!(evidence.objects[0].kind, ObjectKind::Function);
+        let sleep = &evidence.functions[0];
+        assert_eq!(sleep.name.value(), "sleep");
+        assert_eq!(sleep.classification, FunctionClassification::KnownDangerous);
+        assert!(evidence.risks.contains(&RiskFlag::DelayFunction));
+    }
+
+    #[test]
+    fn an_unknown_function_called_in_relation_position_is_still_denied() {
+        let evidence = evidence("SELECT * FROM my_udf(1)");
+        assert_eq!(
+            evidence.functions[0].classification,
+            FunctionClassification::Unknown
+        );
+        assert!(evidence.risks.contains(&RiskFlag::UserDefinedFunction));
+    }
+
+    #[test]
     fn a_function_name_is_never_reported_as_a_relation() {
         assert!(
             evidence("SELECT LOAD_FILE('/etc/passwd')")
@@ -398,6 +501,17 @@ mod tests {
     }
 
     #[test]
+    fn a_select_into_inside_a_set_operation_is_still_flagged() {
+        // `into` lives on `Select`, not on `Query::body` directly: the left arm of
+        // a `UNION` is a `Select` reached only through `pre_visit_select`.
+        assert!(
+            evidence("SELECT * INTO newtbl FROM t UNION SELECT 1")
+                .risks
+                .contains(&RiskFlag::SelectInto)
+        );
+    }
+
+    #[test]
     fn explain_analyze_is_flagged_and_its_inner_statement_is_still_seen() {
         let evidence = evidence("EXPLAIN ANALYZE SELECT 1");
         assert_eq!(
@@ -422,6 +536,23 @@ mod tests {
                 "a root write is not a nested one: {sql}"
             );
         }
+    }
+
+    #[test]
+    fn a_write_that_is_the_second_statement_of_a_batch_is_not_a_nested_write() {
+        // Depth is tracked during the walk, not inferred from batch position: the
+        // second statement of a batch is still a root statement, at depth 1.
+        let evidence = evidence("SELECT 1; DELETE FROM t");
+        assert!(evidence.risks.contains(&RiskFlag::MultipleStatements));
+        assert!(evidence.risks.contains(&RiskFlag::WriteStatement));
+        assert!(!evidence.risks.contains(&RiskFlag::DataModifyingCte));
+    }
+
+    #[test]
+    fn a_write_reached_by_descending_into_a_cte_is_a_data_modifying_cte() {
+        let evidence = evidence("WITH x AS (DELETE FROM t) SELECT * FROM x");
+        assert!(evidence.risks.contains(&RiskFlag::WriteStatement));
+        assert!(evidence.risks.contains(&RiskFlag::DataModifyingCte));
     }
 
     #[test]
