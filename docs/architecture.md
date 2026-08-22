@@ -147,9 +147,13 @@ Parsing is local, synchronous CPU work:
 
 ```rust
 pub trait QueryAnalyzer: Send + Sync {
+    fn dialect(&self) -> Dialect;
     fn analyze(&self, request: QueryRequest) -> Result<AnalyzedQuery, AnalyzeError>;
 }
 ```
+
+`dialect` exists so `ConnectionRuntime::new` can reject a MySQL analyzer wired to a
+PostgreSQL connection at startup instead of at the first query.
 
 Asynchronous ports require dynamic dispatch because the connection is selected at
 runtime. `async fn` in traits is not dyn-compatible, so boxing is explicit:
@@ -160,6 +164,10 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 This keeps allocation and dispatch visible. Do not add `async-trait` merely to hide
 the representation (ADR-0013).
+
+**Every port method that runs SQL takes a deadline and a cancellation token**, and
+one that does not, does not. `deadline` is a `tokio::time::Instant`, the clock
+`timeout_at` and `pause` both understand.
 
 ```rust
 pub trait QueryExecutor: Send + Sync {
@@ -172,15 +180,15 @@ pub trait QueryExecutor: Send + Sync {
 }
 
 pub trait SchemaInspector: Send + Sync {
-    fn search_schema<'a>(&'a self, r: &'a SchemaSearchRequest)
-        -> BoxFuture<'a, Result<SchemaSearchResult, SchemaError>>;
-    fn describe_schema<'a>(&'a self, r: &'a SchemaDescribeRequest)
-        -> BoxFuture<'a, Result<SchemaDescription, SchemaError>>;
+    fn search_schema<'a>(&'a self, r: &'a SchemaSearchRequest, deadline: Instant,
+        cancel: CancellationToken) -> BoxFuture<'a, Result<SchemaSearchResult, SchemaError>>;
+    fn describe_schema<'a>(&'a self, r: &'a SchemaDescribeRequest, deadline: Instant,
+        cancel: CancellationToken) -> BoxFuture<'a, Result<SchemaDescription, SchemaError>>;
 }
 
 pub trait Explainer: Send + Sync {
-    fn explain<'a>(&'a self, r: &'a ExplainRequest)
-        -> BoxFuture<'a, Result<QueryPlan, ExplainError>>;
+    fn explain<'a>(&'a self, query: &'a AuthorizedQuery, deadline: Instant,
+        cancel: CancellationToken) -> BoxFuture<'a, Result<QueryPlan, ExplainError>>;
 }
 
 pub trait AuditSink: Send + Sync {
@@ -190,6 +198,16 @@ pub trait AuditSink: Send + Sync {
         -> BoxFuture<'a, Result<(), AuditError>>;
 }
 ```
+
+`Explainer::explain` takes an `AuthorizedQuery`, not an `ExplainRequest`. PostgreSQL's
+planner constant-folds `IMMUTABLE` functions, so planning is execution and every
+policy that applies to `query` applies here (`docs/mcp.md` section 3.1; SPEC section
+6, invariant 12). `ExplainRequest` remains the MCP-facing input the query service
+converts.
+
+`AuditSink` takes no deadline: a sink has no server-side work to cancel, so the caller
+bounds the write with `tokio::time::timeout`. ADR-0022 still requires the attempt
+phase to be cheap.
 
 Dropping a future does not guarantee server-side query termination. Passing the
 deadline and cancellation token explicitly lets adapters issue real cancellation—a
@@ -201,14 +219,18 @@ No port exposes an `execute(sql: &str)` API that accepts untrusted SQL.
 ## 6. Connection runtime
 
 ```rust
-pub struct ConnectionRuntime {
-    metadata: ConnectionMetadata,
-    analyzer: Arc<dyn QueryAnalyzer>,
-    executor: Arc<dyn QueryExecutor>,
-    inspector: Arc<dyn SchemaInspector>,
-    explainer: Arc<dyn Explainer>,
-    capabilities: Capabilities,
-    query_semaphore: Arc<Semaphore>,
+pub struct ConnectionRuntime { /* private fields */ }
+
+impl ConnectionRuntime {
+    pub fn new(parts: ConnectionRuntimeParts) -> Result<Self, RuntimeError>;
+    pub fn metadata(&self) -> &ConnectionMetadata;
+    pub fn capabilities(&self) -> Capabilities;
+    pub fn limits(&self) -> ExecutionLimits;
+    pub fn analyzer(&self) -> &dyn QueryAnalyzer;
+    pub fn executor(&self) -> &dyn QueryExecutor;
+    pub fn inspector(&self) -> &dyn SchemaInspector;
+    pub fn explainer(&self) -> &dyn Explainer;
+    pub async fn acquire_query_permit(&self) -> Result<QueryPermit, ConnectionError>;
 }
 
 pub trait ConnectionRegistry: Send + Sync {
@@ -217,7 +239,16 @@ pub trait ConnectionRegistry: Send + Sync {
 }
 ```
 
-Fields are private. The concrete implementation uses a `HashMap` that becomes
+The semaphore is a private field rather than an exposed `Arc<Semaphore>`, because
+`Semaphore::add_permits` takes `&self`: handing the semaphore out would let any caller
+raise the connection's concurrency limit at runtime and defeat SPEC section 6,
+invariant 17. `acquire_query_permit` waits at most `limits.max_queue_wait` and then
+returns `ConnectionError::Busy`, which is the `server_busy` of invariant 16, so both
+bounds are structural rather than a caller's responsibility. `ConnectionRuntime::new`
+validates the limits and rejects an analyzer whose dialect differs from the
+connection's.
+
+Fields are private. The concrete registry implementation uses a `HashMap` that becomes
 immutable after startup. Dynamic configuration reload is future work.
 
 A connection encapsulates its concrete pools and dialect behavior.
