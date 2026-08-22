@@ -112,8 +112,10 @@ thiserror  tracing  tracing-subscriber  secrecy  time  base64  bigdecimal  uuid
 `tokio-util` provides `CancellationToken` for explicit query cancellation.
 
 `sha2` computes the `v1:<sha256-hex>` query fingerprint of `docs/security.md`
-section 11.4, which `std` cannot provide. It is used behind one function per adapter
-and adds only `hybrid-array` and `typenum`.
+section 11.4, which `std` cannot provide. It is used behind one function per
+adapter. The RustCrypto chain it sits in — `sha2`, `digest`, `hybrid-array`,
+`typenum` — is already in the graph via `sqlx`'s MySQL authentication; the only
+crate this dependency newly introduces is `const-oid`.
 
 ### 2.6 Do not add by default
 
