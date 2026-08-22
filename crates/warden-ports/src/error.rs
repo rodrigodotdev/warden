@@ -425,6 +425,14 @@ mod tests {
                 detail: LEAKY.to_owned(),
             }
             .to_string(),
+            // Both `#[error(transparent)]` variants delegate `Display` to another
+            // crate's type. They are safe today because `PolicyRejection` prints only
+            // its fixed-table `DenyCode` and `NormalizationError` prints only a
+            // column and type name, but neither fact is checked here without an
+            // entry in this loop — a future `warden-policy` or `warden-core` change
+            // would otherwise leak past this guard unnoticed.
+            SchemaError::Rejected(testing::rejection()).to_string(),
+            ExecuteError::Normalization(NormalizationError::ArrayTooDeep { max: 8 }).to_string(),
         ] {
             assert!(!rendered.contains("alice@example.com"), "{rendered}");
             assert!(!rendered.contains("db-01.internal"), "{rendered}");

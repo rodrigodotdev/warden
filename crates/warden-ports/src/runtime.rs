@@ -142,6 +142,12 @@ impl ConnectionRuntime {
     }
 
     /// The bounds every request on this connection runs under.
+    ///
+    /// This is the connection's own configured bound. `AuthorizedQuery::limits()` is
+    /// whatever value the caller passed into `PolicyEngine::authorize`, and nothing
+    /// checks the two agree — so Milestone 11 must pass this value into `authorize`
+    /// rather than any other source, or a query could run under a different budget
+    /// than the connection it targets actually has.
     #[must_use]
     pub fn limits(&self) -> ExecutionLimits {
         self.limits
@@ -286,6 +292,11 @@ mod tests {
             assert!(!rendered.contains(field), "{rendered}");
         }
         assert!(!rendered.contains("FakeExecutor"), "{rendered}");
+        // The milestone checklist requires that `Debug` print metadata, capabilities,
+        // and limits — the previous assertions prove the ports are absent, these
+        // prove the required fields are actually present.
+        assert!(rendered.contains("capabilities"), "{rendered}");
+        assert!(rendered.contains("limits"), "{rendered}");
     }
 
     #[test]

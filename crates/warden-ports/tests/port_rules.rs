@@ -30,7 +30,7 @@ use warden_policy::{AnalyzedQuery, AuthorizedQuery};
 use warden_ports::{
     AnalyzeError, AuditAttempt, AuditError, AuditOutcomeEvent, AuditSink, BoxFuture,
     ConnectionError, ConnectionRegistry, ConnectionRuntime, ExecuteError, ExplainError, Explainer,
-    QueryAnalyzer, QueryExecutor, SchemaError, SchemaInspector,
+    QueryAnalyzer, QueryExecutor, QueryPermit, SchemaError, SchemaInspector,
 };
 
 /// The complete port inventory. Adding a port means adding it here and to
@@ -184,8 +184,9 @@ fn every_port_and_method_is_documented_in_the_architecture() {
                 "{file} does not declare {method}"
             );
             assert!(
-                document.contains(method),
-                "{name}::{method} is not mentioned in docs/architecture.md"
+                document.contains(&format!("fn {method}")),
+                "{name}::{method} is not mentioned as `fn {method}` in \
+                 docs/architecture.md"
             );
         }
     }
@@ -202,6 +203,13 @@ fn an_audit_record_cannot_be_serialized() {
          internal detail, which never crosses the MCP boundary"
     );
     // The same file must not grow a field for the statement or its parameters.
+    //
+    // This scan only catches the exact spellings below — `pub statement` or
+    // `pub bound_values` would slip past it. The guarantee that actually holds is
+    // structural, not textual: `serde` is not a dependency of `warden-ports` at all
+    // (`tests/architecture.rs` enforces that), so no `#[derive(Serialize)]` in
+    // audit.rs could compile regardless of what a field is named. Treat the string
+    // check as a fast, partial signal, not the proof.
     for forbidden in ["pub sql", "pub parameters"] {
         assert!(
             !source.contains(forbidden),
@@ -209,6 +217,19 @@ fn an_audit_record_cannot_be_serialized() {
              default (docs/security.md section 11.3)"
         );
     }
+}
+
+/// `ConnectionRuntime` crosses task boundaries as `Arc<ConnectionRuntime>`, and a
+/// `QueryPermit` is held across an await inside a spawned task once Milestone 11
+/// exists. Both hold today because every field happens to be `Send + Sync`, but that
+/// is incidental to the current field set rather than guaranteed by it — a future
+/// `Rc` or `RefCell` field should fail this test, not surface as a hard-to-diagnose
+/// compile error three milestones later.
+#[test]
+fn connection_runtime_and_permit_cross_task_boundaries() {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<ConnectionRuntime>();
+    assert_send_sync::<QueryPermit>();
 }
 
 /// A startup-only failure has no public code to leak.

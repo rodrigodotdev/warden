@@ -240,6 +240,12 @@ pub trait ConnectionRegistry: Send + Sync {
 }
 ```
 
+`ConnectionRuntimeParts` (`new`'s parameter type) bundles everything one connection
+needs before it can serve a request — metadata, capabilities, limits, and the four
+adapter ports — into a single struct literal that `ConnectionRuntime::new` validates
+and consumes; its fields are public because assembling one is the composition root's
+job, not this crate's.
+
 The semaphore is a private field rather than an exposed `Arc<Semaphore>`, because
 `Semaphore::add_permits` takes `&self`: handing the semaphore out would let any caller
 raise the connection's concurrency limit at runtime and defeat SPEC section 6,
@@ -248,6 +254,18 @@ returns `ConnectionError::Busy`, which is the `server_busy` of invariant 16, so 
 bounds are structural rather than a caller's responsibility. `ConnectionRuntime::new`
 validates the limits and rejects an analyzer whose dialect differs from the
 connection's.
+
+Under the current design, holding a permit across a call is a convention, not a type
+guarantee: `executor()` and `explainer()` hand out their trait objects unconditionally,
+so nothing stops a caller from invoking `execute_read_only` or `explain` without ever
+calling `acquire_query_permit` first. Both methods must hold a permit for the whole
+call — `execute_read_only` because it is the query SPEC section 6, invariant 17
+bounds, and `explain` because planning runs real work on the server (`docs/mcp.md`
+section 3.1) and shares `agent_pool` with `execute_read_only` (section 6.1 below), so
+its concurrency must be bounded by the same permit rather than left to the pool alone.
+A future milestone implementing the service layer is expected to enforce this
+structurally rather than merely follow it as documented practice; see
+`docs/open-questions.md` for the candidate designs.
 
 `available_permits` returns a copied `usize`, not the semaphore itself, so it hands
 out no way to raise the limit — only to read it. Diagnostics and tests use it; no
@@ -343,7 +361,8 @@ exposes a planner field that MySQL lacks, the generic MySQL summary omits it. **
 invent values.**
 
 Uniformity belongs at semantic boundaries—`analyze`, `authorize`,
-`execute_read_only`, `inspect_schema`, and `explain`—not in driver APIs.
+`execute_read_only`, `search_schema`, `describe_schema`, and `explain`—not in driver
+APIs.
 
 ## 12. Startup sequence
 

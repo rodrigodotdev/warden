@@ -30,6 +30,11 @@ pub trait QueryExecutor: Send + Sync {
     /// The server-side timeout is configured to fire first, so the ordinary path
     /// returns a clean database error with an intact pooled connection and this
     /// deadline stays a safety net (`docs/operations.md` section 5.3).
+    ///
+    /// `query.limits()` is the authority for this call's row and byte bounds; the
+    /// adapter is responsible for enforcing them (SPEC section 6, invariants 14 and
+    /// 15), not `ConnectionRuntime::limits()`, which describes the connection rather
+    /// than this one authorized statement.
     fn execute_read_only<'a>(
         &'a self,
         query: &'a AuthorizedQuery,
