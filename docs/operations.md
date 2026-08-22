@@ -96,17 +96,24 @@ overflow on deeply nested SQL and makes the fuzzing invariant achievable. It use
 `stacker`, which contains `unsafe`; this does not violate Warden's first-party
 `unsafe` policy and is recorded in `deny.toml`.
 
-Evaluate the `visitor` feature for exhaustive AST traversal (`docs/security.md`
-section 7.1).
+**Enable `visitor`** (Milestone 4). It derives `Visit`/`VisitMut` on every AST node,
+so an adapter's traversal reaches every `Statement`, `Query`, `TableFactor`,
+`ObjectName`, `Expr`, and `Value` without a handwritten recursion that could forget
+one. `docs/security.md` section 7.1 asks for exactly that property; the cost is the
+`sqlparser_derive` proc macro at build time.
 
 ### 2.5 Expected production dependencies
 
 ```text
-tokio  tokio-util  rmcp  sqlx  sqlparser  serde  serde_json
+tokio  tokio-util  rmcp  sqlx  sqlparser  sha2  serde  serde_json
 thiserror  tracing  tracing-subscriber  secrecy  time  base64  bigdecimal  uuid
 ```
 
 `tokio-util` provides `CancellationToken` for explicit query cancellation.
+
+`sha2` computes the `v1:<sha256-hex>` query fingerprint of `docs/security.md`
+section 11.4, which `std` cannot provide. It is used behind one function per adapter
+and adds only `hybrid-array` and `typenum`.
 
 ### 2.6 Do not add by default
 
