@@ -45,6 +45,8 @@ pub mod error;
 pub mod executor;
 pub mod explainer;
 pub mod inspector;
+pub mod registry;
+pub mod runtime;
 
 #[cfg(test)]
 mod testing;
@@ -52,11 +54,14 @@ mod testing;
 pub use analyzer::QueryAnalyzer;
 pub use audit::{AuditAttempt, AuditEventId, AuditOutcome, AuditOutcomeEvent, AuditSink};
 pub use error::{
-    AnalyzeError, AuditError, ConnectionError, ExecuteError, ExplainError, SchemaError,
+    AnalyzeError, AuditError, ConnectionError, ExecuteError, ExplainError, RuntimeError,
+    SchemaError,
 };
 pub use executor::QueryExecutor;
 pub use explainer::Explainer;
 pub use inspector::SchemaInspector;
+pub use registry::ConnectionRegistry;
+pub use runtime::{ConnectionRuntime, ConnectionRuntimeParts, QueryPermit};
 
 /// The future a dynamically dispatched port returns.
 ///

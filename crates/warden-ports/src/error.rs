@@ -273,6 +273,37 @@ impl PublicError for ConnectionError {
     }
 }
 
+/// Why a connection could not be assembled at startup.
+///
+/// Deliberately **not** a [`PublicError`]. This is an operator-facing failure raised
+/// by the composition root before any transport is serving, so it never crosses the
+/// MCP boundary and has no code an agent could observe — the same distinction
+/// `warden_core::error` draws for configuration errors.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum RuntimeError {
+    /// The connection's execution limits are not usable.
+    #[error("connection {name} has invalid execution limits: {source}")]
+    Limits {
+        /// The affected connection.
+        name: ConnectionName,
+        /// Which bound was rejected.
+        source: warden_core::limits::LimitsError,
+    },
+    /// The analyzer parses a different dialect than the connection speaks.
+    ///
+    /// A composition-root bug that would otherwise stay invisible until an agent
+    /// asked a question and got PostgreSQL syntax parsed by the MySQL grammar.
+    #[error("connection {name} is {expected} but its analyzer parses {actual}")]
+    DialectMismatch {
+        /// The affected connection.
+        name: ConnectionName,
+        /// The dialect the connection declares.
+        expected: warden_core::dialect::Dialect,
+        /// The dialect the analyzer reports.
+        actual: warden_core::dialect::Dialect,
+    },
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -436,5 +467,20 @@ mod tests {
             PublicErrorCode::QueryNormalizationError
         );
         assert!(error.to_string().contains("order_state"), "{error}");
+    }
+
+    #[test]
+    fn a_startup_failure_has_no_public_code_to_leak() {
+        // `RuntimeError` deliberately does not implement `PublicError`. This test
+        // documents the intent; `tests/port_rules.rs` proves it mechanically.
+        let error = RuntimeError::DialectMismatch {
+            name: name(),
+            expected: warden_core::dialect::Dialect::PostgreSql,
+            actual: warden_core::dialect::Dialect::MySql,
+        };
+        assert_eq!(
+            error.to_string(),
+            "connection production-db is postgresql but its analyzer parses mysql"
+        );
     }
 }

@@ -15,6 +15,7 @@
 #![allow(dead_code)]
 
 use std::num::NonZeroUsize;
+use std::sync::Arc;
 use std::time::Duration;
 
 use time::OffsetDateTime;
@@ -39,10 +40,15 @@ use warden_policy::{
 use crate::BoxFuture;
 use crate::analyzer::QueryAnalyzer;
 use crate::audit::{AuditAttempt, AuditEventId, AuditOutcomeEvent, AuditSink};
-use crate::error::{AnalyzeError, AuditError, ExecuteError, ExplainError, SchemaError};
+use crate::error::{
+    AnalyzeError, AuditError, ConnectionError, ExecuteError, ExplainError, RuntimeError,
+    SchemaError,
+};
 use crate::executor::QueryExecutor;
 use crate::explainer::Explainer;
 use crate::inspector::SchemaInspector;
+use crate::registry::ConnectionRegistry;
+use crate::runtime::{ConnectionRuntime, ConnectionRuntimeParts};
 
 /// The statement every fixture uses.
 pub(crate) const SQL: &str = "SELECT id FROM orders";
@@ -461,5 +467,58 @@ impl AuditSink for FakeAuditSink {
         _event: &'a AuditOutcomeEvent,
     ) -> BoxFuture<'a, Result<(), AuditError>> {
         Box::pin(async move { self.result() })
+    }
+}
+
+/// A runtime whose analyzer matches the connection's dialect.
+pub(crate) fn runtime(dialect: Dialect, limits: ExecutionLimits) -> ConnectionRuntime {
+    try_runtime(dialect, limits, dialect).unwrap()
+}
+
+/// A runtime built from parts that may deliberately disagree.
+pub(crate) fn try_runtime(
+    dialect: Dialect,
+    limits: ExecutionLimits,
+    analyzer_dialect: Dialect,
+) -> Result<ConnectionRuntime, RuntimeError> {
+    ConnectionRuntime::new(ConnectionRuntimeParts {
+        metadata: connection(dialect),
+        capabilities: capabilities(),
+        limits,
+        analyzer: Arc::new(FakeAnalyzer::new(analyzer_dialect)),
+        executor: Arc::new(FakeExecutor::default()),
+        inspector: Arc::new(FakeInspector::default()),
+        explainer: Arc::new(FakeExplainer::default()),
+    })
+}
+
+/// A registry holding exactly the fixture connection.
+#[derive(Debug)]
+pub(crate) struct FakeRegistry {
+    runtime: Arc<ConnectionRuntime>,
+}
+
+impl FakeRegistry {
+    /// A registry serving one connection on the given dialect.
+    pub(crate) fn new(dialect: Dialect) -> Self {
+        Self {
+            runtime: Arc::new(runtime(dialect, ExecutionLimits::default())),
+        }
+    }
+}
+
+impl ConnectionRegistry for FakeRegistry {
+    fn get(
+        &self,
+        name: &warden_core::connection::ConnectionName,
+    ) -> Result<Arc<ConnectionRuntime>, ConnectionError> {
+        if name == &self.runtime.metadata().name {
+            return Ok(Arc::clone(&self.runtime));
+        }
+        Err(ConnectionError::NotFound { name: name.clone() })
+    }
+
+    fn list(&self) -> Vec<warden_core::connection::ConnectionMetadata> {
+        vec![self.runtime.metadata().clone()]
     }
 }
