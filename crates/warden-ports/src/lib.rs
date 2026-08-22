@@ -40,6 +40,7 @@ use std::future::Future;
 use std::pin::Pin;
 
 pub mod analyzer;
+pub mod audit;
 pub mod error;
 pub mod executor;
 pub mod explainer;
@@ -49,6 +50,7 @@ pub mod inspector;
 mod testing;
 
 pub use analyzer::QueryAnalyzer;
+pub use audit::{AuditAttempt, AuditEventId, AuditOutcome, AuditOutcomeEvent, AuditSink};
 pub use error::{
     AnalyzeError, AuditError, ConnectionError, ExecuteError, ExplainError, SchemaError,
 };

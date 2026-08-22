@@ -17,6 +17,7 @@
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
+use time::OffsetDateTime;
 use tokio::time::{Instant, sleep, sleep_until};
 use tokio_util::sync::CancellationToken;
 use warden_core::analysis::{QueryAnalysis, QueryAnalysisParts, StatementKind};
@@ -32,12 +33,13 @@ use warden_core::schema::{
     SchemaSearchRequest, SchemaSearchResult, Table, TableKind,
 };
 use warden_policy::{
-    AnalyzedQuery, AuthorizedQuery, PolicyEngine, PolicyRejection, PolicySettings,
+    AnalyzedQuery, AuthorizedQuery, DenyReason, PolicyEngine, PolicyRejection, PolicySettings,
 };
 
 use crate::BoxFuture;
 use crate::analyzer::QueryAnalyzer;
-use crate::error::{AnalyzeError, ExecuteError, ExplainError, SchemaError};
+use crate::audit::{AuditAttempt, AuditEventId, AuditOutcomeEvent, AuditSink};
+use crate::error::{AnalyzeError, AuditError, ExecuteError, ExplainError, SchemaError};
 use crate::executor::QueryExecutor;
 use crate::explainer::Explainer;
 use crate::inspector::SchemaInspector;
@@ -404,5 +406,60 @@ impl Explainer for FakeExplainer {
                 plan: serde_json::json!({ "Node Type": "Seq Scan" }),
             })
         })
+    }
+}
+
+/// An attempt against the fixture connection, carrying the given denials.
+pub(crate) fn attempt(deny_reasons: Vec<DenyReason>) -> AuditAttempt {
+    AuditAttempt {
+        id: AuditEventId::generate(),
+        timestamp: OffsetDateTime::UNIX_EPOCH,
+        request_id: "req-1".parse().unwrap(),
+        principal: "alice@example.com".parse().unwrap(),
+        client: "Claude Code".parse().unwrap(),
+        connection: "production-db".parse().unwrap(),
+        dialect: Dialect::MySql,
+        environment: Environment::Production,
+        fingerprint: None,
+        statement_kind: StatementKind::Select,
+        deny_reasons,
+    }
+}
+
+/// A sink that either accepts everything or fails everything.
+#[derive(Debug, Default)]
+pub(crate) struct FakeAuditSink {
+    broken: bool,
+}
+
+impl FakeAuditSink {
+    /// A sink that cannot accept a record, so the caller must fail closed.
+    pub(crate) fn broken() -> Self {
+        Self { broken: true }
+    }
+
+    fn result(&self) -> Result<(), AuditError> {
+        if self.broken {
+            return Err(AuditError::Unavailable {
+                detail: "the fake sink is broken".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl AuditSink for FakeAuditSink {
+    fn record_attempt<'a>(
+        &'a self,
+        _event: &'a AuditAttempt,
+    ) -> BoxFuture<'a, Result<(), AuditError>> {
+        Box::pin(async move { self.result() })
+    }
+
+    fn record_outcome<'a>(
+        &'a self,
+        _event: &'a AuditOutcomeEvent,
+    ) -> BoxFuture<'a, Result<(), AuditError>> {
+        Box::pin(async move { self.result() })
     }
 }
