@@ -282,6 +282,15 @@ locking SELECT forms
 session/user variable assignment
 ```
 
+**How each one is detected (Milestone 4).** Locking clauses, `SELECT INTO`,
+`EXPLAIN ANALYZE`, `:=` assignment, stored-routine calls, and every function above
+come from the AST. `INTO OUTFILE` and `INTO DUMPFILE` do **not**: sqlparser 0.62
+rejects both, so they are detected by a token-level guard that reports
+`RiskFlag::FileOutput`, keeping the audit record accurate and the denial independent
+of a parser limitation (ADR-0028). `LOCK IN SHARE MODE` is likewise unparseable
+today and is denied as a parse error; the corpus records that, so an upgrade that
+changes it fails a test rather than passing silently.
+
 The list is not assumed complete. The database account remains the boundary.
 
 ### 7.3 PostgreSQL
