@@ -90,7 +90,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_cancelled_token_stops_a_catalog_query() {
-        let inspector = testing::FakeInspector::default();
+        let inspector = testing::FakeInspector::taking(Duration::from_secs(30));
         let cancel = CancellationToken::new();
         cancel.cancel();
         let search = testing::search_request();
@@ -99,5 +99,33 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error, SchemaError::Cancelled);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_token_stops_a_describe_lookup() {
+        let inspector = testing::FakeInspector::taking(Duration::from_secs(30));
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let describe = testing::describe_request();
+        let error = inspector
+            .describe_schema(&describe, Instant::now() + Duration::from_secs(5), cancel)
+            .await
+            .unwrap_err();
+        assert_eq!(error, SchemaError::Cancelled);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_deadline_reaches_the_adapter_instead_of_being_a_dropped_future() {
+        let inspector = testing::FakeInspector::taking(Duration::from_secs(30));
+        let search = testing::search_request();
+        let error = inspector
+            .search_schema(
+                &search,
+                Instant::now() + Duration::from_secs(5),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error, SchemaError::Timeout);
     }
 }

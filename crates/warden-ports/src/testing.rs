@@ -258,17 +258,39 @@ impl QueryExecutor for FakeExecutor {
 #[derive(Debug, Default)]
 pub(crate) struct FakeInspector {
     rejects: bool,
+    duration: Duration,
 }
 
 impl FakeInspector {
     /// An inspector whose object rules deny everything.
     pub(crate) fn rejecting() -> Self {
-        Self { rejects: true }
+        Self {
+            rejects: true,
+            duration: Duration::ZERO,
+        }
     }
 
-    fn guard(&self, cancel: &CancellationToken) -> Result<(), SchemaError> {
-        if cancel.is_cancelled() {
-            return Err(SchemaError::Cancelled);
+    /// An inspector whose lookup takes the given time to finish.
+    pub(crate) fn taking(duration: Duration) -> Self {
+        Self {
+            rejects: false,
+            duration,
+        }
+    }
+
+    /// Races the same three futures the executor does, so `SchemaInspector`'s
+    /// deadline and cancellation reach a real caller exactly like
+    /// `QueryExecutor`'s do (ADR-0024), for both methods below without
+    /// duplicating the race in each.
+    async fn guard(
+        &self,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> Result<(), SchemaError> {
+        tokio::select! {
+            () = sleep(self.duration) => {}
+            () = cancel.cancelled() => return Err(SchemaError::Cancelled),
+            () = sleep_until(deadline) => return Err(SchemaError::Timeout),
         }
         if self.rejects {
             return Err(SchemaError::Rejected(rejection()));
@@ -281,11 +303,11 @@ impl SchemaInspector for FakeInspector {
     fn search_schema<'a>(
         &'a self,
         _request: &'a SchemaSearchRequest,
-        _deadline: Instant,
+        deadline: Instant,
         cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<SchemaSearchResult, SchemaError>> {
         Box::pin(async move {
-            self.guard(&cancel)?;
+            self.guard(deadline, &cancel).await?;
             Ok(SchemaSearchResult {
                 matches: vec![SchemaMatch {
                     schema: "app".to_owned(),
@@ -301,11 +323,11 @@ impl SchemaInspector for FakeInspector {
     fn describe_schema<'a>(
         &'a self,
         _request: &'a SchemaDescribeRequest,
-        _deadline: Instant,
+        deadline: Instant,
         cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<SchemaDescription, SchemaError>> {
         Box::pin(async move {
-            self.guard(&cancel)?;
+            self.guard(deadline, &cancel).await?;
             Ok(SchemaDescription {
                 schemas: vec![Schema {
                     name: "app".to_owned(),
@@ -333,6 +355,7 @@ impl SchemaInspector for FakeInspector {
 /// An explainer with a fixed outcome.
 #[derive(Debug, Default)]
 pub(crate) struct FakeExplainer {
+    duration: Duration,
     failure: Option<ExplainError>,
 }
 
@@ -340,7 +363,16 @@ impl FakeExplainer {
     /// An explainer that always fails the same way.
     pub(crate) fn failing(error: ExplainError) -> Self {
         Self {
+            duration: Duration::ZERO,
             failure: Some(error),
+        }
+    }
+
+    /// An explainer whose planning takes the given time to finish.
+    pub(crate) fn taking(duration: Duration) -> Self {
+        Self {
+            duration,
+            failure: None,
         }
     }
 }
@@ -349,12 +381,17 @@ impl Explainer for FakeExplainer {
     fn explain<'a>(
         &'a self,
         query: &'a AuthorizedQuery,
-        _deadline: Instant,
+        deadline: Instant,
         cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<QueryPlan, ExplainError>> {
         Box::pin(async move {
-            if cancel.is_cancelled() {
-                return Err(ExplainError::Cancelled);
+            // Races the same three futures the executor does, so a dropped future
+            // is never the only thing standing between planning and a hung
+            // connection (ADR-0024).
+            tokio::select! {
+                () = sleep(self.duration) => {}
+                () = cancel.cancelled() => return Err(ExplainError::Cancelled),
+                () = sleep_until(deadline) => return Err(ExplainError::Timeout),
             }
             if let Some(error) = &self.failure {
                 return Err(error.clone());

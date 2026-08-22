@@ -77,4 +77,32 @@ mod tests {
             .unwrap_err();
         assert_eq!(error, ExplainError::PrefixVerificationFailed);
     }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_cancelled_token_stops_planning_before_its_deadline() {
+        let explainer = testing::FakeExplainer::taking(Duration::from_secs(30));
+        let query = testing::authorized(Dialect::PostgreSql);
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let error = explainer
+            .explain(&query, Instant::now() + Duration::from_secs(5), cancel)
+            .await
+            .unwrap_err();
+        assert_eq!(error, ExplainError::Cancelled);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_deadline_reaches_the_adapter_instead_of_being_a_dropped_future() {
+        let explainer = testing::FakeExplainer::taking(Duration::from_secs(30));
+        let query = testing::authorized(Dialect::PostgreSql);
+        let error = explainer
+            .explain(
+                &query,
+                Instant::now() + Duration::from_secs(5),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error, ExplainError::Timeout);
+    }
 }
