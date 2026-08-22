@@ -88,10 +88,12 @@ pub struct ConnectionRuntime {
 impl ConnectionRuntime {
     /// Validates the parts and builds the connection's concurrency bound.
     ///
-    /// Validation order matters: the limits are checked first, which is what makes
-    /// `Semaphore::new(max_concurrent_queries)` safe to call — `ExecutionLimits`
+    /// Validation order matters: the limits are checked first, which is what rules
+    /// out `Semaphore::new(max_concurrent_queries)` receiving zero — `ExecutionLimits`
     /// rejects a zero bound, and a semaphore with zero permits would deadlock every
-    /// request instead of failing at startup.
+    /// request instead of failing at startup. (`Semaphore::new` also panics above
+    /// `Semaphore::MAX_PERMITS`, but that ceiling is far beyond any value validation
+    /// needs to guard against.)
     pub fn new(parts: ConnectionRuntimeParts) -> Result<Self, RuntimeError> {
         parts
             .limits
@@ -182,7 +184,7 @@ impl ConnectionRuntime {
     pub async fn acquire_query_permit(&self) -> Result<QueryPermit, ConnectionError> {
         let semaphore = Arc::clone(&self.query_semaphore);
         match timeout(self.limits.max_queue_wait, semaphore.acquire_owned()).await {
-            Ok(Ok(permit)) => Ok(QueryPermit(permit)),
+            Ok(Ok(permit)) => Ok(QueryPermit { _permit: permit }),
             // The semaphore is closed only during shutdown.
             Ok(Err(_closed)) => Err(ConnectionError::Unavailable {
                 name: self.metadata.name.clone(),
@@ -218,14 +220,19 @@ impl fmt::Debug for ConnectionRuntime {
 /// as the query runs. There is no way to construct one except through
 /// [`ConnectionRuntime::acquire_query_permit`], and no way to create extra slots at
 /// all.
-#[derive(Debug)]
 #[must_use = "dropping the permit releases the connection's concurrency slot"]
-pub struct QueryPermit(
-    // Held for its `Drop` effect only: nothing ever reads it back. `dead_code`
-    // cannot see a field used solely for RAII, so it is silenced here rather than
-    // by adding an accessor that would just hand the permit back out.
-    #[allow(dead_code)] OwnedSemaphorePermit,
-);
+pub struct QueryPermit {
+    /// Held for its `Drop` effect only; nothing ever reads it back.
+    _permit: OwnedSemaphorePermit,
+}
+
+/// See [`ConnectionRuntimeParts`]'s `Debug` for why this is hand-written rather than
+/// derived: a derived impl would render the permit's inner `Arc<Semaphore>` state.
+impl fmt::Debug for QueryPermit {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("QueryPermit").finish_non_exhaustive()
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -258,6 +265,26 @@ mod tests {
         let rendered = format!("{runtime:?}");
         assert!(rendered.contains("production-db"), "{rendered}");
         assert!(rendered.contains(".."), "{rendered}");
+        assert!(!rendered.contains("FakeExecutor"), "{rendered}");
+    }
+
+    #[test]
+    fn parts_debug_also_prints_no_port_and_no_secret() {
+        let parts = ConnectionRuntimeParts {
+            metadata: testing::connection(Dialect::MySql),
+            capabilities: testing::capabilities(),
+            limits: ExecutionLimits::default(),
+            analyzer: Arc::new(testing::FakeAnalyzer::new(Dialect::MySql)),
+            executor: Arc::new(testing::FakeExecutor::default()),
+            inspector: Arc::new(testing::FakeInspector::default()),
+            explainer: Arc::new(testing::FakeExplainer::default()),
+        };
+        let rendered = format!("{parts:?}");
+        assert!(rendered.contains("production-db"), "{rendered}");
+        assert!(rendered.contains(".."), "{rendered}");
+        for field in ["analyzer", "executor", "inspector", "explainer"] {
+            assert!(!rendered.contains(field), "{rendered}");
+        }
         assert!(!rendered.contains("FakeExecutor"), "{rendered}");
     }
 
@@ -302,8 +329,13 @@ mod tests {
         assert_eq!(runtime.available_permits(), 0);
 
         // The second caller waits exactly `max_queue_wait` and is then told the
-        // connection is busy, rather than waiting for a query it cannot see.
+        // connection is busy, rather than waiting for a query it cannot see. Asserting
+        // the elapsed time, not merely that the call eventually returns, is what
+        // distinguishes this connection's own configured bound from any other
+        // hardcoded duration a future refactor might substitute for it.
+        let started = tokio::time::Instant::now();
         let error = runtime.acquire_query_permit().await.unwrap_err();
+        assert_eq!(started.elapsed(), limits.max_queue_wait);
         assert_eq!(
             error,
             ConnectionError::Busy {
