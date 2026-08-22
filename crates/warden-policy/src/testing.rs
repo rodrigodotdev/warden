@@ -14,7 +14,7 @@ use std::num::NonZeroUsize;
 
 use warden_core::analysis::{
     FunctionClassification, FunctionRef, ObjectKind, ObjectRef, QueryAnalysis, QueryAnalysisParts,
-    StatementKind,
+    SqlIdentifier, StatementKind,
 };
 use warden_core::connection::{ConnectionMetadata, Environment};
 use warden_core::context::RequestContext;
@@ -79,12 +79,22 @@ pub(crate) fn analyzed(analysis: QueryAnalysis) -> AnalyzedQuery {
     AnalyzedQuery::new(request, analysis)
 }
 
-/// A table reference, optionally schema-qualified.
+/// A table reference, optionally schema-qualified. Unquoted, like ordinary SQL.
 pub(crate) fn table(schema: Option<&str>, name: &str) -> ObjectRef {
     ObjectRef {
         catalog: None,
-        schema: schema.map(str::to_owned),
-        name: name.to_owned(),
+        schema: schema.map(SqlIdentifier::unquoted),
+        name: SqlIdentifier::unquoted(name),
+        kind: ObjectKind::Table,
+    }
+}
+
+/// A quoted table reference, for the folding cases where quoting decides.
+pub(crate) fn quoted_table(schema: Option<&str>, name: &str) -> ObjectRef {
+    ObjectRef {
+        catalog: None,
+        schema: schema.map(SqlIdentifier::unquoted),
+        name: SqlIdentifier::quoted(name),
         kind: ObjectKind::Table,
     }
 }
@@ -92,10 +102,21 @@ pub(crate) fn table(schema: Option<&str>, name: &str) -> ObjectRef {
 /// A function reference with an explicit classification.
 pub(crate) fn function(name: &str, classification: FunctionClassification) -> FunctionRef {
     FunctionRef {
-        name: name.to_owned(),
+        name: SqlIdentifier::unquoted(name),
         schema: None,
         classification,
     }
+}
+
+/// Evaluates one object policy against a connection of a chosen dialect.
+pub(crate) fn check_object_against(
+    policy: &dyn ObjectAccessPolicy,
+    object: &ObjectRef,
+    dialect: Dialect,
+) -> PolicyDecision {
+    let context = request_context();
+    let connection = connection(dialect);
+    policy.check(object, &PolicyContext::new(&context, &connection))
 }
 
 /// Evaluates one policy against evidence, using a connection of a chosen dialect.
