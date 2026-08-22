@@ -19,9 +19,17 @@
 //! **Not in either table, on purpose.** `USER`, `CURRENT_USER`, `SESSION_USER`,
 //! `SYSTEM_USER`, `CONNECTION_ID`, `FOUND_ROWS`, and `ROW_COUNT` read account or
 //! session state rather than data, and `UUID_SHORT` increments a server-side
-//! counter, which is a write. All of them land in `Unknown` and are denied.
+//! counter, which is a write. `VERSION` reports server state that
+//! `docs/security.md` section 1 names a protected asset ("infrastructure
+//! hostnames and topology") and that section 10 already strips from error
+//! messages before they reach the model; allowlisting it here would hand the
+//! same information back on the result path instead. `UUID` fails the same
+//! bar for a different reason: MySQL's `UUID()` returns a version-1 UUID, which
+//! embeds the server host's MAC address, so it leaks that asset through a value
+//! rather than through a counter, the way `UUID_SHORT` does. All of them land
+//! in `Unknown` and are denied.
 
-// This module's `pub(crate)` item gains its first caller in Task 4's analyzer.
+// This module's `pub(crate)` item gains its first caller in Task 5's analyzer.
 // Until then only this file's own `#[cfg(test)]` block reaches it, which the
 // non-test build cannot see, so `dead_code` would otherwise fire here.
 #![allow(dead_code)]
@@ -288,9 +296,6 @@ const SAFE: &[&str] = &[
     // Information about the connection's own database, not about the account
     "database",
     "schema",
-    "version",
-    // Identifier generation with no server-side counter
-    "uuid",
 ];
 
 /// Classifies one function name, and names the risk when there is one.
@@ -362,10 +367,14 @@ mod tests {
         for name in [
             "user",
             "current_user",
+            "session_user",
+            "system_user",
             "connection_id",
             "found_rows",
             "row_count",
             "uuid_short",
+            "version",
+            "uuid",
         ] {
             assert_eq!(classify(name).0, FunctionClassification::Unknown, "{name}");
         }
