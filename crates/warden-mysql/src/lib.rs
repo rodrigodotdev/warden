@@ -19,5 +19,6 @@
 //! and `warden-policy` denies it with a code an auditor can read (ADR-0011). Only a
 //! statement that yielded nothing to evaluate becomes an `AnalyzeError`.
 
+mod functions;
 mod parse;
 mod statement;
