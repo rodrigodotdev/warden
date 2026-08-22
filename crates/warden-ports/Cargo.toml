@@ -12,3 +12,23 @@ publish = false
 workspace = true
 
 [dependencies]
+warden-core = { workspace = true }
+warden-policy = { workspace = true }
+thiserror = { workspace = true }
+# `sync` for the per-connection Semaphore and `time` for the bounded queue wait
+# (`docs/architecture.md` section 6.1). No runtime feature: this crate defines
+# ports, it never starts a runtime.
+tokio = { workspace = true, features = ["sync", "time"] }
+# `CancellationToken` lives in the ungated `tokio_util::sync` module, so the
+# workspace's `default-features = false` is enough (verified against tokio-util
+# 0.7.19).
+tokio-util = { workspace = true }
+time = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+# `QueryPlan::plan` is a `serde_json::Value`, so the explainer fake needs the crate.
+serde_json = { workspace = true }
+# `test-util` provides `#[tokio::test(start_paused = true)]`, which makes every
+# deadline and queue-wait test deterministic and instant.
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }

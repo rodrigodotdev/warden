@@ -60,6 +60,41 @@ otherwise, none blocks M0–M5.
     provides a patent grant and is common for security infrastructure; AGPL prevents
     closed-source SaaS resale. This is a product decision.
 
+13. **Can `SchemaInspector` filter objects at the source without changing its
+    signature?** No. `docs/security.md` §5.2 requires the inspector to receive the
+    allowed set and filter at the source rather than return the whole catalog for a
+    service to filter afterward, but `search_schema`/`describe_schema`
+    (`crates/warden-ports/src/inspector.rs`) take only a request, a deadline, and a
+    cancellation token — no allowed set and no `RequestContext`. `SchemaError::Rejected`
+    carries a `PolicyRejection`, whose constructor is reachable only from
+    `PolicyEngine::authorize` or `check_object`, and both need per-request identity
+    that never reaches an adapter holding only a startup `Arc<PolicyEngine>`.
+    `describe_schema` could call `check_object` per table before dispatch, but that is
+    the "service filters afterward" shape §5.2 rejects, and it leaves
+    `SchemaError::Rejected` unproducible by any adapter; `search_schema` cannot be
+    salvaged that way at all, since a denied match the adapter already found would
+    consume an allowed match's slot under the request's `limit` before anything could
+    filter it back out. The fix is a signature change — add `context: &'a
+    RequestContext` or an explicit allowed-set parameter to both methods — and
+    Milestone 9 is expected to make it, so it lands there as an accepted change
+    rather than a surprise.
+
+14. **Does anything besides convention stop an adapter from bypassing the query
+    permit or the audit attempt?** No. `ConnectionRuntime::executor()` and
+    `explainer()` hand out their trait objects unconditionally, so
+    `execute_read_only`/`explain` compile and run without ever calling
+    `acquire_query_permit`, and the audit two-phase ordering (ADR-0022) likewise
+    lives only in a doc comment — of the milestone's three structural claims, only
+    "an unauthorized statement cannot execute" is enforced by types. The same gap
+    means `explain` concurrency is currently bounded by `agent_pool`, not by
+    `max_concurrent_queries` (SPEC invariant 17), even though planning runs real work
+    on the server. Two resolutions are on the table: move `execute_read_only` and
+    `explain` onto `ConnectionRuntime` itself, which would acquire the permit
+    internally and drop the `executor()`/`explainer()` accessors, or add a
+    `&QueryPermit` witness parameter so the call site cannot compile without a slot.
+    Both are cheap now and expensive once Milestone 7/8 ship adapters, which is why
+    this is recorded ahead of Milestone 11 rather than left to be discovered there.
+
 ## 3. Future work deliberately outside v0.x
 
 ### Adapters

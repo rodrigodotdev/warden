@@ -409,14 +409,21 @@ pub struct AuditOutcomeEvent {
     pub duration: Option<Duration>,
     pub rows_returned: Option<usize>,
     pub result_bytes: Option<usize>,
-    pub error_code: Option<&'static str>,
+    pub error_code: Option<PublicErrorCode>,
 }
 
 pub enum AuditOutcome { Denied, Succeeded, Failed, TimedOut, Cancelled }
 ```
 
 Identifiers are newtypes, not `String`; swapping two `String` fields in an audit event
-would otherwise compile.
+would otherwise compile. `error_code` is the `PublicErrorCode` enum rather than a
+string, so an outcome cannot record a code outside the closed set of section 10.
+
+Both types live in `warden-ports`, not `warden-core`: `AuditAttempt` carries
+`DenyReason`, which belongs to `warden-policy`, downstream of the core. Neither
+derives `Serialize` — a record carrying internal denial detail must not be attachable
+to a tool response by accident, and Milestone 13's sink decides its own format for the
+fields it may write.
 
 ### 11.3 SQL in audits
 
