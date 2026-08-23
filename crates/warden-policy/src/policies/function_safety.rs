@@ -33,7 +33,7 @@ impl FunctionSafetyPolicy {
     fn qualified(function: &FunctionRef) -> String {
         match &function.schema {
             Some(schema) => format!("{schema}.{}", function.name),
-            None => function.name.clone(),
+            None => function.name.to_string(),
         }
     }
 }
@@ -80,7 +80,7 @@ impl Policy for FunctionSafetyPolicy {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use warden_core::analysis::QueryAnalysis;
+    use warden_core::analysis::{QueryAnalysis, SqlIdentifier};
     use warden_core::dialect::Dialect;
 
     use super::*;
@@ -149,8 +149,8 @@ mod tests {
     #[test]
     fn a_qualified_call_is_reported_with_its_schema() {
         let analysis = with_functions(vec![FunctionRef {
-            name: "do_something".to_owned(),
-            schema: Some("public".to_owned()),
+            name: SqlIdentifier::unquoted("do_something"),
+            schema: Some(SqlIdentifier::unquoted("public")),
             classification: FunctionClassification::Unknown,
         }]);
         assert_eq!(

@@ -205,15 +205,16 @@ that the supposedly generic core was secretly shaped around MySQL.
 - [ ] MySQL and PostgreSQL analyzers exist
 - [ ] Both adapters execute safe read-only queries
 - [x] SQLx's `any` feature is disabled and `AnyPool` is unreachable (`tests/architecture.rs`)
-- [ ] Both adapters use concrete pools (pending M6; `warden-mysql` and
-      `warden-postgres` are currently doc-comment placeholders)
-- [ ] `sqlparser` appears only inside adapter crates
+- [ ] Both adapters use concrete pools (pending M6; `warden-mysql` now has
+      its analyzer but no pool, `warden-postgres` is still a doc-comment
+      placeholder)
+- [x] `sqlparser` appears only inside adapter crates
 - [ ] Multiple statements are denied
 - [ ] Nested writes are denied
 - [ ] Locking reads are denied
 - [ ] Known dangerous functions have regression tests
 - [ ] Unknown functions are denied by default
-- [ ] MySQL file access and output are denied
+- [x] MySQL file access and output are denied
 - [ ] PostgreSQL sequence mutation is denied
 - [ ] Dedicated test roles demonstrably cannot write
 - [ ] Read-only transactions are verified

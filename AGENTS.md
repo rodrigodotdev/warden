@@ -28,7 +28,7 @@ prevails.
 | `warden-policy` depends on `sqlx` or `rmcp` | `Cargo.toml` |
 | `warden-service` depends on `sqlx` | `Cargo.toml` |
 | adapters depend on `rmcp` | `Cargo.toml` |
-| a `sqlparser` AST type appears in an adapter's public signature | manual review; tooling planned for M4 |
+| a `sqlparser` AST type appears in `warden-mysql`'s public signature | `crates/warden-mysql/tests/adapter_rules.rs` (crate-local; M5 owes the equivalent for `warden-postgres`) |
 | `AnyPool` | the sqlx `any` feature is disabled, causing a compile error |
 | `sqlx::raw_sql` | `clippy.toml` -> `disallowed-methods` |
 | `println!` / `print!` | `clippy::print_stdout = "deny"` |

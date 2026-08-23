@@ -103,7 +103,7 @@ in ordinary database tools.
 ```rust
 pub struct QueryAnalysis {
     dialect: Dialect,
-    statement_count: usize,
+    statement_count: NonZeroUsize,
     root_kind: StatementKind,
     nested_kinds: Vec<StatementKind>,
     objects: Vec<ObjectRef>,
@@ -135,9 +135,9 @@ review.
 
 ```rust
 pub struct ObjectRef {
-    pub catalog: Option<String>,
-    pub schema: Option<String>,
-    pub name: String,
+    pub catalog: Option<SqlIdentifier>,
+    pub schema: Option<SqlIdentifier>,
+    pub name: SqlIdentifier,
     pub kind: ObjectKind,
 }
 
@@ -150,13 +150,17 @@ subquery aliases are **not** `ObjectRef` values.
 
 ```rust
 pub struct FunctionRef {
-    pub name: String,
-    pub schema: Option<String>,
+    pub name: SqlIdentifier,
+    pub schema: Option<SqlIdentifier>,
     pub classification: FunctionClassification,
 }
 
 pub enum FunctionClassification { KnownSafe, KnownDangerous, Unknown }
 ```
+
+Each name part is a `SqlIdentifier { value, quoting }`: the value without quote
+characters, plus whether the statement quoted it. Policy comparison needs that bit
+(`docs/security.md` section 5.1, ADR-0027).
 
 ```text
 KnownSafe      -> eligible

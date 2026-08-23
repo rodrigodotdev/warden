@@ -87,7 +87,7 @@ layer.
 **The table allowlist does not bound what the agent can read.** It operates on AST
 names, but names do not determine what a relation reads.
 
-Four structural bypasses exist:
+Five structural bypasses exist:
 
 1. **Views.** `SELECT * FROM public_report` passes the allowlist while the view reads
    `users.password_hash`; the parser sees only the view name.
@@ -96,6 +96,12 @@ Four structural bypasses exist:
 4. **Identifier folding.** PostgreSQL folds unquoted identifiers to lowercase, so a
    deny-list entry named `Users` would never match. MySQL case sensitivity depends on
    `lower_case_table_names` and the file system.
+5. **CTE-name shadowing (MySQL analyzer).** `visit::collect` subtracts every
+   unqualified relation whose name matches a declared CTE alias anywhere in the
+   statement, not only within that alias's own scope. `WITH orders AS (SELECT * FROM
+   orders) SELECT * FROM orders` self-references the real base table — MySQL resolves
+   a non-`RECURSIVE` CTE's own body to a table of that name — but the analyzer drops
+   it along with the alias, so `TableAllowDenyPolicy` never evaluates it.
 
 **Design consequence:** the dedicated role's `GRANT SELECT` bounds read scope. The
 allowlist remains useful for reducing attack surface and improving error messages,
@@ -113,18 +119,19 @@ but public material does not present it as a security boundary.
     `lower_case_table_names`.
   Without this rule, policy has silent false negatives.
 
-  **Current state (Milestone 2).** `warden_core::analysis::ObjectRef` does not yet
-  record whether a name was quoted, so the quoted/unquoted split above cannot be
-  implemented until an analyzer produces that bit. `folding.rs` compares both
-  dialects ASCII-case-insensitively behind a function that matches `Dialect`
-  exhaustively, so a quoted PostgreSQL `"Users"` currently matches a rule spelled
-  `users`. This is acceptable in the interim because the allowlist is not the
-  read-scope boundary — the dedicated role's `GRANT SELECT` is (ADR-0023) — and it
-  is tracked as parser-dependent work for the M4/M5 analyzers (`docs/milestones.md`),
-  which is where the quoted/unquoted rule above lands.
-- **CTE names and subquery aliases are not `ObjectRef`.** The analyzer must distinguish
-  `WITH x AS (SELECT * FROM secrets) SELECT * FROM x`; `secrets` is the relation, and
-  `x` is not an object.
+  **Shipped in Milestone 4 (ADR-0027).** `warden_core::analysis::SqlIdentifier`
+  carries each name part together with the quoting the statement used, and
+  `warden_policy::folding::rule_matches` applies the rule above: PostgreSQL folds an
+  unquoted identifier and compares a quoted one exactly, MySQL compares
+  case-insensitively regardless of backticks. An analyzer that cannot report quoting
+  cannot build an `ObjectRef`.
+- **CTE names and subquery aliases are not `ObjectRef`.** The shipped MySQL analyzer
+  does not track scope to distinguish them precisely; it approximates by dropping any
+  unqualified relation whose name matches a declared CTE alias anywhere in the
+  statement. That correctly removes the alias from `WITH x AS (SELECT * FROM secrets)
+  SELECT * FROM x`, but it also removes a real relation that happens to share a CTE's
+  name (bypass 5, above). Precise scope resolution needs a name resolver the analyzer
+  does not have.
 
 ### 5.2 Object policy applies to every tool
 
@@ -284,6 +291,15 @@ INTO OUTFILE  INTO DUMPFILE
 locking SELECT forms
 session/user variable assignment
 ```
+
+**How each one is detected (Milestone 4).** Locking clauses, `SELECT INTO`,
+`EXPLAIN ANALYZE`, `:=` assignment, stored-routine calls, and every function above
+come from the AST. `INTO OUTFILE` and `INTO DUMPFILE` do **not**: sqlparser 0.62
+rejects both, so they are detected by a token-level guard that reports
+`RiskFlag::FileOutput`, keeping the audit record accurate and the denial independent
+of a parser limitation (ADR-0028). `LOCK IN SHARE MODE` is likewise unparseable
+today and is denied as a parse error; the corpus records that, so an upgrade that
+changes it fails a test rather than passing silently.
 
 The list is not assumed complete. The database account remains the boundary.
 

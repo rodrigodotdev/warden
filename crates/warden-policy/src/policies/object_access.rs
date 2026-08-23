@@ -7,11 +7,11 @@
 //! smaller attack surface and a better error message, and public material must not
 //! present them as more than that.
 
-use warden_core::analysis::ObjectRef;
+use warden_core::analysis::{ObjectRef, SqlIdentifier};
 use warden_core::dialect::Dialect;
 
 use crate::decision::{DenyCode, DenyReason, PolicyDecision};
-use crate::folding::folded_eq;
+use crate::folding::rule_matches;
 use crate::input::PolicyContext;
 use crate::policy::ObjectAccessPolicy;
 
@@ -107,8 +107,8 @@ impl ObjectRule {
 ///
 /// Which slot an adapter fills is the adapter's decision, because a two-part name
 /// means different things on MySQL and PostgreSQL. Policy compares the nearest one.
-fn qualifier_of(object: &ObjectRef) -> Option<&str> {
-    object.schema.as_deref().or(object.catalog.as_deref())
+fn qualifier_of(object: &ObjectRef) -> Option<&SqlIdentifier> {
+    object.schema.as_ref().or(object.catalog.as_ref())
 }
 
 /// Restricts which schemas a connection may touch.
@@ -157,7 +157,7 @@ impl ObjectAccessPolicy for SchemaAllowListPolicy {
         let dialect = context.dialect();
         if allowed
             .iter()
-            .any(|schema| folded_eq(dialect, schema, qualifier))
+            .any(|schema| rule_matches(dialect, schema, qualifier))
         {
             return PolicyDecision::Allow;
         }
@@ -204,24 +204,24 @@ impl TableAllowDenyPolicy {
 
     /// Strict matching, used for the allowlist.
     fn allows(rule: &ObjectRule, object: &ObjectRef, dialect: Dialect) -> bool {
-        if !folded_eq(dialect, rule.name(), &object.name) {
+        if !rule_matches(dialect, rule.name(), &object.name) {
             return false;
         }
         match (rule.qualifier(), qualifier_of(object)) {
             (None, _) => true,
-            (Some(expected), Some(actual)) => folded_eq(dialect, expected, actual),
+            (Some(expected), Some(actual)) => rule_matches(dialect, expected, actual),
             (Some(_), None) => false,
         }
     }
 
     /// Fail-closed matching, used for the denylist.
     fn denies(rule: &ObjectRule, object: &ObjectRef, dialect: Dialect) -> bool {
-        if !folded_eq(dialect, rule.name(), &object.name) {
+        if !rule_matches(dialect, rule.name(), &object.name) {
             return false;
         }
         match (rule.qualifier(), qualifier_of(object)) {
             (None, _) | (_, None) => true,
-            (Some(expected), Some(actual)) => folded_eq(dialect, expected, actual),
+            (Some(expected), Some(actual)) => rule_matches(dialect, expected, actual),
         }
     }
 }
@@ -366,9 +366,9 @@ mod tests {
     fn the_catalog_is_used_when_there_is_no_schema() {
         let policy = SchemaAllowListPolicy::new(vec!["app".to_owned()]);
         let object = ObjectRef {
-            catalog: Some("other".to_owned()),
+            catalog: Some(SqlIdentifier::unquoted("other")),
             schema: None,
-            name: "orders".to_owned(),
+            name: SqlIdentifier::unquoted("orders"),
             kind: ObjectKind::Table,
         };
         assert!(!allowed(&policy, &object, Dialect::MySql));
@@ -475,5 +475,21 @@ mod tests {
         // The agent learns that some object was refused, never which one: a
         // specific message is an enumeration oracle.
         assert!(!reason.code().public_message().contains("secrets"));
+    }
+
+    #[test]
+    fn a_quoted_postgres_name_does_not_match_a_lowercase_rule() {
+        // The bypass `docs/security.md` section 5.1 names: `"Users"` and `users` are
+        // two relations, and a deny rule for one must not be read as covering both.
+        let policy = TableAllowDenyPolicy::new(None, vec![ObjectRule::parse("users").unwrap()]);
+        let quoted = testing::quoted_table(None, "Users");
+        assert!(matches!(
+            testing::check_object_against(&policy, &quoted, Dialect::PostgreSql),
+            PolicyDecision::Allow
+        ));
+        assert!(matches!(
+            testing::check_object_against(&policy, &quoted, Dialect::MySql),
+            PolicyDecision::Deny(_)
+        ));
     }
 }

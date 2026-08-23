@@ -9,7 +9,9 @@ use std::num::NonZeroUsize;
 use crate::dialect::Dialect;
 use crate::fingerprint::QueryFingerprint;
 
-pub use reference::{FunctionClassification, FunctionRef, ObjectKind, ObjectRef};
+pub use reference::{
+    FunctionClassification, FunctionRef, IdentifierQuoting, ObjectKind, ObjectRef, SqlIdentifier,
+};
 pub use risk::RiskFlag;
 pub use statement::StatementKind;
 
@@ -173,12 +175,12 @@ mod tests {
             nested_kinds: vec![StatementKind::Delete],
             objects: vec![ObjectRef {
                 catalog: None,
-                schema: Some("app".to_owned()),
-                name: "orders".to_owned(),
+                schema: Some(SqlIdentifier::unquoted("app")),
+                name: SqlIdentifier::unquoted("orders"),
                 kind: ObjectKind::Table,
             }],
             functions: vec![FunctionRef {
-                name: "pg_sleep".to_owned(),
+                name: SqlIdentifier::unquoted("pg_sleep"),
                 schema: None,
                 classification: FunctionClassification::KnownDangerous,
             }],
@@ -197,7 +199,7 @@ mod tests {
         assert_eq!(analysis.root_kind(), StatementKind::Select);
         assert_eq!(analysis.nested_kinds(), [StatementKind::Delete]);
         assert_eq!(analysis.objects()[0].qualified_name(), "app.orders");
-        assert_eq!(analysis.functions()[0].name, "pg_sleep");
+        assert_eq!(analysis.functions()[0].name.value(), "pg_sleep");
         assert!(analysis.has_side_effects());
         assert!(!analysis.has_locking_clause());
         assert_eq!(
