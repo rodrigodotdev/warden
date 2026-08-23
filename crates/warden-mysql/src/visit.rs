@@ -12,7 +12,8 @@ use sqlparser::ast::{
     BinaryOperator, Expr, ObjectName, Query, Select, Statement, TableFactor, Visit, Visitor,
 };
 use warden_core::analysis::{
-    FunctionRef, ObjectKind, ObjectRef, RiskFlag, SqlIdentifier, StatementKind,
+    FunctionClassification, FunctionRef, ObjectKind, ObjectRef, RiskFlag, SqlIdentifier,
+    StatementKind,
 };
 
 use crate::functions;
@@ -50,15 +51,30 @@ pub(crate) struct Evidence {
 ///
 /// This is the same set of kinds `collect`'s exhaustive match treats as a write; kept
 /// as its own function because the walk needs the answer before that match runs.
+///
+/// Written as an exhaustive `match`, not `matches!`, because `matches!` silently
+/// returns `false` for any variant its pattern does not name. ADR-0021 requires a
+/// new `warden-core` enum variant to break the build rather than slip through, and
+/// `adapter_rules.rs`'s wildcard scan only looks for `_ =>` / `_ if` arms — a
+/// `matches!` call is invisible to it. Every [`StatementKind`] variant is named
+/// below so the compiler, not a scanner, is the guard.
 fn is_write_kind(kind: StatementKind) -> bool {
-    matches!(
-        kind,
+    match kind {
         StatementKind::Insert
-            | StatementKind::Update
-            | StatementKind::Delete
-            | StatementKind::Merge
-            | StatementKind::Copy
-    )
+        | StatementKind::Update
+        | StatementKind::Delete
+        | StatementKind::Merge
+        | StatementKind::Copy => true,
+        StatementKind::Select
+        | StatementKind::Explain
+        | StatementKind::Show
+        | StatementKind::Ddl
+        | StatementKind::TransactionControl
+        | StatementKind::SessionControl
+        | StatementKind::Call
+        | StatementKind::Utility
+        | StatementKind::Unknown => false,
+    }
 }
 
 impl Evidence {
@@ -107,6 +123,17 @@ impl Evidence {
     }
 
     /// Classifies one function call and records both halves of the evidence.
+    ///
+    /// A schema-qualified call is never checked against the built-in registry. In
+    /// MySQL a built-in function name cannot be schema-qualified — writing
+    /// `schema.name(...)` is only legal for a stored routine — so a two-part call is
+    /// provably user-defined the moment it is seen, before any name comparison
+    /// happens. Consulting `functions::classify` on the bare name anyway would let
+    /// any stored routine that happens to share a name with a `SAFE` entry (`format`,
+    /// `now`, `count`, `if`, `left`, `right`, ...) launder itself into `KnownSafe` and
+    /// skip the `UserDefinedFunction` risk that authorization depends on. The schema
+    /// is still recorded on the `FunctionRef` either way:
+    /// `FunctionSafetyPolicy::qualified()` renders `schema.name` in its audit detail.
     fn record_function(&mut self, name: &ObjectName) {
         let Some(mut parts) = identifiers(name) else {
             self.flag(RiskFlag::UnknownConstruct);
@@ -117,7 +144,14 @@ impl Evidence {
             return;
         };
         let schema = parts.pop();
-        let (classification, risk) = functions::classify(function.value());
+        let (classification, risk) = if schema.is_some() {
+            (
+                FunctionClassification::Unknown,
+                Some(RiskFlag::UserDefinedFunction),
+            )
+        } else {
+            functions::classify(function.value())
+        };
         if let Some(risk) = risk {
             self.flag(risk);
         }
@@ -429,6 +463,23 @@ mod tests {
         assert_eq!(
             function.schema.as_ref().map(SqlIdentifier::value),
             Some("sch")
+        );
+        assert_eq!(function.classification, FunctionClassification::Unknown);
+        assert!(evidence.risks.contains(&RiskFlag::UserDefinedFunction));
+    }
+
+    #[test]
+    fn a_schema_qualified_call_to_a_safe_name_is_denied_not_laundered() {
+        // `format` is on the `SAFE` list, but a MySQL built-in cannot be
+        // schema-qualified, so `app.format(1)` is provably a stored routine and must
+        // not be classified against the registry: Finding 1 of the whole-branch
+        // review.
+        let evidence = evidence("SELECT app.format(1) FROM orders");
+        let function = &evidence.functions[0];
+        assert_eq!(function.name.value(), "format");
+        assert_eq!(
+            function.schema.as_ref().map(SqlIdentifier::value),
+            Some("app")
         );
         assert_eq!(function.classification, FunctionClassification::Unknown);
         assert!(evidence.risks.contains(&RiskFlag::UserDefinedFunction));

@@ -130,8 +130,10 @@ impl ObjectKind {
 /// `WITH x AS (SELECT * FROM secrets) SELECT * FROM x`, `secrets` is the object and
 /// `x` is not (`docs/security.md` section 5.1).
 ///
-/// The parts are stored exactly as written. Case folding is dialect-specific and
-/// belongs to policy comparison in the adapters, not to this type.
+/// Each part is a [`SqlIdentifier`]: the value with any quote characters stripped,
+/// together with the quoting the statement used for that part (ADR-0027). Case
+/// folding is dialect-specific and happens in `warden_policy::folding::rule_matches`,
+/// not here — this type only carries what the statement wrote.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize)]
 pub struct ObjectRef {
     /// Catalog or database qualifier, when the statement wrote one.

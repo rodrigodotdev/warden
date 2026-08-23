@@ -16,6 +16,15 @@
 //! Names are compared ASCII-lowercased. MySQL function names are case-insensitive,
 //! and Unicode folding would make a security comparison depend on locale data.
 //!
+//! **Known limitation.** MySQL resolves `SELECT format (1)` — with a space before
+//! the opening parenthesis — to a *stored* function of that name rather than the
+//! built-in, and a schema-qualified call is denied for exactly this reason (see
+//! `visit::record_function`). But sqlparser discards that whitespace before this
+//! registry ever sees the call, so an unqualified `format (1)` and `format(1)`
+//! produce the same AST and this table cannot tell them apart. Only a token-level
+//! guard, reading the source text directly, could close this gap; the registry
+//! that classifies by name alone cannot see it.
+//!
 //! **Not in either table, on purpose.** `USER`, `CURRENT_USER`, `SESSION_USER`,
 //! `SYSTEM_USER`, `CONNECTION_ID`, `FOUND_ROWS`, and `ROW_COUNT` read account or
 //! session state rather than data, and `UUID_SHORT` increments a server-side

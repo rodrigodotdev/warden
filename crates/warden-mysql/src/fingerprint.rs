@@ -8,6 +8,13 @@
 //! Identifier quoting is **not** erased: `` `Orders` `` and `Orders` fingerprint
 //! differently, because on some MySQL configurations they are different relations and
 //! a fingerprint that merged them would merge two different questions.
+//!
+//! A batch's normalized statements are joined with `"; "` before hashing. That join
+//! is not proven injective — a literal `"; "` inside one normalized statement could
+//! in principle make two different batches collide — but nothing depends on it being
+//! one: the fingerprint is a correlation key for grouping audit records, not
+//! something any policy authorizes on, so a false correlation costs at most a
+//! confusing audit query, never an authorization decision.
 
 use core::ops::ControlFlow;
 use std::fmt::Write as _;

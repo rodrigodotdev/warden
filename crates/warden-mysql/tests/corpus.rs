@@ -162,6 +162,50 @@ const READS: &[Case] = &[
         risks: &[],
         verdict: None,
     },
+    Case {
+        // Finding 3 of the whole-branch review, pinned as a recorded contract. The
+        // CTE is named `orders`, the same as the real base table it selects from.
+        // CTE subtraction in `visit::collect` drops every unqualified relation whose
+        // name matches a declared alias anywhere in the statement, not only within
+        // that alias's own scope, so the inner `orders` — which MySQL resolves to
+        // the real table, since a non-`RECURSIVE` CTE cannot self-reference — is
+        // dropped along with the alias. `docs/security.md` section 5 records this as
+        // the fifth structural bypass of the allowlist; ADR-0023 makes the role's
+        // `GRANT SELECT` the actual read boundary. This row exists so a later change
+        // to the subtraction (exact match, or scope-aware) is visible here rather
+        // than silently changing behaviour.
+        sql: "WITH orders AS (SELECT * FROM orders) SELECT * FROM orders",
+        root_kind: Some(StatementKind::Select),
+        nested_kinds: &[],
+        objects: &[],
+        functions: &[],
+        risks: &[],
+        verdict: None,
+    },
+    Case {
+        // `docs/testing.md` section 3.1 names "comments" as its own theme; the
+        // optimizer-hint row above covers it only incidentally.
+        sql: "-- a leading comment\nSELECT id FROM orders",
+        root_kind: Some(StatementKind::Select),
+        nested_kinds: &[],
+        objects: &["orders"],
+        functions: &[],
+        risks: &[],
+        verdict: None,
+    },
+    Case {
+        // `DUAL` is MySQL's no-table placeholder. The analyzer reports it as an
+        // ordinary `ObjectRef` — it cannot tell a pseudo-table from a real one — so
+        // it fails toward denial under an allowlist rather than being silently
+        // dropped. Pinned here so a later change is visible.
+        sql: "SELECT 1 FROM DUAL",
+        root_kind: Some(StatementKind::Select),
+        nested_kinds: &[],
+        objects: &["DUAL"],
+        functions: &[],
+        risks: &[],
+        verdict: None,
+    },
 ];
 
 const WRITES: &[Case] = &[
@@ -424,6 +468,19 @@ const FUNCTIONS: &[Case] = &[
         nested_kinds: &[],
         objects: &["orders"],
         functions: &[("custom_metric", FunctionClassification::Unknown)],
+        risks: &[RiskFlag::UserDefinedFunction],
+        verdict: Some(DenyCode::UnknownFunction),
+    },
+    Case {
+        // Finding 1 of the whole-branch review: `format` is on the `SAFE` list, but
+        // a MySQL built-in cannot be schema-qualified, so this call is provably a
+        // stored routine and must not be classified against the registry. Before
+        // the fix this row reached `KnownSafe` with no risk and was authorized.
+        sql: "SELECT app.format(1) FROM orders",
+        root_kind: Some(StatementKind::Select),
+        nested_kinds: &[],
+        objects: &["orders"],
+        functions: &[("format", FunctionClassification::Unknown)],
         risks: &[RiskFlag::UserDefinedFunction],
         verdict: Some(DenyCode::UnknownFunction),
     },

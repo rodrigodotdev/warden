@@ -103,7 +103,7 @@ in ordinary database tools.
 ```rust
 pub struct QueryAnalysis {
     dialect: Dialect,
-    statement_count: usize,
+    statement_count: NonZeroUsize,
     root_kind: StatementKind,
     nested_kinds: Vec<StatementKind>,
     objects: Vec<ObjectRef>,

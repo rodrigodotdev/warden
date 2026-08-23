@@ -14,9 +14,9 @@ use sqlparser::parser::{Parser, ParserError};
 /// `recursive-protection` feature keeps a deep tree from overflowing the stack
 /// (`docs/operations.md` section 2.4).
 ///
-/// Measured against sqlparser 0.62: 2000 chained `OR`s and 200 CTEs parse well within
-/// it, because operator chains and CTE lists are iterative, not recursive. What it
-/// stops is depth — roughly 50 nested parentheses or subqueries.
+/// Measured against sqlparser 0.62: 2000 chained `OR`s parse well within it, because
+/// an operator chain is iterative, not recursive. What it stops is depth — roughly 50
+/// nested parentheses or subqueries.
 pub(crate) const RECURSION_LIMIT: usize = 50;
 
 /// Why the MySQL grammar produced no statement list.
