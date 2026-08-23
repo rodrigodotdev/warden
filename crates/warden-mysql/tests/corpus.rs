@@ -136,6 +136,32 @@ const READS: &[Case] = &[
         risks: &[],
         verdict: None,
     },
+    Case {
+        // Unquoted identifier case is preserved as written, not folded.
+        sql: "SELECT id FROM Orders",
+        root_kind: Some(StatementKind::Select),
+        nested_kinds: &[],
+        objects: &["Orders"],
+        functions: &[],
+        risks: &[],
+        verdict: None,
+    },
+    Case {
+        // The CTE alias is declared `Report` and referenced as `report`. CTE
+        // subtraction in `visit::collect` compares names with
+        // `eq_ignore_ascii_case`, so the alias is still recognized and dropped
+        // across the case difference; only the real relation the CTE reads
+        // survives. If that comparison were ever tightened to an exact match,
+        // `report` would leak into the object list as if it were a real table,
+        // and this row would catch it.
+        sql: "WITH Report AS (SELECT * FROM secrets) SELECT * FROM report",
+        root_kind: Some(StatementKind::Select),
+        nested_kinds: &[],
+        objects: &["secrets"],
+        functions: &[],
+        risks: &[],
+        verdict: None,
+    },
 ];
 
 const WRITES: &[Case] = &[

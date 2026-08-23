@@ -62,15 +62,19 @@ fn source_files() -> Vec<PathBuf> {
 }
 
 /// Lines of code, with comment lines and the `#[cfg(test)]` module removed.
+///
+/// The cut point is a line whose *trimmed* text is exactly `#[cfg(test)]`, not
+/// the first place that string occurs anywhere in the file. A substring match
+/// would let a doc comment that happens to mention `#[cfg(test)]` earlier in
+/// the file silently hide every real line below it — export guard included —
+/// while the tests kept passing.
 fn code_lines(path: &Path) -> Vec<(usize, String)> {
     let text = fs::read_to_string(path)
         .unwrap_or_else(|error| panic!("could not read {}: {error}", path.display()));
-    let body = text
-        .split_once("#[cfg(test)]")
-        .map_or(text.as_str(), |(before, _)| before);
-    body.lines()
+    text.lines()
         .enumerate()
         .map(|(index, line)| (index + 1, line.trim().to_owned()))
+        .take_while(|(_, line)| line != "#[cfg(test)]")
         .filter(|(_, line)| !line.starts_with("//"))
         .collect()
 }
@@ -124,6 +128,13 @@ fn only_the_analyzer_and_the_crate_root_export_anything() {
 
 #[test]
 fn no_public_signature_names_a_parser_type() {
+    // Deliberately not filtered by `is_exported`: Rust forbids `pub` inside a
+    // trait-impl block, so `impl QueryAnalyzer for MySqlAnalyzer`'s methods —
+    // the actual public contract `warden-service` calls — start with `fn`, not
+    // `pub fn`, and would be invisible to a `pub`-only scan. The two public
+    // files are small and reviewed, so scanning every non-comment line in them
+    // is precise enough; `names_type`'s word-boundary check still keeps
+    // `StatementKind` from matching `Statement`.
     let mut violations = Vec::new();
     for path in source_files() {
         let name = path
@@ -134,9 +145,6 @@ fn no_public_signature_names_a_parser_type() {
             continue;
         }
         for (number, line) in code_lines(&path) {
-            if !is_exported(&line) {
-                continue;
-            }
             for ast_type in AST_TYPES {
                 if names_type(&line, ast_type) {
                     violations.push(format!("  {}:{number}: {line}", path.display()));
@@ -147,10 +155,13 @@ fn no_public_signature_names_a_parser_type() {
 
     assert!(
         violations.is_empty(),
-        "a `sqlparser` type appears in a public signature:\n{}\n\n\
+        "a `sqlparser` type appears in the crate's public surface:\n{}\n\n\
          SPEC section 6, invariant 28 and ADR-0007 keep parser ASTs inside adapter \
          crates; that is the seam that lets a future adapter replace `sqlparser` \
-         without touching MCP, core, policy, or audit models.",
+         without touching MCP, core, policy, or audit models. This scan covers \
+         every line of `lib.rs` and `analyzer.rs`, not only `pub`-prefixed ones, \
+         because a trait-impl method such as `QueryAnalyzer::analyze` is public \
+         without ever writing the word `pub`.",
         violations.join("\n")
     );
 }
@@ -232,6 +243,20 @@ fn the_scans_are_alive() {
         source_files().len() >= 7,
         "fewer modules than Milestone 4 shipped; the scans may be reading the wrong \
          directory"
+    );
+
+    // The AST-containment scan no longer filters on `is_exported`, because a
+    // trait-impl method — `QueryAnalyzer::analyze`'s own signature, for
+    // instance — is public without ever writing `pub`. Prove the detection
+    // primitive still fires on that shape, so the widened scan would catch it.
+    assert!(
+        names_type(
+            "fn analyze(&self, s: &Statement) -> Result<Foo, Bar> {",
+            "Statement"
+        ),
+        "a parser type in a trait-impl method signature, which never starts \
+         with `pub`, must still be caught now that the scan is not gated on \
+         `is_exported`"
     );
 
     // The wildcard scan must fire in both directions, not merely fail to fire.
