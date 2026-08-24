@@ -14,6 +14,9 @@ workspace = true
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+# ADR-0019: DSNs are typed and redacted. This is the only crate both adapters can
+# depend on, so the secret type has to live here (`docs/architecture.md` section 3).
+secrecy = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

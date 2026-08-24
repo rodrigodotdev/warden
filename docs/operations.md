@@ -456,6 +456,11 @@ Provide private CAs through `ssl_root_cert` on `PgConnectOptions` and
 
 **Do not disable certificate verification to simplify setup.**
 
+Warden makes this a connection-policy invariant: `Disabled` and the driver mapping of
+`Required` (TLS without peer verification) are legal only for a `development`
+connection. Staging, production, and every operator-defined environment must use
+`VerifyCa` or `VerifyIdentity`; the default is `VerifyIdentity`.
+
 Avoid optional driver behavior that permits arbitrary local-file loading. Do not
 expose unsafe driver-specific capabilities through generic configuration without a
 documented need.
