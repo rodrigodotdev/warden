@@ -713,6 +713,30 @@ const FUNCTIONS: &[Case] = &[
         risks: &[RiskFlag::UserDefinedFunction],
         verdict: Some(DenyCode::UnknownFunction),
     },
+    Case {
+        // A quoted name that is already lowercase folds to the same registry entry
+        // an unquoted call would: PostgreSQL itself would resolve both to `count`.
+        sql: r#"SELECT "count"(1)"#,
+        root_kind: Some(StatementKind::Select),
+        nested_kinds: &[],
+        objects: &[],
+        functions: &[("count", FunctionClassification::KnownSafe)],
+        risks: &[],
+        verdict: None,
+    },
+    Case {
+        // A quoted, mixed-case name is a different identifier from `count` and must
+        // not launder into `KnownSafe` by being lowercased on the way to the
+        // registry. This is the laundering ADR-0029 exists to close, achieved with
+        // quote characters instead of a schema qualifier.
+        sql: r#"SELECT "Count"(1)"#,
+        root_kind: Some(StatementKind::Select),
+        nested_kinds: &[],
+        objects: &[],
+        functions: &[("Count", FunctionClassification::Unknown)],
+        risks: &[RiskFlag::UserDefinedFunction],
+        verdict: Some(DenyCode::UnknownFunction),
+    },
 ];
 
 /// Shapes that exist only in this dialect, or that sqlparser reads unusually.

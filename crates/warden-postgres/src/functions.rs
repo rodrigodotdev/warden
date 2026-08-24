@@ -13,9 +13,15 @@
 //! ordinary reading through functions (`generate_series`, `unnest`, the `jsonb_*`
 //! family) and a registry too narrow to cover them would deny plain queries.
 //!
-//! Names are compared ASCII-lowercased. PostgreSQL folds an unquoted identifier to
-//! lowercase, and Unicode folding would make a security comparison depend on locale
-//! data.
+//! Names arrive already folded. `visit::record_function` calls the shared `folded()`
+//! helper — the same one CTE subtraction uses — before consulting this registry: an
+//! unquoted identifier is lowercased the way PostgreSQL itself folds it, and a quoted
+//! one is compared by its literal, unfolded characters (ASCII-only on purpose: Unicode
+//! folding would make a security comparison depend on locale data). Every entry below
+//! is lowercase (asserted by `the_two_tables_are_lowercase_sets_that_do_not_overlap`),
+//! so a quoted call can only match one that is itself already lowercase —
+//! `"count"(1)` matches the `count` entry, `"Count"(1)` does not, exactly as
+//! PostgreSQL would resolve the two differently.
 //!
 //! **This module never sees a schema.** `visit::record_function` decides whether the
 //! call's schema is trusted before calling [`classify`], and consults this registry
@@ -327,19 +333,23 @@ const SAFE: &[&str] = &[
     "gen_random_uuid",
 ];
 
-/// Classifies one bare function name, and names the risk when there is one.
+/// Classifies one already-folded function name, and names the risk when there is one.
+///
+/// This function does no folding of its own: the caller (`visit::record_function`)
+/// folds by the identifier's own quoting before calling this, so a name that arrives
+/// here already carries PostgreSQL's resolution rule. Passing a name in the wrong case
+/// is a caller bug, not something this function should paper over — see the module
+/// header.
 ///
 /// The `Option<RiskFlag>` is the evidence half: `FunctionSafetyPolicy` acts on the
 /// classification and `RiskEvidencePolicy` acts on the flag, so a dangerous call is
 /// denied twice by independent rules and an audit record says *which* danger it was
 /// rather than only "dangerous function".
 pub(crate) fn classify(name: &str) -> (FunctionClassification, Option<RiskFlag>) {
-    let lowered = name.to_ascii_lowercase();
-
-    if let Some((_, flag)) = DANGEROUS.iter().find(|(known, _)| *known == lowered) {
+    if let Some((_, flag)) = DANGEROUS.iter().find(|(known, _)| *known == name) {
         return (FunctionClassification::KnownDangerous, Some(*flag));
     }
-    if SAFE.contains(&lowered.as_str()) {
+    if SAFE.contains(&name) {
         return (FunctionClassification::KnownSafe, None);
     }
     (
@@ -378,9 +388,9 @@ mod tests {
 
     #[test]
     fn each_dangerous_function_names_the_risk_it_is() {
-        assert_eq!(classify("PG_SLEEP").1, Some(RiskFlag::DelayFunction));
+        assert_eq!(classify("pg_sleep").1, Some(RiskFlag::DelayFunction));
         assert_eq!(classify("pg_advisory_lock").1, Some(RiskFlag::AdvisoryLock));
-        assert_eq!(classify("NEXTVAL").1, Some(RiskFlag::SequenceMutation));
+        assert_eq!(classify("nextval").1, Some(RiskFlag::SequenceMutation));
         assert_eq!(classify("pg_read_file").1, Some(RiskFlag::FileAccess));
         assert_eq!(classify("lo_export").1, Some(RiskFlag::FileOutput));
         assert_eq!(classify("set_config").1, Some(RiskFlag::SessionMutation));
@@ -441,12 +451,19 @@ mod tests {
     }
 
     #[test]
-    fn classification_ignores_ascii_case() {
-        assert_eq!(classify("CoUnT").0, FunctionClassification::KnownSafe);
+    fn classify_trusts_the_caller_to_have_already_folded_the_name() {
+        // `visit::record_function` folds by the identifier's own quoting before
+        // calling `classify`; this function compares only what it is given. A name
+        // that differs in case from the registry is a different identifier, not a
+        // case-insensitive match — the fix for the laundering ADR-0029 exists to
+        // close (a quoted, mixed-case name reaching the registry unfolded).
+        assert_eq!(classify("count").0, FunctionClassification::KnownSafe);
+        assert_eq!(classify("Count").0, FunctionClassification::Unknown);
         assert_eq!(
-            classify("Pg_SlEeP").0,
+            classify("pg_sleep").0,
             FunctionClassification::KnownDangerous
         );
+        assert_eq!(classify("PG_SLEEP").0, FunctionClassification::Unknown);
     }
 
     #[test]

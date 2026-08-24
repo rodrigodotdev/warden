@@ -208,6 +208,12 @@ impl Evidence {
     /// `warden-mysql` (ADR-0029). The schema is recorded on the `FunctionRef` either
     /// way: `FunctionSafetyPolicy::qualified()` renders `schema.name` in its audit
     /// detail.
+    ///
+    /// The bare name is folded by [`folded`] — the same helper CTE subtraction uses —
+    /// before it reaches the registry. Without this, `"Count"(1)` would be lowercased
+    /// on its way into `functions::classify` and match the `count` entry despite
+    /// being a different, quoted identifier: exactly the laundering ADR-0029 exists to
+    /// close, achieved with quote characters instead of a schema qualifier.
     fn record_function(&mut self, name: &ObjectName) {
         let Some(mut parts) = identifiers(name) else {
             self.flag(RiskFlag::UnknownConstruct);
@@ -222,7 +228,7 @@ impl Evidence {
             rule_matches(Dialect::PostgreSql, TRUSTED_FUNCTION_SCHEMA, schema)
         });
         let (classification, risk) = if trusted {
-            functions::classify(function.value())
+            functions::classify(&folded(&function))
         } else {
             (
                 FunctionClassification::Unknown,
