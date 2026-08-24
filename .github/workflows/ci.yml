@@ -72,8 +72,10 @@ jobs:
           shared-key: docker
 
       - name: Integration tests (Testcontainers)
-        run: cargo test -p warden-tracer --features docker -- --nocapture
-        timeout-minutes: 20
+        run: |
+          cargo test -p warden-tracer --features docker -- --nocapture
+          cargo test -p warden-mysql --features docker -- --nocapture
+        timeout-minutes: 30
 
   msrv:
     name: MSRV 1.94

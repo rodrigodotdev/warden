@@ -51,6 +51,9 @@ mod statement;
 mod tokens;
 mod visit;
 
+#[cfg(all(test, feature = "docker"))]
+mod container_tests;
+
 pub use analyzer::MySqlAnalyzer;
 pub use connection::{MySqlConnectionConfig, MySqlConnectionPools};
 pub use error::ConnectError;

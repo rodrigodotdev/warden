@@ -43,7 +43,10 @@ run = "cargo test --workspace"
 
 [tasks."test:docker"]
 description = "Run integration tests against real containers"
-run = "cargo test -p warden-tracer --features docker -- --nocapture"
+run = [
+  "cargo test -p warden-tracer --features docker -- --nocapture",
+  "cargo test -p warden-mysql --features docker -- --nocapture",
+]
 
 [tasks.doc]
 description = "Build the API documentation with warnings denied"
