@@ -67,6 +67,7 @@ sqlparser = { version = "0.62.0", features = ["visitor"] }
 # has no SHA-256. Used behind one function per adapter; hex comes from `{:02x}`
 # rather than another crate.
 sha2 = "0.11"
+syn = { version = "2", features = ["full"] }
 
 # Serialization and errors
 serde = { version = "1.0", features = ["derive"] }
@@ -127,6 +128,7 @@ workspace = true
 
 [dev-dependencies]
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 toml = { workspace = true }
 
 # Per-task panic containment depends on unwinding; see docs/security.md section 14.

@@ -48,6 +48,7 @@ control is accepted risk and must say so explicitly.
 | Broad schema enumeration | bounded response; object policy on schema tools | E2E |
 | DSN in a tool response | non-serializable secret types; MCP models have no DSN field | unit + E2E |
 | Credential in log, trace, or error | sanitized error mapping; trace-field allowlist; panic hook without payload | unit + E2E |
+| Raw SQL in an operator log through the driver | `ConnectOptions::disable_statement_logging` on every connect options value | unit |
 | Malformed MCP payload | rmcp SDK; input-size limit; sanitized error | E2E |
 | Unauthorized transport access | OAuth/OIDC under the MCP specification; trusted `RequestContext` | HTTP E2E |
 | **Injection through returned data** | section 9; partial mitigation and partially accepted risk | — |
@@ -493,6 +494,14 @@ raw SQL:     OFF by default
 parameters:  OFF by default
 fingerprint: ON when available
 ```
+
+**The driver is a second source, and its default is on.** SQLx 0.9's
+`LogSettings::default()` logs every statement at `DEBUG` and every statement slower
+than one second at `WARN`, emitted through `tracing` with the statement in a
+`db.statement` field. A deployment that never writes a log line itself would still
+publish agent SQL at `WARN`. Both adapters call
+`ConnectOptions::disable_statement_logging` on every connect options value they build,
+for both pools, and Milestone 6's unit tests cover the call site.
 
 SQL can contain emails, tokens, names, search strings, private messages, and literal
 secrets. A security product must not accidentally create a second sensitive-data

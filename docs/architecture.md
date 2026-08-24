@@ -299,6 +299,15 @@ slow queries, a single pool drains and also takes down health checks and schema
 discovery. Separate pools are simpler and more robust than reserving capacity in one
 pool.
 
+**Implemented in Milestone 6.** `warden_mysql::MySqlConnectionPools` and
+`warden_postgres::PostgreSqlConnectionPools` own the two pools. Their accessors are
+`pub(crate)`, so no `MySqlPool` or `PgPool` appears in either crate's public surface
+and the composition root never names a SQLx type;
+`crates/warden-*/tests/adapter_rules.rs` enforces that mechanically. On PostgreSQL,
+`capacity(0)` is only half the control: every statement bound for `agent_pool` is
+built by the crate-private `agent_query`, which applies `.persistent(false)`, because
+persistence is a per-query flag that no pool setting can enforce.
+
 ## 7. Capabilities
 
 ```rust

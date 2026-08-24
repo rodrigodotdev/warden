@@ -33,6 +33,13 @@ confidence-threshold = 0.9
 # Allowed licenses absent from the current graph would otherwise create noise;
 # this allowlist is intentionally preventive.
 unused-allowed-license = "allow"
+# `sqlx-core 0.9.0` requires this exact root store through its rustls webpki
+# configuration. `webpki-roots` packages Mozilla CCADB-derived root data under
+# CDLA-Permissive-2.0, whose redistribution notice obligation is documented in
+# docs/operations.md section 2.7. Keep this exception version-pinned: a root-store
+# update requires a fresh license and provenance review rather than inheriting a
+# project-wide allowlist entry.
+exceptions = [{ crate = "webpki-roots@1.0.9", allow = ["CDLA-Permissive-2.0"] }]
 
 [licenses.private]
 # Workspace crates use `publish = false` and are not checked.

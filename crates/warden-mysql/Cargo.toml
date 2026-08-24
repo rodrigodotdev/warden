@@ -36,4 +36,5 @@ thiserror = { workspace = true }
 # direct dependency would select an incompatible version and compile two copies
 # whose types do not unify.
 testcontainers-modules = { workspace = true }
+syn = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

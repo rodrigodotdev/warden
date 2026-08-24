@@ -4,10 +4,11 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 /// Forbidden dependency-graph edges from `docs/architecture.md` section 3 and SPEC
 /// section 6, invariants 27–28.
@@ -40,6 +41,168 @@ const EXPECTED_MEMBERS: &[&str] = &[
     // Remove this entry with the disposable M0.5 crate after Milestone 12.
     "warden-tracer",
 ];
+
+const WEBPKI_ROOTS_LICENSE: &str =
+    include_str!("../LICENSES/webpki-roots-1.0.9-CDLA-Permissive-2.0.txt");
+const WEBPKI_ROOTS_LICENSE_SHA256: &str =
+    "e271993808fec50ab29350b39539cdec611a9103f827e0aa26d61da70e2d33f8";
+
+fn container_build_files(directory: &Path, files: &mut Vec<PathBuf>) {
+    for entry in std::fs::read_dir(directory)
+        .unwrap_or_else(|error| panic!("could not read {}: {error}", directory.display()))
+    {
+        let entry = entry.unwrap_or_else(|error| panic!("could not read directory entry: {error}"));
+        let path = entry.path();
+        if path.is_dir() {
+            let ignored = matches!(
+                path.file_name().and_then(|name| name.to_str()),
+                Some(".git" | ".superpowers" | "target")
+            );
+            if !ignored {
+                container_build_files(&path, files);
+            }
+            continue;
+        }
+        if matches!(
+            path.file_name().and_then(|name| name.to_str()),
+            Some("Dockerfile" | "Containerfile")
+        ) {
+            files.push(path);
+        }
+    }
+}
+
+fn logical_docker_instructions(contents: &str) -> Vec<String> {
+    let mut instructions = Vec::new();
+    let mut current = String::new();
+
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let continued = line.ends_with('\\');
+        let fragment = if continued {
+            &line[..line.len() - 1]
+        } else {
+            line
+        };
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(fragment.trim_end());
+        if !continued {
+            instructions.push(std::mem::take(&mut current));
+        }
+    }
+    if !current.is_empty() {
+        instructions.push(current);
+    }
+
+    instructions
+}
+
+fn strip_copy_flags(mut arguments: &str) -> Option<&str> {
+    loop {
+        arguments = arguments.trim_start();
+        if !arguments.starts_with("--") {
+            return Some(arguments);
+        }
+        let flag_end = arguments.find(char::is_whitespace)?;
+        let flag = &arguments[..flag_end];
+        arguments = &arguments[flag_end..];
+        if !flag.contains('=') && matches!(flag, "--chown" | "--chmod" | "--exclude") {
+            let value_end = arguments.trim_start().find(char::is_whitespace)?;
+            arguments = &arguments.trim_start()[value_end..];
+        }
+    }
+}
+
+fn shell_words(arguments: &str) -> Option<Vec<String>> {
+    let mut words = Vec::new();
+    let mut word = String::new();
+    let mut quote = None;
+    let mut escaped = false;
+
+    for character in arguments.chars() {
+        if escaped {
+            word.push(character);
+            escaped = false;
+            continue;
+        }
+        if character == '\\' && quote != Some('\'') {
+            escaped = true;
+            continue;
+        }
+        if matches!(character, '\'' | '"') {
+            if quote == Some(character) {
+                quote = None;
+            } else if quote.is_none() {
+                quote = Some(character);
+            } else {
+                word.push(character);
+            }
+            continue;
+        }
+        if character.is_whitespace() && quote.is_none() {
+            if !word.is_empty() {
+                words.push(std::mem::take(&mut word));
+            }
+        } else {
+            word.push(character);
+        }
+    }
+    if escaped || quote.is_some() {
+        return None;
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    Some(words)
+}
+
+fn copy_sources(instruction: &str) -> Option<Vec<String>> {
+    let (keyword, arguments) = instruction.trim().split_once(char::is_whitespace)?;
+    if !keyword.eq_ignore_ascii_case("COPY") {
+        return None;
+    }
+    let arguments = strip_copy_flags(arguments)?;
+    let paths = if arguments.starts_with('[') {
+        serde_json::from_str::<Vec<String>>(arguments).ok()?
+    } else {
+        shell_words(arguments)?
+    };
+    (paths.len() >= 2).then(|| paths[..paths.len() - 1].to_vec())
+}
+
+fn is_normalized_license_source(source: &str) -> bool {
+    source == "LICENSES"
+        || source.strip_prefix("LICENSES/").is_some_and(|suffix| {
+            !suffix.is_empty()
+                && suffix
+                    .split('/')
+                    .all(|component| !component.is_empty() && component != "." && component != "..")
+        })
+}
+
+fn dockerfile_copies_licenses(contents: &str) -> bool {
+    logical_docker_instructions(contents)
+        .iter()
+        .filter_map(|instruction| copy_sources(instruction))
+        .flatten()
+        .any(|source| is_normalized_license_source(&source))
+}
+
+fn sha256_hex(contents: &str) -> String {
+    use std::fmt::Write as _;
+
+    let digest = Sha256::digest(contents.as_bytes());
+    let mut hexadecimal = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut hexadecimal, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    hexadecimal
+}
 
 fn metadata() -> Value {
     let output = Command::new(env!("CARGO"))
@@ -302,4 +465,51 @@ fn sqlx_any_feature_is_never_enabled() {
              into a declared read-only gateway. Resolved features: {features:?}"
         );
     }
+}
+
+#[test]
+fn distributed_webpki_roots_license_is_complete_and_future_images_copy_licenses() {
+    assert_eq!(
+        sha256_hex(WEBPKI_ROOTS_LICENSE),
+        WEBPKI_ROOTS_LICENSE_SHA256,
+        "the vendored third-party notice must remain byte-for-byte faithful to \
+         webpki-roots@1.0.9's LICENSE"
+    );
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut container_files = Vec::new();
+    container_build_files(&root, &mut container_files);
+    for file in container_files {
+        let contents = std::fs::read_to_string(&file)
+            .unwrap_or_else(|error| panic!("could not read {}: {error}", file.display()));
+        assert!(
+            dockerfile_copies_licenses(&contents),
+            "{} must copy LICENSES into the image; M12 packaging must distribute the webpki-roots license",
+            file.display()
+        );
+    }
+}
+
+#[test]
+fn docker_copy_parser_accepts_normalized_license_source_with_flags_and_continuation() {
+    let fixture = r#"
+        COPY --chown=warden:warden --chmod=0644 \
+          LICENSES/webpki-roots-1.0.9-CDLA-Permissive-2.0.txt /opt/warden/LICENSES/
+    "#;
+    assert!(dockerfile_copies_licenses(fixture));
+}
+
+#[test]
+fn docker_copy_parser_accepts_normalized_license_source_in_json_form() {
+    assert!(dockerfile_copies_licenses(
+        r#"COPY ["LICENSES", "/opt/warden/LICENSES/"]"#
+    ));
+}
+
+#[test]
+fn docker_copy_parser_rejects_license_destination_and_non_normalized_source() {
+    let destination_only = "COPY --link app /opt/warden/LICENSES";
+    let non_normalized_source = "COPY ./LICENSES /opt/warden/LICENSES";
+    assert!(!dockerfile_copies_licenses(destination_only));
+    assert!(!dockerfile_copies_licenses(non_normalized_source));
 }

@@ -136,14 +136,15 @@ jobs:
         with:
           shared-key: coverage
 
-      # The gate the Milestone 0 note deferred: with the policy engine in place, a
-      # drop in coverage means a security rule lost its test, which is the one
-      # regression that must not merge quietly.
-      #
-      # `report` needs its own `--workspace`: cargo-llvm-cov 0.9.0 resolves the
-      # report against the current package, and this manifest is both a workspace
-      # root and package `warden`, so without it the report silently narrows to
-      # `src/main.rs` and `src/cli.rs` and never sees warden-core or warden-policy.
-      - run: cargo llvm-cov --workspace --no-report
+      # `--all-features` enables each adapter's `docker` feature, so the container
+      # tests contribute. Without it the connection code that only runs against a
+      # server counts as uncovered and the 95% floor fails for a reason that is not a
+      # missing test. GitHub-hosted runners provide a Docker daemon, which the
+      # `docker` job above already relies on. LLVM instrumentation makes concurrent
+      # PostgreSQL container startup intermittently exceed the 3s pool acquire limit;
+      # serialize only this coverage collection. The dedicated Docker gate remains
+      # parallel and validates the normal test mode separately.
+      - run: cargo llvm-cov --workspace --all-features --no-report -- --test-threads=1
+        timeout-minutes: 40
       - run: cargo llvm-cov report --workspace --html --output-dir coverage
       - run: cargo llvm-cov report --workspace --summary-only --fail-under-lines 95

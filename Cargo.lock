@@ -3034,6 +3034,7 @@ name = "warden"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "sha2 0.11.0",
  "toml",
 ]
 
@@ -3063,6 +3064,7 @@ dependencies = [
  "sha2 0.11.0",
  "sqlparser",
  "sqlx",
+ "syn 2.0.119",
  "testcontainers-modules",
  "thiserror",
  "tokio",
@@ -3102,6 +3104,7 @@ dependencies = [
  "sha2 0.11.0",
  "sqlparser",
  "sqlx",
+ "syn 2.0.119",
  "testcontainers-modules",
  "thiserror",
  "tokio",

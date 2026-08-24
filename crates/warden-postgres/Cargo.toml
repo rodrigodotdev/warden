@@ -34,5 +34,6 @@ thiserror = { workspace = true }
 [dev-dependencies]
 # Depend only on `testcontainers-modules`, which re-exports `testcontainers`.
 testcontainers-modules = { workspace = true }
+syn = { workspace = true }
 # Test-only runtime support for async configuration-validation and container tests.
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }

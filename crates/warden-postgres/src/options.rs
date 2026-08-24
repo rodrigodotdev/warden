@@ -139,6 +139,64 @@ mod tests {
         .unwrap()
     }
 
+    fn local_is_mut_options(local: &syn::Local) -> bool {
+        matches!(
+            &local.pat,
+            syn::Pat::Ident(identifier)
+                if identifier.ident == "options" && identifier.mutability.is_some()
+        )
+    }
+
+    fn connect_options_logging_is_disabled(source: &str) -> Result<(), String> {
+        let file = syn::parse_file(source).map_err(|error| error.to_string())?;
+        let functions: Vec<_> = file
+            .items
+            .iter()
+            .filter_map(|item| match item {
+                syn::Item::Fn(function) if function.sig.ident == "connect_options" => {
+                    Some(function)
+                }
+                _ => None,
+            })
+            .collect();
+        let [function] = functions.as_slice() else {
+            return Err("expected exactly one production connect_options function".to_owned());
+        };
+
+        let locals: Vec<_> = function
+            .block
+            .stmts
+            .iter()
+            .filter_map(|statement| match statement {
+                syn::Stmt::Local(local) if local_is_mut_options(local) => Some(local),
+                _ => None,
+            })
+            .collect();
+        let [options] = locals.as_slice() else {
+            return Err("expected exactly one top-level `let mut options`".to_owned());
+        };
+        let mut expression = options
+            .init
+            .as_ref()
+            .map(|initializer| initializer.expr.as_ref())
+            .ok_or_else(|| "`let mut options` needs an initializer".to_owned())?;
+
+        let mut disable_calls = 0_usize;
+        while let syn::Expr::MethodCall(method_call) = expression {
+            if method_call.method == "disable_statement_logging" {
+                disable_calls += 1;
+            }
+            expression = method_call.receiver.as_ref();
+        }
+        if disable_calls == 1 {
+            Ok(())
+        } else {
+            Err(format!(
+                "the direct `let mut options` method chain calls disable_statement_logging {disable_calls} times"
+            ))
+        }
+    }
+
     #[test]
     fn a_mysql_dsn_is_refused_before_the_driver_sees_it() {
         assert_eq!(
@@ -227,6 +285,37 @@ mod tests {
             .get_ssl_mode(),
             PgSslMode::VerifyFull
         ));
+    }
+
+    #[test]
+    fn connect_options_disables_driver_statement_logging_once() {
+        connect_options_logging_is_disabled(include_str!("options.rs")).unwrap();
+    }
+
+    #[test]
+    fn statement_logging_guard_accepts_a_direct_method_chain() {
+        let fixture = r#"
+            fn connect_options() {
+                let mut options = parsed.ssl_mode(mode).disable_statement_logging();
+            }
+        "#;
+        connect_options_logging_is_disabled(fixture).unwrap();
+    }
+
+    #[test]
+    fn statement_logging_guard_rejects_comments_strings_and_dead_code() {
+        let fixture = r#"
+            fn connect_options() {
+                // .disable_statement_logging()
+                let message = ".disable_statement_logging()";
+                let mut options = if false {
+                    parsed.disable_statement_logging()
+                } else {
+                    parsed
+                };
+            }
+        "#;
+        assert!(connect_options_logging_is_disabled(fixture).is_err());
     }
     #[test]
     fn wardens_startup_options_are_written_after_the_dsns_own() {
