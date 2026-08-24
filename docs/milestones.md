@@ -202,20 +202,19 @@ that the supposedly generic core was secretly shaped around MySQL.
 
 - [x] Workspace compiles on the declared toolchain
 - [x] Every crate forbids `unsafe` and inherits workspace lints
-- [ ] MySQL and PostgreSQL analyzers exist
+- [x] MySQL and PostgreSQL analyzers exist
 - [ ] Both adapters execute safe read-only queries
 - [x] SQLx's `any` feature is disabled and `AnyPool` is unreachable (`tests/architecture.rs`)
-- [ ] Both adapters use concrete pools (pending M6; `warden-mysql` now has
-      its analyzer but no pool, `warden-postgres` is still a doc-comment
-      placeholder)
+- [ ] Both adapters use concrete pools (pending M6; both adapters now have
+      analyzers and neither has a pool)
 - [x] `sqlparser` appears only inside adapter crates
-- [ ] Multiple statements are denied
-- [ ] Nested writes are denied
-- [ ] Locking reads are denied
-- [ ] Known dangerous functions have regression tests
-- [ ] Unknown functions are denied by default
+- [x] Multiple statements are denied
+- [x] Nested writes are denied
+- [x] Locking reads are denied
+- [x] Known dangerous functions have regression tests
+- [x] Unknown functions are denied by default
 - [x] MySQL file access and output are denied
-- [ ] PostgreSQL sequence mutation is denied
+- [x] PostgreSQL sequence mutation is denied
 - [ ] Dedicated test roles demonstrably cannot write
 - [ ] Read-only transactions are verified
 - [ ] Every query has client-side **and** server-side deadlines
@@ -232,6 +231,6 @@ that the supposedly generic core was secretly shaped around MySQL.
 - [ ] SQLx errors are sanitized at the MCP boundary
 - [ ] Integration tests use real containers
 - [ ] MCP E2E tests exist
-- [ ] A security corpus exists
+- [x] A security corpus exists
 - [ ] README documents secure deployment and the SPEC section 7 guarantee boundaries
 - [ ] Security documentation states that database privileges are mandatory
