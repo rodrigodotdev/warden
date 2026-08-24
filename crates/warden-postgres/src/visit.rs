@@ -363,12 +363,16 @@ impl Visitor for Evidence {
                 ..
             } => self.flag(RiskFlag::UnknownConstruct),
             // No wildcard-to-Unknown arm here, deliberately: see the crate note in
-            // `lib.rs`. Side effects reach a PostgreSQL expression as a function
-            // call, a custom operator, or a nested statement the visitor descends
-            // into, and all three are classified above. PostgreSQL has no
-            // expression-level assignment operator in SQL: `f(a := 1)` is argument
-            // naming inside a call that is itself classified, not session mutation
-            // the way MySQL's `@x := 1` is.
+            // `lib.rs`. Side effects reach a PostgreSQL expression through three
+            // classified shapes — a function call, a custom operator, or a nested
+            // statement the visitor descends into — all of which are classified
+            // above. A fourth shape is known and left unclassified: a user-defined
+            // cast reaches `Expr::Cast`, not this arm, so `'x'::evil_type` is never
+            // classified here; that is acceptable because creating the cast, or the
+            // type it casts to, requires DDL, which this tool denies. PostgreSQL has
+            // no expression-level assignment operator in SQL: `f(a := 1)` is
+            // argument naming inside a call that is itself classified, not session
+            // mutation the way MySQL's `@x := 1` is.
             _ => {}
         }
         ControlFlow::Continue(())

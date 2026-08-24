@@ -87,7 +87,7 @@ layer.
 **The table allowlist does not bound what the agent can read.** It operates on AST
 names, but names do not determine what a relation reads.
 
-Six structural bypasses exist:
+Seven structural bypasses exist:
 
 1. **Views.** `SELECT * FROM public_report` passes the allowlist while the view reads
    `users.password_hash`; the parser sees only the view name.
@@ -108,16 +108,22 @@ Six structural bypasses exist:
    scope-blind: `WITH orders AS (SELECT * FROM orders) SELECT * FROM orders` loses
    the real base table there too.
 
-6. **Write and DDL target relations (both analyzers).** `INSERT INTO t`, `COPY t
-   FROM/TO`, and every DDL target (`CREATE TABLE`, `ALTER TABLE`, `DROP`, ...) do
-   not appear in `QueryAnalysis`'s object list. sqlparser routes each of these
-   through `Visitor::pre_visit_relation` — and `COPY`'s table through no visitor
-   hook at all — rather than through `TableFactor`, which is the hook both
+6. **`INSERT`, `COPY`, and DDL target relations (both analyzers).** `INSERT INTO t`,
+   `COPY t FROM/TO`, and every DDL target (`CREATE TABLE`, `ALTER TABLE`, `DROP`,
+   ...) do not appear in `QueryAnalysis`'s object list. sqlparser routes each of
+   these through `Visitor::pre_visit_relation` — and `COPY`'s table through no
+   visitor hook at all — rather than through `TableFactor`, which is the hook both
    analyzers implement. This is not an authorization gap under a read-only
    profile: each such statement independently carries `RiskFlag::WriteStatement`
    or `RiskFlag::Ddl`, and policy denies it on that evidence alone. It becomes
    load-bearing the moment a write-permitting profile exists, at which point
    `TableAllowDenyPolicy` would not see the relation being written.
+7. **User-defined casts on PostgreSQL.** `'x'::evil_type` and
+   `CAST('x' AS evil_type)` reach `Expr::Cast`, never `Expr::Function`, so the
+   function classification in section 7.3 never sees them. `CREATE CAST ... WITH
+   FUNCTION` and a type's input function both run arbitrary code. This does not
+   need a wildcard-to-`Unknown` `Expr` arm to close: creating the cast, or the type
+   it casts to, is DDL, and DDL is denied outright.
 
 **Design consequence:** the dedicated role's `GRANT SELECT` bounds read scope. The
 allowlist remains useful for reducing attack surface and improving error messages,

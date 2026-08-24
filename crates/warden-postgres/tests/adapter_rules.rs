@@ -171,10 +171,12 @@ fn no_public_signature_names_a_parser_type() {
 ///
 /// Only the pattern side of `previous` — the text before its first `=>` — is
 /// checked. Scanning the whole line produces a false positive when rustfmt splits a
-/// multi-line arm across lines: `visit.rs` has a `BinaryOperator::Assignment` arm
-/// whose *body* calls `self.flag(RiskFlag::SessionMutation)`, so the line right
-/// before a later `_ => {}` (over `Expr`, the deliberate exception documented in
-/// `lib.rs`) mentions `RiskFlag::` only on the right-hand side of an unrelated arm.
+/// multi-line arm across lines: `visit.rs`'s `Expr::BinaryOp { op:
+/// BinaryOperator::PGCustomBinaryOperator(_), .. }` arm closes over several lines, so
+/// the line right before the later `_ => {}` (over `Expr`, the deliberate exception
+/// documented in `lib.rs`) is `} => self.flag(RiskFlag::UnknownConstruct),` — the bare
+/// `}` that closes the multi-line pattern, with `RiskFlag::` appearing only on the
+/// right-hand side of that same, unrelated arm.
 /// The rule is about what is being *matched*, not what an arm's body does, exactly
 /// as the comment on the scan itself says.
 ///
@@ -277,7 +279,7 @@ fn the_scans_are_alive() {
     );
     assert!(
         !wildcard_follows_guarded_pattern(
-            "} => self.flag(RiskFlag::SessionMutation),",
+            "} => self.flag(RiskFlag::UnknownConstruct),",
             "_ => {}",
             &guarded
         ),

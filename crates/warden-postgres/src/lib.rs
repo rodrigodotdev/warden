@@ -26,10 +26,13 @@
 //! unmapped `TableFactor` adds `RiskFlag::UnknownConstruct`, and a function outside
 //! the registry is `FunctionClassification::Unknown`. `Expr` gets no such arm,
 //! deliberately: it is overwhelmingly arithmetic and comparison, and side effects
-//! reach a PostgreSQL expression through exactly three shapes — a function call, a
+//! reach a PostgreSQL expression through three classified shapes — a function call, a
 //! user-defined operator invoked as `OPERATOR(schema.name)`, and a nested statement
-//! the visitor descends into — all three of which are classified. A `warden-core`
-//! security enum never gets a wildcard at all (ADR-0021).
+//! the visitor descends into. A fourth shape is known and deliberately left
+//! unclassified: a user-defined cast — `'x'::evil_type` or `CAST('x' AS evil_type)` —
+//! reaches `Expr::Cast`, never `Expr::Function`. That is acceptable because creating
+//! the cast, or the type it casts to, requires DDL, which this tool denies. A
+//! `warden-core` security enum never gets a wildcard at all (ADR-0021).
 
 mod analyzer;
 mod fingerprint;
