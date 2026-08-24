@@ -18,6 +18,18 @@
 //! evidence — an `Unknown` statement kind, a risk flag, an unclassified function —
 //! and `warden-policy` denies it with a code an auditor can read (ADR-0011). Only a
 //! statement that yielded nothing to evaluate becomes an `AnalyzeError`.
+//!
+//! # Where the wildcards are
+//!
+//! A `sqlparser` enum this crate classifies gets a wildcard arm that maps to
+//! something denied: an unmapped `Statement` becomes `StatementKind::Unknown`, an
+//! unmapped `TableFactor` adds `RiskFlag::UnknownConstruct`, and a function outside
+//! the registry is `FunctionClassification::Unknown`. `Expr` gets no such arm,
+//! deliberately: it is overwhelmingly arithmetic and comparison, and side effects
+//! reach a PostgreSQL expression through exactly three shapes — a function call, a
+//! user-defined operator invoked as `OPERATOR(schema.name)`, and a nested statement
+//! the visitor descends into — all three of which are classified. A `warden-core`
+//! security enum never gets a wildcard at all (ADR-0021).
 
 // Until Task 4 exports `PostgreSqlAnalyzer`, nothing `pub` reaches these modules and
 // `dead_code` fires on every `pub(crate)` item in them in a non-test build. `expect`
@@ -38,3 +50,4 @@
 mod functions;
 mod parse;
 mod statement;
+mod visit;
