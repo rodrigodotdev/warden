@@ -46,6 +46,7 @@ description = "Run integration tests against real containers"
 run = [
   "cargo test -p warden-tracer --features docker -- --nocapture",
   "cargo test -p warden-mysql --features docker -- --nocapture",
+  "cargo test -p warden-postgres --features docker -- --nocapture",
 ]
 
 [tasks.doc]

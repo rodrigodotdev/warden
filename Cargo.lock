@@ -3102,6 +3102,7 @@ dependencies = [
  "sha2 0.11.0",
  "sqlparser",
  "sqlx",
+ "testcontainers-modules",
  "thiserror",
  "tokio",
  "warden-core",

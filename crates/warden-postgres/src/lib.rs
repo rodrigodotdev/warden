@@ -58,6 +58,9 @@ mod query;
 mod statement;
 mod visit;
 
+#[cfg(all(test, feature = "docker"))]
+mod container_tests;
+
 pub use analyzer::PostgreSqlAnalyzer;
 pub use connection::{
     MAX_SCHEMA_NAME_LEN, PostgreSqlConnectionConfig, PostgreSqlConnectionPools, SearchPath,
