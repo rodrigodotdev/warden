@@ -58,6 +58,13 @@ sqlx = { version = "0.9", default-features = false, features = [
 ] }
 ```
 
+**Disabling `any` and `migrate` removes the API, not the code.** `sqlx` 0.9.0
+declares `sqlx-core` with `features = ["migrate"]` unconditionally and inherits its
+defaults, which include `any`, so both modules compile whatever the facade's feature
+list says. `sqlx::AnyPool` and `sqlx::migrate!` are still unreachable, which is the
+guarantee ADR-0005 and ADR-0009 need; ADR-0004 records the limitation and
+`tests/architecture.rs` pins both facts so an upstream change is noticed here.
+
 `bigdecimal` is mandatory and **must not** be replaced with `rust_decimal`. The latter
 is 96-bit and loses precision for large `NUMERIC` values, violating normalization rule
 1 (`docs/data-model.md` section 8.1).
@@ -106,10 +113,15 @@ one. `docs/security.md` section 7.1 asks for exactly that property; the cost is 
 
 ```text
 tokio  tokio-util  rmcp  sqlx  sqlparser  sha2  serde  serde_json
-thiserror  tracing  tracing-subscriber  secrecy  time  base64  bigdecimal  uuid
+thiserror  tracing  tracing-subscriber  secrecy  url  percent-encoding
+time  base64  bigdecimal  uuid
 ```
 
 `tokio-util` provides `CancellationToken` for explicit query cancellation.
+
+`url` and `percent-encoding` parse the DSN in `warden-core`, once, so that neither
+adapter has to trust a driver's URL parser with a connection string (ADR-0031). Both
+are already in the graph through `sqlx`, which parses URLs with the same two crates.
 
 `sha2` computes the `v1:<sha256-hex>` query fingerprint of `docs/security.md`
 section 11.4, which `std` cannot provide. It is used behind one function per
@@ -130,6 +142,29 @@ of wrapping an unrelated web framework around it.
 
 Use `cargo-deny` for advisories, licenses, sources, and bans. Commit `Cargo.lock`
 because Warden is an application.
+
+`deny.toml` has one deliberately narrow license exception:
+`webpki-roots@1.0.9` is allowed to use `CDLA-Permissive-2.0`, and no other crate or
+version inherits that allowance. SQLx 0.9 reaches this root store through `sqlx-core`'s
+rustls webpki configuration. The crate packages Mozilla CCADB-derived root data under
+that license; its [SPDX text](https://spdx.org/licenses/CDLA-Permissive-2.0.html)
+permits use, modification, and sharing while requiring the license text to accompany
+shared data. Any redistribution that includes this root store must preserve that
+notice. A `webpki-roots` update requires a fresh provenance and license review before
+its version-pinned exception can change.
+
+`LICENSES/webpki-roots-1.0.9-CDLA-Permissive-2.0.txt` is the unmodified text
+distributed by that crate. It is a third-party redistribution notice, **not**
+Warden's project license. Today's distributable artifact is the source repository;
+there is no Dockerfile, Containerfile, or release archive yet. The architecture test
+compares its SHA-256 against the canonical crate text and parses future Dockerfile or
+Containerfile `COPY` instructions. A file passes only when the **final** build stage —
+the one a release artifact is built from, so a notice copied into a builder stage and
+discarded with it does not count — copies either `LICENSES` or that exact notice path
+to `/opt/warden/LICENSES`. A destination merely named `LICENSES`, an unrelated file
+under `LICENSES/`, and a non-normalized source such as `./LICENSES` all fail.
+Milestone 12 packaging must copy that directory to that destination in each release
+artifact.
 
 > **PENDING:** the project license is not selected, which blocks the `deny.toml`
 > license allowlist. This is a product choice between Apache-2.0, with its patent
@@ -214,6 +249,21 @@ environment variables or files, empty DSNs, invalid durations, zero or invalid h
 limits, pool maxima below required concurrency, unknown policy profiles, malformed
 schema or table rules, unknown fields, and explicitly prohibited configuration.
 
+**A DSN names only the connection target** (ADR-0031). It must carry a supported
+scheme, a TCP host, a user and a database; it may carry a port and a password; and it
+may carry no query string and no fragment. `?sslmode=`, `?options=`, `?ssl-ca=`,
+`?socket=` and every other driver parameter are startup errors rather than settings,
+because each of them is a decision Warden makes from its own configuration, and a DSN
+that carried one would be a second, unreviewed source of it. Unix-domain socket paths
+are not addressable: TLS needs a TCP peer to authenticate.
+
+**PostgreSQL connections refuse an ambient environment.** `PgConnectOptions` reads
+`PGHOST`, `PGHOSTADDR`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`, `PGSSLMODE`,
+`PGSSLROOTCERT`, `PGSSLCERT`, `PGSSLKEY`, `PGAPPNAME` and `PGOPTIONS` for itself, and
+offers no way to clear the three certificate fields afterwards. Warden refuses to
+build a connection while any of them — or `PGPASSFILE` — is set, and names the
+variable. Unset them; put the value in Warden's configuration instead.
+
 **Error messages never contain secret values.**
 
 ### 3.3 Secrets
@@ -290,9 +340,20 @@ selected per query through the `sqlx::query` builder.
 Static, finite SQL makes the default cache and persistence appropriate for
 `control_pool`.
 
-M0.5's MySQL measurement covers only statement-cache behavior. It does not validate
-numeric pool defaults (`max 5 / min 0 / acquire 3s`), which remain owned by M6 and
-must be verified under integration and load tests (`docs/milestones.md`).
+**Milestone 6 closed that gap.** `PoolSettings::agent()` and `PoolSettings::control()`
+in `warden-core` carry the numbers, and each adapter asserts them twice: once against
+`PoolOptions`'s own getters with no database, because SQLx defaults to `max 10` and a
+30-second acquire timeout and an unset field is invisible in review; and once against a
+real server, where five held connections make the sixth caller fail with
+`PoolTimedOut` after three seconds rather than queue indefinitely. The same tests show
+that a saturated `agent_pool` leaves `health_check` on `control_pool` unaffected, which
+is the property ADR-0025 exists for.
+
+M6 also measured what M0.5 could not: with `statement_cache_capacity(0)`, twenty
+distinct agent-pool queries left `Prepared_stmt_count` unchanged on MySQL 8.4, and with
+`statement_cache_capacity(0)` plus `.persistent(false)` through
+`warden_postgres::query::agent_query`, twenty distinct agent-pool queries left
+`pg_prepared_statements` empty on PostgreSQL 17.
 
 ## 5. Timeouts and cancellation
 
@@ -307,7 +368,10 @@ The solution **does not rewrite agent SQL**.
 Apply these settings at connect time, outside any agent-controlled path:
 
 ```rust
-PgConnectOptions::new()
+// `new_without_pgpass`, never `new` or `from_str`: every constructor seeds itself
+// from `PG*` variables, and the parsing ones also read `~/.pgpass` and log what they
+// cannot parse — password included — before hardening can run (ADR-0031).
+PgConnectOptions::new_without_pgpass()
     .options([
         ("statement_timeout", "5000"),
         ("idle_in_transaction_session_timeout", "10000"),
@@ -330,7 +394,18 @@ comes from validated configuration, **never** untrusted SQL.
 parameter. Some managed pools and proxies, including PgBouncer in transaction mode
 and certain cloud proxies, reject or discard it. In those deployments, `SET LOCAL`
 becomes the primary control rather than reinforcement, and `warden check` must detect
-the difference by querying `current_setting('statement_timeout')` after connecting.
+the difference after connecting.
+
+**Milestone 6 provides that detection.**
+`PostgreSqlConnectionPools::verify_session_settings` reads every pinned setting back
+from `pg_settings` on **both** pools and reports
+`ConnectError::SessionSettingRejected` naming the setting, the configured value and
+the server's. It reads `pg_settings.setting` rather than `current_setting`, because
+the former reports a time value in the row's own unit — milliseconds here — while the
+latter normalizes `5000ms` to `5s` and would make the comparison depend on formatting.
+`MySqlConnectionPools::verify_session_settings` does the same for
+`@@SESSION.MAX_EXECUTION_TIME`. Neither is part of readiness, which stays a single
+`SELECT 1` on `control_pool`.
 
 ### 5.2 MySQL
 
@@ -455,6 +530,11 @@ Provide private CAs through `ssl_root_cert` on `PgConnectOptions` and
 `MySqlConnectOptions`.
 
 **Do not disable certificate verification to simplify setup.**
+
+Warden makes this a connection-policy invariant: `Disabled` and the driver mapping of
+`Required` (TLS without peer verification) are legal only for a `development`
+connection. Staging, production, and every operator-defined environment must use
+`VerifyCa` or `VerifyIdentity`; the default is `VerifyIdentity`.
 
 Avoid optional driver behavior that permits arbitrary local-file loading. Do not
 expose unsafe driver-specific capabilities through generic configuration without a

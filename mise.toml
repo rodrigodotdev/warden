@@ -43,7 +43,11 @@ run = "cargo test --workspace"
 
 [tasks."test:docker"]
 description = "Run integration tests against real containers"
-run = "cargo test -p warden-tracer --features docker -- --nocapture"
+run = [
+  "cargo test -p warden-tracer --features docker -- --nocapture",
+  "cargo test -p warden-mysql --features docker -- --nocapture",
+  "cargo test -p warden-postgres --features docker -- --nocapture",
+]
 
 [tasks.doc]
 description = "Build the API documentation with warnings denied"
@@ -51,9 +55,9 @@ env = { RUSTDOCFLAGS = "-D warnings" }
 run = "cargo doc --workspace --no-deps --document-private-items"
 
 [tasks.coverage]
-description = "Generate line and region coverage as HTML and a terminal summary"
+description = "Generate all-features coverage serially, then HTML and a terminal summary"
 run = [
-  "cargo llvm-cov --workspace --no-report",
+  "cargo llvm-cov --workspace --all-features --no-report -- --test-threads=1",
   "cargo llvm-cov report --workspace --html --output-dir coverage",
   "cargo llvm-cov report --workspace --summary-only --fail-under-lines 95",
 ]

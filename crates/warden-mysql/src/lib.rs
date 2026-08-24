@@ -1,16 +1,25 @@
-//! Warden's MySQL adapter: analysis now, execution, inspection, explain,
-//! normalization, and connections in Milestones 7, 9 and 10.
+//! Warden's MySQL adapter: analysis and connections now, execution, inspection and
+//! explain in Milestones 7, 9 and 10.
 //!
 //! This crate may depend on `warden-core`, `warden-policy`, `warden-ports`, `sqlx`,
 //! and `sqlparser`, but never `rmcp`.
 //!
 //! # The AST stops here
 //!
-//! Every module below is private and every item in them is `pub(crate)`. The crate's
-//! entire public surface is `MySqlAnalyzer`, whose signatures name only
+//! Every module below is private, and the crate exports four names: the analyzer,
+//! the two connection types, and their error. Their signatures name only
 //! `warden-core`, `warden-policy`, and `warden-ports` types, so no `sqlparser` type
 //! can appear in a public signature (SPEC section 6, invariant 28; ADR-0007).
-//! `tests/adapter_rules.rs` enforces that mechanically rather than by review.
+//! `tests/adapter_rules.rs` enforces that mechanically rather than by review, over
+//! the four files allowed to declare a `pub` item.
+//!
+//! # The driver stops here too
+//!
+//! [`MySqlConnectionPools`] owns two concrete `MySqlPool` values (ADR-0005,
+//! ADR-0025) and hands out neither: the accessors are `pub(crate)`, so the crate's
+//! public surface names no SQLx type at all. The composition root builds a pools
+//! value, passes it to the executor, and never depends on `sqlx` itself.
+//! `tests/adapter_rules.rs` enforces that the same way it enforces the AST rule.
 //!
 //! # How analysis fails, and how it does not
 //!
@@ -32,11 +41,20 @@
 //! all (ADR-0021).
 
 mod analyzer;
+mod connection;
+mod error;
 mod fingerprint;
 mod functions;
+mod options;
 mod parse;
+mod pool;
 mod statement;
 mod tokens;
 mod visit;
 
+#[cfg(all(test, feature = "docker"))]
+mod container_tests;
+
 pub use analyzer::MySqlAnalyzer;
+pub use connection::{MySqlConnectionConfig, MySqlConnectionPools};
+pub use error::ConnectError;

@@ -9,6 +9,23 @@ use std::time::Duration;
 /// truncates. The default is a quarter of this.
 pub const MAX_RESULT_BYTES_CEILING: usize = 1024 * 1024;
 
+/// The longest configurable query timeout.
+///
+/// A gateway that lets one query hold a connection for an hour has no useful bound,
+/// and the ceiling is also what keeps [`ExecutionLimits::client_timeout`] strictly
+/// greater than [`ExecutionLimits::server_timeout`]: without it a `Duration::MAX`
+/// timeout would saturate and make the two equal, silently inverting the ordering
+/// ADR-0024 depends on.
+pub const MAX_QUERY_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How much later the client-side safety net fires than the server-side deadline.
+///
+/// `docs/operations.md` section 5.3: with the server deadline strictly first, the
+/// normal path receives a clean server error and returns an intact connection to the
+/// pool. A client timeout during row streaming forces SQLx to discard the connection,
+/// and repeated slow queries would then drain a pool of five.
+pub const CLIENT_TIMEOUT_MARGIN: Duration = Duration::from_secs(1);
+
 /// A limit that would disable a bound or exceed its ceiling.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum LimitsError {
@@ -25,6 +42,14 @@ pub enum LimitsError {
         actual: usize,
         /// Hard ceiling.
         ceiling: usize,
+    },
+    /// `timeout` exceeded [`MAX_QUERY_TIMEOUT`].
+    #[error("timeout is {actual:?}; the ceiling is {ceiling:?}")]
+    TimeoutAboveCeiling {
+        /// Configured value.
+        actual: Duration,
+        /// Hard ceiling.
+        ceiling: Duration,
     },
     /// A per-value budget larger than the total budget cannot bind anything.
     #[error("max_value_bytes ({value}) exceeds max_result_bytes ({total})")]
@@ -98,6 +123,12 @@ impl ExecutionLimits {
                 return Err(LimitsError::Zero { field });
             }
         }
+        if self.timeout > MAX_QUERY_TIMEOUT {
+            return Err(LimitsError::TimeoutAboveCeiling {
+                actual: self.timeout,
+                ceiling: MAX_QUERY_TIMEOUT,
+            });
+        }
         if self.max_result_bytes > MAX_RESULT_BYTES_CEILING {
             return Err(LimitsError::AboveCeiling {
                 actual: self.max_result_bytes,
@@ -111,6 +142,26 @@ impl ExecutionLimits {
             });
         }
         Ok(())
+    }
+
+    /// The deadline the database itself enforces.
+    ///
+    /// PostgreSQL receives it as `statement_timeout` at connect time and MySQL as
+    /// `MAX_EXECUTION_TIME` through `after_connect`, both outside any agent-controlled
+    /// path (ADR-0024).
+    #[must_use]
+    pub fn server_timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// The deadline the client enforces as a safety net.
+    ///
+    /// Strictly longer than [`ExecutionLimits::server_timeout`] for validated limits,
+    /// which is what makes the server error — not the dropped future — the ordinary
+    /// path (`docs/operations.md` section 5.3).
+    #[must_use]
+    pub fn client_timeout(&self) -> Duration {
+        self.timeout.saturating_add(CLIENT_TIMEOUT_MARGIN)
     }
 }
 
@@ -216,5 +267,44 @@ mod tests {
             inverted.validate(),
             Err(LimitsError::ValueAboveTotal { .. })
         ));
+    }
+
+    #[test]
+    fn the_client_deadline_is_strictly_later_than_the_server_deadline() {
+        for timeout in [
+            Duration::from_millis(1),
+            Duration::from_secs(5),
+            MAX_QUERY_TIMEOUT,
+        ] {
+            let limits = ExecutionLimits {
+                timeout,
+                ..Default::default()
+            };
+            limits.validate().unwrap();
+            assert_eq!(limits.server_timeout(), timeout);
+            assert!(
+                limits.server_timeout() < limits.client_timeout(),
+                "ordering inverted at {timeout:?}"
+            );
+        }
+        assert_eq!(
+            ExecutionLimits::default().client_timeout(),
+            Duration::from_secs(6)
+        );
+    }
+
+    #[test]
+    fn a_timeout_above_the_ceiling_is_rejected() {
+        let above = ExecutionLimits {
+            timeout: MAX_QUERY_TIMEOUT + Duration::from_secs(1),
+            ..Default::default()
+        };
+        assert_eq!(
+            above.validate(),
+            Err(LimitsError::TimeoutAboveCeiling {
+                actual: MAX_QUERY_TIMEOUT + Duration::from_secs(1),
+                ceiling: MAX_QUERY_TIMEOUT,
+            })
+        );
     }
 }

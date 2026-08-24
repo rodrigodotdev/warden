@@ -12,9 +12,17 @@ publish = false
 workspace = true
 
 [dependencies]
+# ADR-0031: a DSN is parsed and validated here, once, so that both adapters read a
+# connection target rather than re-deriving one from a string. `url` is the parser
+# `sqlx` itself uses, and `percent-encoding` decodes the credential fields.
+percent-encoding = { workspace = true }
+# ADR-0019: DSNs are typed and redacted. This is the only crate both adapters can
+# depend on, so the secret type has to live here (`docs/architecture.md` section 3).
+secrecy = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
+url = { workspace = true }
 
 [dev-dependencies]
 toml = { workspace = true }

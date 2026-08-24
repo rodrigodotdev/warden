@@ -2038,6 +2038,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
+name = "secrecy"
+version = "0.10.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e891af845473308773346dc847b2c23ee78fe442e0472ac50e22a18a93d3ae5a"
+dependencies = [
+ "zeroize",
+]
+
+[[package]]
 name = "security-framework"
 version = "3.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3025,6 +3034,7 @@ name = "warden"
 version = "0.1.0"
 dependencies = [
  "serde_json",
+ "sha2 0.11.0",
  "toml",
 ]
 
@@ -3036,10 +3046,13 @@ version = "0.1.0"
 name = "warden-core"
 version = "0.1.0"
 dependencies = [
+ "percent-encoding",
+ "secrecy",
  "serde",
  "serde_json",
  "thiserror",
  "toml",
+ "url",
 ]
 
 [[package]]
@@ -3052,6 +3065,11 @@ version = "0.1.0"
 dependencies = [
  "sha2 0.11.0",
  "sqlparser",
+ "sqlx",
+ "syn 2.0.119",
+ "testcontainers-modules",
+ "thiserror",
+ "tokio",
  "warden-core",
  "warden-policy",
  "warden-ports",
@@ -3087,6 +3105,11 @@ version = "0.1.0"
 dependencies = [
  "sha2 0.11.0",
  "sqlparser",
+ "sqlx",
+ "syn 2.0.119",
+ "testcontainers-modules",
+ "thiserror",
+ "tokio",
  "warden-core",
  "warden-policy",
  "warden-ports",

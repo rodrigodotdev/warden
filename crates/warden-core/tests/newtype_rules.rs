@@ -124,3 +124,106 @@ fn the_public_error_codes_match_the_security_document() {
          all."
     );
 }
+
+#[test]
+fn the_dsn_implements_no_stringifying_trait() {
+    // `Debug` is present and hand-written; `TryFrom`/`FromStr` are required. These
+    // five are the ones that would turn a secret back into a printable string or
+    // duplicate it, and
+    // the module comment explains why the general newtype rule does not apply
+    // (ADR-0019) — which is exactly why the rule needs a check rather than prose.
+    const FORBIDDEN: &[&str] = &["Clone", "Display", "AsRef", "Deref", "Serialize"];
+
+    let mut violations = Vec::new();
+    for path in source_files() {
+        let mut header = String::new();
+        let mut header_line = 0;
+        for (number, line) in code_lines(&path) {
+            if header.is_empty() {
+                if !line.starts_with("impl") {
+                    continue;
+                }
+                header_line = number;
+                header.push_str(&line);
+            } else {
+                header.push(' ');
+                header.push_str(&line);
+            }
+
+            if !header.contains('{') {
+                continue;
+            }
+
+            if let Some((implemented_traits, target)) = header.split_once(" for ") {
+                let targets_dsn = target
+                    .split(|character: char| !character.is_ascii_alphanumeric())
+                    .any(|part| part == "Dsn");
+                if targets_dsn {
+                    for trait_name in FORBIDDEN {
+                        if implemented_traits
+                            .split(|character: char| !character.is_ascii_alphanumeric())
+                            .any(|part| part == *trait_name)
+                        {
+                            violations
+                                .push(format!("  {}:{header_line}: {header}", path.display()));
+                        }
+                    }
+                }
+            }
+
+            header.clear();
+        }
+    }
+
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/secret.rs");
+    let lines = code_lines(&path);
+    let mut pending_derives = String::new();
+    let mut in_derive = false;
+    for (number, line) in lines {
+        if in_derive {
+            pending_derives.push_str(&line);
+            if line.ends_with(")]") {
+                in_derive = false;
+            }
+            continue;
+        }
+
+        if line.starts_with("#[derive") {
+            pending_derives.push_str(&line);
+            in_derive = !line.ends_with(")]");
+            continue;
+        }
+
+        if line.is_empty() || line.starts_with("#[") {
+            continue;
+        }
+
+        if line == "pub struct Dsn {" {
+            for trait_name in FORBIDDEN {
+                if pending_derives
+                    .split(|character: char| !character.is_ascii_alphanumeric())
+                    .any(|derived| derived == *trait_name)
+                {
+                    violations.push(format!(
+                        "  {}:{number}: a derive immediately preceding `Dsn` includes {trait_name}",
+                        path.display()
+                    ));
+                }
+            }
+            break;
+        }
+
+        pending_derives.clear();
+    }
+
+    assert!(
+        violations.is_empty(),
+        "`Dsn` implements or derives a forbidden secret trait:\n{}\n\n\
+         A DSN carries a password. `Display` is what puts it into a log line, \
+         `AsRef<str>` is what hands it to anything expecting a string, and \
+         `Serialize` is what puts it into a tool response (ADR-0019; SPEC section 6, \
+         invariants 20-21). `Clone` duplicates a secret. The only read-back is \
+         `expose_password`.",
+        violations.join("\n")
+    );
+}

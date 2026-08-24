@@ -205,8 +205,7 @@ that the supposedly generic core was secretly shaped around MySQL.
 - [x] MySQL and PostgreSQL analyzers exist
 - [ ] Both adapters execute safe read-only queries
 - [x] SQLx's `any` feature is disabled and `AnyPool` is unreachable (`tests/architecture.rs`)
-- [ ] Both adapters use concrete pools (pending M6; both adapters now have
-      analyzers and neither has a pool)
+- [x] Both adapters use concrete pools
 - [x] `sqlparser` appears only inside adapter crates
 - [x] Multiple statements are denied
 - [x] Nested writes are denied
