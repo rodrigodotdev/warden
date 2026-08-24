@@ -389,17 +389,55 @@ mod tests {
         assert!(hardening_chain(fixture).is_err());
     }
 
+    /// Every `.rs` file in this crate, so the scan cannot be satisfied by the one
+    /// file that happens to hold the guard.
+    fn crate_sources() -> Vec<(String, String)> {
+        fn collect(directory: &std::path::Path, found: &mut Vec<(String, String)>) {
+            let entries = std::fs::read_dir(directory)
+                .unwrap_or_else(|error| panic!("could not read {}: {error}", directory.display()));
+            for entry in entries {
+                let path = entry.expect("unreadable directory entry").path();
+                if path.is_dir() {
+                    collect(&path, found);
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    let text = std::fs::read_to_string(&path).unwrap_or_else(|error| {
+                        panic!("could not read {}: {error}", path.display())
+                    });
+                    found.push((path.display().to_string(), text));
+                }
+            }
+        }
+
+        let mut found = Vec::new();
+        collect(
+            &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut found,
+        );
+        assert!(
+            !found.is_empty(),
+            "no source files found; did the layout change?"
+        );
+        found
+    }
+
     #[test]
-    fn no_production_call_reaches_the_environment_or_pgpass() {
-        let calls = production_calls(include_str!("options.rs"));
-        for forbidden in FORBIDDEN_CALLS {
-            assert!(
-                !calls.iter().any(|call| call == forbidden),
-                "{forbidden} is called; it would let the driver read the environment, \
-                 `~/.pgpass`, or a URL it can log before hardening (ADR-0031)"
-            );
+    fn no_production_call_in_this_crate_reaches_the_environment_or_pgpass() {
+        // Scans the whole crate, not just this file: a second module that built
+        // `PgConnectOptions` for itself would reopen the `PG*` and `~/.pgpass` paths
+        // while every test in `options.rs` still passed.
+        for (path, source) in crate_sources() {
+            let calls = production_calls(&source);
+            for forbidden in FORBIDDEN_CALLS {
+                assert!(
+                    !calls.iter().any(|call| call == forbidden),
+                    "{path} calls {forbidden}; it would let the driver read the \
+                     environment, `~/.pgpass`, or a URL it can log before hardening \
+                     (ADR-0031)"
+                );
+            }
         }
         // `var_os` is the one deliberate environment read, and it only refuses.
+        let calls = production_calls(include_str!("options.rs"));
         assert!(calls.iter().any(|call| call == "std::env::var_os"));
     }
 
