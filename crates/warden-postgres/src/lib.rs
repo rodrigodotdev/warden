@@ -31,23 +31,11 @@
 //! the visitor descends into — all three of which are classified. A `warden-core`
 //! security enum never gets a wildcard at all (ADR-0021).
 
-// Until Task 4 exports `PostgreSqlAnalyzer`, nothing `pub` reaches these modules and
-// `dead_code` fires on every `pub(crate)` item in them in a non-test build. `expect`
-// rather than `allow` because an unfulfilled expectation is itself a warning: the
-// moment the export exists this line starts failing the build, which is how it gets
-// removed instead of outliving its reason. Scoped to `not(test)`: the unit tests
-// below call into `parse` and `statement` directly, which makes those items reachable
-// — and therefore not dead — in the `#[cfg(test)]` build, so an unscoped `expect`
-// would be unfulfilled there even though nothing is wrong.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the crate exports nothing until Task 4 wires up the analyzer"
-    )
-)]
-
+mod analyzer;
+mod fingerprint;
 mod functions;
 mod parse;
 mod statement;
 mod visit;
+
+pub use analyzer::PostgreSqlAnalyzer;
