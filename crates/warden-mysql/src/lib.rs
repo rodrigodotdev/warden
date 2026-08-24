@@ -1,5 +1,5 @@
-//! Warden's MySQL adapter: analysis now, execution, inspection, explain,
-//! normalization, and connections in Milestones 7, 9 and 10.
+//! Warden's MySQL adapter: analysis and connections now, execution, inspection and
+//! explain in Milestones 7, 9 and 10.
 //!
 //! This crate may depend on `warden-core`, `warden-policy`, `warden-ports`, `sqlx`,
 //! and `sqlparser`, but never `rmcp`.
@@ -11,6 +11,14 @@
 //! `warden-core`, `warden-policy`, and `warden-ports` types, so no `sqlparser` type
 //! can appear in a public signature (SPEC section 6, invariant 28; ADR-0007).
 //! `tests/adapter_rules.rs` enforces that mechanically rather than by review.
+//!
+//! # The driver stops here too
+//!
+//! [`MySqlConnectionPools`] owns two concrete `MySqlPool` values (ADR-0005,
+//! ADR-0025) and hands out neither: the accessors are `pub(crate)`, so the crate's
+//! public surface names no SQLx type at all. The composition root builds a pools
+//! value, passes it to the executor, and never depends on `sqlx` itself.
+//! `tests/adapter_rules.rs` enforces that the same way it enforces the AST rule.
 //!
 //! # How analysis fails, and how it does not
 //!
@@ -32,11 +40,17 @@
 //! all (ADR-0021).
 
 mod analyzer;
+mod connection;
+mod error;
 mod fingerprint;
 mod functions;
+mod options;
 mod parse;
+mod pool;
 mod statement;
 mod tokens;
 mod visit;
 
 pub use analyzer::MySqlAnalyzer;
+pub use connection::{MySqlConnectionConfig, MySqlConnectionPools};
+pub use error::ConnectError;
