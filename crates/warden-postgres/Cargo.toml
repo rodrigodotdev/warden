@@ -15,5 +15,16 @@ workspace = true
 warden-core = { workspace = true }
 warden-policy = { workspace = true }
 warden-ports = { workspace = true }
+# ADR-0004/0005: concrete `PgPool` values, with `any` and `migrate` disabled
+# workspace-wide so `AnyPool` and the DDL migration executor are compile errors.
+sqlx = { workspace = true }
+# `time` only: this crate needs `timeout_at` for connection health checks. It starts
+# no runtime; the binary does.
+tokio = { workspace = true, features = ["time"] }
 sqlparser = { workspace = true }
 sha2 = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# Test-only runtime support for async configuration-validation tests.
+tokio = { workspace = true, features = ["macros", "rt"] }

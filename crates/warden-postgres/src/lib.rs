@@ -1,5 +1,5 @@
-//! Warden's PostgreSQL adapter: analysis now, execution, inspection, explain,
-//! normalization, and connections in Milestones 8, 9 and 10.
+//! Warden's PostgreSQL adapter: analysis and connections now, execution, inspection
+//! and explain in Milestones 8, 9 and 10.
 //!
 //! This crate may depend on `warden-core`, `warden-policy`, `warden-ports`, `sqlx`,
 //! and `sqlparser`, but never `rmcp`.
@@ -11,6 +11,18 @@
 //! `warden-core`, `warden-policy`, and `warden-ports` types, so no `sqlparser` type
 //! can appear in a public signature (SPEC section 6, invariant 28; ADR-0007).
 //! `tests/adapter_rules.rs` enforces that mechanically rather than by review.
+//!
+//! # The driver stops here too
+//!
+//! [`PostgreSqlConnectionPools`] owns two concrete `PgPool` values (ADR-0005,
+//! ADR-0025) and hands out neither: the accessors are `pub(crate)`, so the crate's
+//! public surface names no SQLx type at all. `tests/adapter_rules.rs` enforces that
+//! the same way it enforces the AST rule.
+//!
+//! Every statement destined for `agent_pool` is built by `crate::query::agent_query`,
+//! which applies `.persistent(false)`. That flag is per query, not per pool, so
+//! `statement_cache_capacity(0)` alone would make PostgreSQL leak a named prepared
+//! statement per distinct query for the connection's lifetime (ADR-0025).
 //!
 //! # How analysis fails, and how it does not
 //!
@@ -35,10 +47,20 @@
 //! `warden-core` security enum never gets a wildcard at all (ADR-0021).
 
 mod analyzer;
+mod connection;
+mod error;
 mod fingerprint;
 mod functions;
+mod options;
 mod parse;
+mod pool;
+mod query;
 mod statement;
 mod visit;
 
 pub use analyzer::PostgreSqlAnalyzer;
+pub use connection::{
+    MAX_SCHEMA_NAME_LEN, PostgreSqlConnectionConfig, PostgreSqlConnectionPools, SearchPath,
+    SearchPathError,
+};
+pub use error::ConnectError;
