@@ -2,13 +2,23 @@
 //!
 //! `docs/security.md` section 11.4 asks each adapter to fingerprint a normalized AST
 //! with literals replaced, so audits stay comparable without ever storing SQL. The
-//! normalization here is sqlparser's own `Display`, applied after every literal has
-//! been replaced with `?`, which also erases whitespace, comments, and keyword case.
+//! normalization here is sqlparser's own `Display`, applied after every literal
+//! sqlparser models as a `Value` has been replaced with `?`, which also erases
+//! whitespace, comments, and keyword case.
 //!
-//! One placeholder covers every literal kind, so a PostgreSQL positional parameter
-//! and an inline value share a fingerprint: `WHERE a = $1` and `WHERE a = 'x'` are
-//! the same question asked about different data. Dollar-quoted strings normalize the
-//! same way, because sqlparser models them as a `Value` like any other.
+//! One placeholder covers every `Value` literal kind, so a PostgreSQL positional
+//! parameter and an inline value share a fingerprint: `WHERE a = $1` and
+//! `WHERE a = 'x'` are the same question asked about different data. Dollar-quoted
+//! strings normalize the same way, because sqlparser models them as a `Value` like
+//! any other.
+//!
+//! **Known gap:** not every literal sqlparser parses reaches a `Value`. A `COPY`
+//! target is `CopyTarget::File { filename: String }`, a plain `String` rather than a
+//! `Value`, so `COPY t FROM 'a.csv'` and `COPY t FROM 'secret.csv'` normalize to
+//! different text and fingerprint differently. There is no security impact — the
+//! output is still only a SHA-256 digest, never the filename itself — but it is a
+//! correlation the module otherwise exists to provide and currently does not for
+//! this one construct.
 //!
 //! Identifier quoting is **not** erased: `"Orders"` and `Orders` fingerprint
 //! differently, because in PostgreSQL they are different relations and a fingerprint
@@ -129,9 +139,15 @@ mod tests {
     #[test]
     fn the_fingerprint_contains_no_literal_from_the_statement() {
         // The point of the whole module: an audit record must not become a second
-        // store of the data an agent searched for.
-        let value = fingerprint("SELECT * FROM users WHERE email = 'alice@example.com'");
-        assert!(!value.contains("alice"), "{value}");
+        // store of the data an agent searched for. A hex digest can never literally
+        // contain "alice", so the property that actually matters is that two
+        // statements differing only in the literal value collapse to the same
+        // fingerprint -- that is the stripping guarantee, and it is what regresses
+        // if `pre_visit_value` stops firing.
+        assert_eq!(
+            fingerprint("SELECT * FROM users WHERE email = 'alice@example.com'"),
+            fingerprint("SELECT * FROM users WHERE email = 'mallory@example.com'")
+        );
     }
 
     #[test]

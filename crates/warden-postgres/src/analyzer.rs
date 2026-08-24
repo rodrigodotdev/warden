@@ -165,10 +165,12 @@ mod tests {
 
     #[test]
     fn a_syntax_error_never_echoes_the_statement_through_display() {
-        // Unlike MySQL's grammar, PostgreSQL's accepts a bare `FROM 'literal'` by
-        // reading the string as a table alias, so this fixture is a genuinely
-        // malformed statement under `PostgreSqlDialect`: an unclosed parenthesis.
-        let error = analyze("SELECT * FROM t WHERE ('sup3r-s3cret'").unwrap_err();
+        // A lone string literal is not a statement under `PostgreSqlDialect`, so the
+        // parser's own message quotes the secret verbatim ("Expected: an SQL
+        // statement, found: 'sup3r-s3cret'"). That is exactly the fixture this test
+        // needs: `detail` genuinely carries the secret, so the assertion below can
+        // actually fail if `AnalyzeError::Parse`'s `Display` ever printed it.
+        let error = analyze("'sup3r-s3cret'").unwrap_err();
         assert!(!error.to_string().contains("sup3r-s3cret"), "{error}");
         assert_eq!(error.deny_reason().code(), DenyCode::UnknownConstruct);
     }
@@ -198,13 +200,18 @@ mod tests {
 
     #[test]
     fn a_batch_reports_the_first_statement_as_the_root() {
-        // `statements.first()` is the source of truth for `root_kind`, not
-        // `Evidence.kinds`: a multi-statement batch's kinds vector holds every
-        // top-level statement's own kind too, not only what is nested inside the
-        // first one.
-        let analyzed = analyze("SELECT 1; DELETE FROM t").unwrap();
+        // `statements.first()` and `statements.len()` are the source of truth for
+        // `root_kind` and `statement_count`, not `Evidence.kinds`. This fixture is
+        // chosen so the two disagree in length: `EXPLAIN` pushes its own kind and
+        // then descends into the query it explains, so `Evidence.kinds` is
+        // `[Explain, Select, Delete]` (length 3) while `statements.len()` is 2. A
+        // regression that read `root_kind` from `kinds[0]` would still pass by
+        // coincidence here (`Explain` is at both position 0 and is the real root),
+        // but a regression that read `statement_count` from `kinds.len()` would
+        // report 3 statements instead of 2, which this test catches.
+        let analyzed = analyze("EXPLAIN SELECT 1; DELETE FROM t").unwrap();
         let analysis = analyzed.analysis();
-        assert_eq!(analysis.root_kind(), StatementKind::Select);
+        assert_eq!(analysis.root_kind(), StatementKind::Explain);
         assert_eq!(analysis.statement_count().get(), 2);
         assert!(analysis.has_risk(RiskFlag::MultipleStatements));
         assert!(analysis.has_risk(RiskFlag::WriteStatement));
