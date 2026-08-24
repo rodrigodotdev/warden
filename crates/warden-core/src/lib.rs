@@ -2,9 +2,11 @@
 //! errors.
 //!
 //! This crate is the root of the dependency graph and depends only on `serde`,
-//! `serde_json`, `thiserror`, and `secrecy` — the last because both adapters need a
-//! typed, redacted DSN and neither may depend on `warden-config`
-//! (`docs/architecture.md` section 3; ADR-0019). It must not depend on `sqlx`,
+//! `serde_json`, `thiserror`, `secrecy`, `url`, and `percent-encoding`. The last
+//! three are all one decision: both adapters need a typed, redacted DSN and neither
+//! may depend on `warden-config` (`docs/architecture.md` section 3; ADR-0019), and
+//! that DSN is parsed and validated here rather than by a driver's own URL parser
+//! (ADR-0031). It must not depend on `sqlx`,
 //! `rmcp`, or `sqlparser` (SPEC sections 4 and 6), a rule `tests/architecture.rs`
 //! enforces mechanically.
 //!

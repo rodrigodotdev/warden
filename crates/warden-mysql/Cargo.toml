@@ -21,8 +21,10 @@ docker = []
 warden-core = { workspace = true }
 warden-policy = { workspace = true }
 warden-ports = { workspace = true }
-# ADR-0004/0005: concrete `MySqlPool` values, with `any` and `migrate` disabled
-# workspace-wide so `AnyPool` and the DDL migration executor are compile errors.
+# ADR-0004/0005: concrete `MySqlPool` values. `any` and `migrate` are disabled
+# workspace-wide, so `sqlx::AnyPool` and `sqlx::migrate!` are compile errors here;
+# ADR-0004 records that `sqlx-core` compiles both modules anyway, and
+# `tests/architecture.rs` pins that limitation.
 sqlx = { workspace = true }
 # `time` only: this crate needs `timeout_at` for connection health checks. It starts
 # no runtime; the binary does.

@@ -12,9 +12,9 @@
 //!   the database user, the database, and the statement, and `tracing::warn!(%error)`
 //!   would then write all of it into the operator log that SPEC section 6, invariants
 //!   21 and 22 keep clean.
-//! * **[`ConnectError::InvalidDsn`] carries nothing at all.** The driver's parse
-//!   failure is a `sqlx::Error::Configuration` wrapping a URL error whose message can
-//!   quote the string it failed on, and that string is the DSN.
+//! * **No variant carries any part of the DSN.** `warden_core::secret::Dsn` has
+//!   already rejected everything malformed, and it reports its own reasons without
+//!   quoting the string; nothing here needs to re-describe a connection string.
 
 use warden_core::dialect::Dialect;
 use warden_core::limits::LimitsError;
@@ -24,11 +24,6 @@ use warden_core::tls::TlsError;
 /// Why a MySQL connection is unusable.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ConnectError {
-    /// The driver could not parse the DSN.
-    ///
-    /// Carries no detail on purpose; see the module documentation.
-    #[error("the DSN is not a usable MySQL connection string")]
-    InvalidDsn,
     /// The DSN's scheme names a different engine than this adapter speaks.
     ///
     /// SQLx does not check this: `MySqlConnectOptions::from_str` parses a
@@ -39,12 +34,6 @@ pub enum ConnectError {
         /// The dialect the DSN's scheme named.
         actual: Dialect,
     },
-    /// The DSN names no default database.
-    ///
-    /// MySQL resolves an unqualified table name against the session's default
-    /// database, so leaving it unset is bypass 3 of `docs/security.md` section 5.
-    #[error("the DSN names no database; MySQL name resolution needs an explicit one")]
-    MissingDatabase,
     /// The pool capacity is not usable.
     #[error("the pool settings are not usable: {source}")]
     PoolSettings {
@@ -77,7 +66,7 @@ pub enum ConnectError {
     Timeout,
     /// A hardened session setting did not survive to the server.
     ///
-    /// `docs/operations.md` section 5.1 names the case: a pooler or proxy between
+    /// `docs/operations.md` section 5.2 names the case: a pooler or proxy between
     /// Warden and the server can discard connection-time settings, and the deployment
     /// then believes it has a server-side deadline it does not have. Both fields are
     /// setting values, never secrets, so `Display` prints them.

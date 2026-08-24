@@ -3046,11 +3046,13 @@ version = "0.1.0"
 name = "warden-core"
 version = "0.1.0"
 dependencies = [
+ "percent-encoding",
  "secrecy",
  "serde",
  "serde_json",
  "thiserror",
  "toml",
+ "url",
 ]
 
 [[package]]

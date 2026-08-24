@@ -11,18 +11,28 @@ use warden_core::tls::TlsError;
 /// Why a PostgreSQL connection is unusable.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ConnectError {
-    /// The driver could not parse the DSN.
-    #[error("the DSN is not a usable PostgreSQL connection string")]
-    InvalidDsn,
     /// The DSN's scheme names a different engine than this adapter speaks.
     #[error("this adapter is postgresql but the DSN names {actual}")]
     DialectMismatch {
         /// The dialect the DSN's scheme named.
         actual: Dialect,
     },
-    /// The DSN names no database.
-    #[error("the DSN names no database")]
-    MissingDatabase,
+    /// The environment would still influence the connection.
+    ///
+    /// `PgConnectOptions` reads its host, credentials and TLS material from `PG*`
+    /// variables and offers no way to clear the certificate fields once a
+    /// constructor has filled them in. A connection whose trust anchor or password
+    /// came from the environment is one Warden's configuration does not describe, so
+    /// startup refuses it and names the variable (ADR-0031). The name is a fixed
+    /// string from `options::AMBIENT_VARIABLES`; the value is never read.
+    #[error(
+        "the environment variable {variable} would influence this connection; \
+         Warden's configuration is the only source, so unset it"
+    )]
+    AmbientConnectionInput {
+        /// The variable that must be unset.
+        variable: &'static str,
+    },
     /// The pool capacity is not usable.
     #[error("the pool settings are not usable: {source}")]
     PoolSettings {

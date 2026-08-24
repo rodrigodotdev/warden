@@ -21,7 +21,7 @@ use tokio::time::Instant;
 use warden_core::connection::Environment;
 use warden_core::limits::ExecutionLimits;
 use warden_core::pool::PoolSettings;
-use warden_core::secret::Dsn;
+use warden_core::secret::{Dsn, DsnError};
 use warden_core::tls::{TlsMode, TlsSettings};
 
 use crate::connection::{MySqlConnectionConfig, MySqlConnectionPools};
@@ -41,11 +41,18 @@ async fn start_mysql() -> ContainerAsync<Mysql> {
         .expect("failed to start the MySQL container")
 }
 
-/// A DSN for the container, with an explicit database as Warden requires.
-async fn dsn(container: &ContainerAsync<Mysql>, query: &str) -> Dsn {
+/// The connection string for the container, with an explicit database as Warden
+/// requires and an optional suffix for the DSNs that must be refused.
+async fn connection_string(container: &ContainerAsync<Mysql>, suffix: &str) -> String {
     let host = container.get_host().await.unwrap();
     let port = container.get_host_port_ipv4(3306).await.unwrap();
-    format!("mysql://root@{host}:{port}/test{query}")
+    format!("mysql://root@{host}:{port}/test{suffix}")
+}
+
+/// A DSN for the container.
+async fn dsn(container: &ContainerAsync<Mysql>) -> Dsn {
+    connection_string(container, "")
+        .await
         .parse()
         .expect("the container DSN should be valid")
 }
@@ -107,7 +114,7 @@ fn deadline() -> Instant {
 async fn connects_over_a_real_tls_handshake() {
     let container = start_mysql().await;
     let pools = MySqlConnectionPools::connect(config(
-        dsn(&container, "").await,
+        dsn(&container).await,
         TlsSettings {
             mode: TlsMode::Required,
             root_certificate: None,
@@ -129,27 +136,34 @@ async fn connects_over_a_real_tls_handshake() {
 }
 
 #[tokio::test]
-async fn a_dsn_cannot_downgrade_tls_at_the_server() {
+async fn a_dsn_that_would_downgrade_tls_never_reaches_this_server() {
+    // The end of the path ADR-0031 closes: this exact string, against this exact
+    // running server, is the one an operator pastes to turn TLS off. It is refused
+    // while it is still a string, so the driver never sees a downgrade to ignore.
     let container = start_mysql().await;
+    let hostile = connection_string(&container, "?ssl-mode=disabled").await;
+    assert_eq!(
+        hostile.parse::<Dsn>().unwrap_err(),
+        DsnError::UnsupportedParameter
+    );
+
+    // The same target without the parameter connects, and connects over TLS, so the
+    // refusal above is about the parameter and not about an unreachable server.
     let pools = MySqlConnectionPools::connect(config(
-        dsn(&container, "?ssl-mode=disabled").await,
+        dsn(&container).await,
         TlsSettings {
             mode: TlsMode::Required,
             root_certificate: None,
         },
     ))
     .await
-    .expect("connect should succeed despite the DSN parameter");
-
+    .expect("connect should succeed without the parameter");
     let row = sqlx::query("SHOW STATUS LIKE 'Ssl_cipher'")
         .fetch_one(pools.agent())
         .await
         .unwrap();
     let cipher: String = row.try_get(1).unwrap();
-    assert!(
-        !cipher.is_empty(),
-        "the DSN's ssl-mode=disabled reached the driver"
-    );
+    assert!(!cipher.is_empty(), "the connection is not using TLS");
 
     pools.close().await;
 }
@@ -160,7 +174,7 @@ async fn a_private_root_certificate_is_honored() {
     let ca = TemporaryCertificate::from_container(&container).await;
 
     let pools = MySqlConnectionPools::connect(config(
-        dsn(&container, "").await,
+        dsn(&container).await,
         TlsSettings {
             mode: TlsMode::VerifyCa,
             root_certificate: Some(ca.path().to_path_buf()),
@@ -181,7 +195,7 @@ async fn identity_verification_rejects_a_hostname_mismatch() {
     // The same container and CA must first pass chain verification. That isolates
     // the next failure to hostname identity rather than a bad authority or server.
     let chain_verified = MySqlConnectionPools::connect(config(
-        dsn(&container, "").await,
+        dsn(&container).await,
         TlsSettings {
             mode: TlsMode::VerifyCa,
             root_certificate: Some(ca.path().to_path_buf()),
@@ -193,7 +207,7 @@ async fn identity_verification_rejects_a_hostname_mismatch() {
     chain_verified.close().await;
 
     let error = MySqlConnectionPools::connect(config(
-        dsn(&container, "").await,
+        dsn(&container).await,
         TlsSettings {
             mode: TlsMode::VerifyIdentity,
             root_certificate: Some(ca.path().to_path_buf()),
@@ -213,7 +227,7 @@ async fn identity_verification_rejects_a_hostname_mismatch() {
 async fn the_server_side_deadline_reaches_both_pools() {
     let container = start_mysql().await;
     let pools = MySqlConnectionPools::connect(config(
-        dsn(&container, "").await,
+        dsn(&container).await,
         TlsSettings {
             mode: TlsMode::Required,
             root_certificate: None,
@@ -240,7 +254,7 @@ async fn the_server_side_deadline_reaches_both_pools() {
 async fn the_agent_pool_retains_no_prepared_statements() {
     let container = start_mysql().await;
     let pools = MySqlConnectionPools::connect(config(
-        dsn(&container, "").await,
+        dsn(&container).await,
         TlsSettings {
             mode: TlsMode::Required,
             root_certificate: None,
@@ -287,7 +301,7 @@ async fn the_agent_pool_retains_no_prepared_statements() {
 async fn the_pool_ceiling_and_acquire_timeout_bound_the_sixth_caller() {
     let container = start_mysql().await;
     let pools = MySqlConnectionPools::connect(config(
-        dsn(&container, "").await,
+        dsn(&container).await,
         TlsSettings {
             mode: TlsMode::Required,
             root_certificate: None,
@@ -335,7 +349,7 @@ async fn the_pool_ceiling_and_acquire_timeout_bound_the_sixth_caller() {
 async fn the_health_check_survives_a_saturated_agent_pool() {
     let container = start_mysql().await;
     let pools = MySqlConnectionPools::connect(config(
-        dsn(&container, "").await,
+        dsn(&container).await,
         TlsSettings {
             mode: TlsMode::Required,
             root_certificate: None,
@@ -362,7 +376,7 @@ async fn the_health_check_survives_a_saturated_agent_pool() {
 async fn a_closed_pool_reports_a_failed_health_check_rather_than_hanging() {
     let container = start_mysql().await;
     let pools = MySqlConnectionPools::connect(config(
-        dsn(&container, "").await,
+        dsn(&container).await,
         TlsSettings {
             mode: TlsMode::Required,
             root_certificate: None,

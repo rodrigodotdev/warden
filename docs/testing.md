@@ -72,8 +72,8 @@ Initial images are MySQL 8.4 and a currently supported PostgreSQL release.
 Compatibility matrices can grow later.
 
 Milestone 6 covers the connection itself: TLS handshake and private-CA verification,
-the server-side deadline on both pools, PostgreSQL's startup options surviving a DSN
-that tries to relax them, `default_transaction_read_only` refusing DDL outside any
+the server-side deadline on both pools, PostgreSQL's startup options reaching the
+server while a DSN that would relax them is refused, `default_transaction_read_only` refusing DDL outside any
 policy, statement-cache behaviour on both engines, the exact pool defaults under
 saturation, and readiness surviving a saturated agent pool. Milestones 7 and 8 add the
 query-level rows below.

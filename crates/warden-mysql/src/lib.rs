@@ -6,11 +6,12 @@
 //!
 //! # The AST stops here
 //!
-//! Every module below is private and every item in them is `pub(crate)`. The crate's
-//! entire public surface is `MySqlAnalyzer`, whose signatures name only
+//! Every module below is private, and the crate exports four names: the analyzer,
+//! the two connection types, and their error. Their signatures name only
 //! `warden-core`, `warden-policy`, and `warden-ports` types, so no `sqlparser` type
 //! can appear in a public signature (SPEC section 6, invariant 28; ADR-0007).
-//! `tests/adapter_rules.rs` enforces that mechanically rather than by review.
+//! `tests/adapter_rules.rs` enforces that mechanically rather than by review, over
+//! the four files allowed to declare a `pub` item.
 //!
 //! # The driver stops here too
 //!

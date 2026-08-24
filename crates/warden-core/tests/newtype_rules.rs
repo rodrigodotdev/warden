@@ -223,7 +223,7 @@ fn the_dsn_implements_no_stringifying_trait() {
          `AsRef<str>` is what hands it to anything expecting a string, and \
          `Serialize` is what puts it into a tool response (ADR-0019; SPEC section 6, \
          invariants 20-21). `Clone` duplicates a secret. The only read-back is \
-         `expose_secret`.",
+         `expose_password`.",
         violations.join("\n")
     );
 }

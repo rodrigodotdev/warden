@@ -19,7 +19,7 @@ use tokio::time::Instant;
 use warden_core::connection::Environment;
 use warden_core::limits::ExecutionLimits;
 use warden_core::pool::PoolSettings;
-use warden_core::secret::Dsn;
+use warden_core::secret::{Dsn, DsnError};
 use warden_core::tls::{TlsMode, TlsSettings};
 
 use crate::connection::{PostgreSqlConnectionConfig, PostgreSqlConnectionPools, SearchPath};
@@ -37,11 +37,18 @@ async fn start_postgres() -> ContainerAsync<Postgres> {
         .expect("failed to start the PostgreSQL container")
 }
 
-/// A DSN for the container, with an explicit database as Warden requires.
-async fn dsn(container: &ContainerAsync<Postgres>, query: &str) -> Dsn {
+/// The connection string for the container, with an explicit database as Warden
+/// requires and an optional suffix for the DSNs that must be refused.
+async fn connection_string(container: &ContainerAsync<Postgres>, suffix: &str) -> String {
     let host = container.get_host().await.unwrap();
     let port = container.get_host_port_ipv4(5432).await.unwrap();
-    format!("postgres://postgres:postgres@{host}:{port}/postgres{query}")
+    format!("postgres://postgres:postgres@{host}:{port}/postgres{suffix}")
+}
+
+/// A DSN for the container.
+async fn dsn(container: &ContainerAsync<Postgres>) -> Dsn {
+    connection_string(container, "")
+        .await
         .parse()
         .expect("the container DSN should be valid")
 }
@@ -80,7 +87,7 @@ async fn setting(pool: &sqlx::PgPool, name: &str) -> String {
 #[tokio::test]
 async fn the_startup_options_reach_the_server_on_both_pools() {
     let container = start_postgres().await;
-    let pools = PostgreSqlConnectionPools::connect(config(dsn(&container, "").await))
+    let pools = PostgreSqlConnectionPools::connect(config(dsn(&container).await))
         .await
         .unwrap();
 
@@ -104,16 +111,28 @@ async fn the_startup_options_reach_the_server_on_both_pools() {
 }
 
 #[tokio::test]
-async fn a_dsn_cannot_relax_the_startup_options() {
-    // `PgConnectOptions::options` appends, and PostgreSQL applies `-c` assignments in
-    // order, so this asserts the property the ordering exists for: a DSN that tries to
-    // remove the deadline and the read-only default loses.
+async fn a_dsn_that_would_relax_the_startup_options_never_reaches_this_server() {
+    // The end of the path ADR-0031 closes. `PgConnectOptions::options` appends and
+    // PostgreSQL applies `-c` assignments in order, so a DSN that reached the driver
+    // could add settings Warden pins nothing against — `row_security` is the one that
+    // matters. It is refused while it is still a string.
     let container = start_postgres().await;
-    let hostile = "?options=-c%20statement_timeout%3D0%20-c%20default_transaction_read_only%3Doff";
-    let pools = PostgreSqlConnectionPools::connect(config(dsn(&container, hostile).await))
-        .await
-        .expect("connect should succeed; the parameter is legal, it just loses");
+    let hostile = connection_string(
+        &container,
+        "?options=-c%20statement_timeout%3D0%20-c%20row_security%3Doff",
+    )
+    .await;
+    assert_eq!(
+        hostile.parse::<Dsn>().unwrap_err(),
+        DsnError::UnsupportedParameter
+    );
 
+    // The same target without the parameter connects, and the server reports the
+    // settings Warden pinned, so the refusal is about the parameter and not about an
+    // unreachable server.
+    let pools = PostgreSqlConnectionPools::connect(config(dsn(&container).await))
+        .await
+        .expect("connect should succeed without the parameter");
     assert_eq!(setting(pools.agent(), "statement_timeout").await, "5000");
     assert_eq!(
         setting(pools.agent(), "default_transaction_read_only").await,
@@ -129,7 +148,7 @@ async fn the_server_refuses_a_write_in_the_hardened_session() {
     // The fourth independent write barrier of ADR-0024, after the parser, the policy
     // engine and the read-only transaction. No Warden policy runs here.
     let container = start_postgres().await;
-    let pools = PostgreSqlConnectionPools::connect(config(dsn(&container, "").await))
+    let pools = PostgreSqlConnectionPools::connect(config(dsn(&container).await))
         .await
         .unwrap();
 
@@ -156,7 +175,7 @@ async fn the_agent_pool_retains_no_prepared_statements() {
     // `pg_prepared_statements` is session-local, so the whole exercise stays on one
     // pinned connection. `agent_query` is what changes that behaviour.
     let container = start_postgres().await;
-    let pools = PostgreSqlConnectionPools::connect(config(dsn(&container, "").await))
+    let pools = PostgreSqlConnectionPools::connect(config(dsn(&container).await))
         .await
         .unwrap();
 
@@ -179,7 +198,7 @@ async fn the_agent_pool_retains_no_prepared_statements() {
         .unwrap();
     assert_eq!(
         retained, 0,
-        "the agent pool retained {retained} prepared statements; \\
+        "the agent pool retained {retained} prepared statements; \
          statement_cache_capacity(0) plus persistent(false) was ineffective"
     );
 
@@ -190,7 +209,7 @@ async fn the_agent_pool_retains_no_prepared_statements() {
 #[tokio::test]
 async fn the_pool_ceiling_and_acquire_timeout_bound_the_sixth_caller() {
     let container = start_postgres().await;
-    let pools = PostgreSqlConnectionPools::connect(config(dsn(&container, "").await))
+    let pools = PostgreSqlConnectionPools::connect(config(dsn(&container).await))
         .await
         .unwrap();
 
@@ -232,7 +251,7 @@ async fn the_pool_ceiling_and_acquire_timeout_bound_the_sixth_caller() {
 #[tokio::test]
 async fn the_health_check_survives_a_saturated_agent_pool() {
     let container = start_postgres().await;
-    let pools = PostgreSqlConnectionPools::connect(config(dsn(&container, "").await))
+    let pools = PostgreSqlConnectionPools::connect(config(dsn(&container).await))
         .await
         .unwrap();
 
@@ -257,7 +276,7 @@ async fn required_tls_refuses_a_server_without_tls() {
     // ADR-0030 because it does not verify a certificate; the assertion still proves
     // it cannot silently fall back when the server offers no TLS.
     let container = start_postgres().await;
-    let cleartext = PostgreSqlConnectionPools::connect(config(dsn(&container, "").await))
+    let cleartext = PostgreSqlConnectionPools::connect(config(dsn(&container).await))
         .await
         .expect("the TLS-less container must accept the disabled-mode control");
     cleartext
@@ -266,7 +285,7 @@ async fn required_tls_refuses_a_server_without_tls() {
         .expect("the disabled-mode control connection must be usable");
     cleartext.close().await;
 
-    let mut required = config(dsn(&container, "").await);
+    let mut required = config(dsn(&container).await);
     required.tls = TlsSettings {
         mode: TlsMode::Required,
         root_certificate: None,
@@ -294,7 +313,7 @@ async fn required_tls_refuses_a_server_without_tls() {
 #[tokio::test]
 async fn a_closed_pool_reports_a_failed_health_check_rather_than_hanging() {
     let container = start_postgres().await;
-    let pools = PostgreSqlConnectionPools::connect(config(dsn(&container, "").await))
+    let pools = PostgreSqlConnectionPools::connect(config(dsn(&container).await))
         .await
         .unwrap();
 

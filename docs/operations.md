@@ -106,10 +106,15 @@ one. `docs/security.md` section 7.1 asks for exactly that property; the cost is 
 
 ```text
 tokio  tokio-util  rmcp  sqlx  sqlparser  sha2  serde  serde_json
-thiserror  tracing  tracing-subscriber  secrecy  time  base64  bigdecimal  uuid
+thiserror  tracing  tracing-subscriber  secrecy  url  percent-encoding
+time  base64  bigdecimal  uuid
 ```
 
 `tokio-util` provides `CancellationToken` for explicit query cancellation.
+
+`url` and `percent-encoding` parse the DSN in `warden-core`, once, so that neither
+adapter has to trust a driver's URL parser with a connection string (ADR-0031). Both
+are already in the graph through `sqlx`, which parses URLs with the same two crates.
 
 `sha2` computes the `v1:<sha256-hex>` query fingerprint of `docs/security.md`
 section 11.4, which `std` cannot provide. It is used behind one function per
@@ -233,6 +238,21 @@ environment variables or files, empty DSNs, invalid durations, zero or invalid h
 limits, pool maxima below required concurrency, unknown policy profiles, malformed
 schema or table rules, unknown fields, and explicitly prohibited configuration.
 
+**A DSN names only the connection target** (ADR-0031). It must carry a supported
+scheme, a TCP host, a user and a database; it may carry a port and a password; and it
+may carry no query string and no fragment. `?sslmode=`, `?options=`, `?ssl-ca=`,
+`?socket=` and every other driver parameter are startup errors rather than settings,
+because each of them is a decision Warden makes from its own configuration, and a DSN
+that carried one would be a second, unreviewed source of it. Unix-domain socket paths
+are not addressable: TLS needs a TCP peer to authenticate.
+
+**PostgreSQL connections refuse an ambient environment.** `PgConnectOptions` reads
+`PGHOST`, `PGHOSTADDR`, `PGPORT`, `PGUSER`, `PGPASSWORD`, `PGDATABASE`, `PGSSLMODE`,
+`PGSSLROOTCERT`, `PGSSLCERT`, `PGSSLKEY`, `PGAPPNAME` and `PGOPTIONS` for itself, and
+offers no way to clear the three certificate fields afterwards. Warden refuses to
+build a connection while any of them — or `PGPASSFILE` — is set, and names the
+variable. Unset them; put the value in Warden's configuration instead.
+
 **Error messages never contain secret values.**
 
 ### 3.3 Secrets
@@ -337,7 +357,10 @@ The solution **does not rewrite agent SQL**.
 Apply these settings at connect time, outside any agent-controlled path:
 
 ```rust
-PgConnectOptions::new()
+// `new_without_pgpass`, never `new` or `from_str`: every constructor seeds itself
+// from `PG*` variables, and the parsing ones also read `~/.pgpass` and log what they
+// cannot parse — password included — before hardening can run (ADR-0031).
+PgConnectOptions::new_without_pgpass()
     .options([
         ("statement_timeout", "5000"),
         ("idle_in_transaction_session_timeout", "10000"),

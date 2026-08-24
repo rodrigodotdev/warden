@@ -123,7 +123,7 @@ impl MySqlConnectionPools {
 
     /// Confirms the server-side deadline survived to the server, on both pools.
     ///
-    /// `docs/operations.md` section 5.1 requires this check because a pooler or proxy
+    /// `docs/operations.md` section 5.2 requires this check because a pooler or proxy
     /// between Warden and the server can discard connection-time settings, leaving a
     /// deployment that believes it has a server-side deadline it does not have. This
     /// is what `warden check` calls; it is not part of readiness, which must stay

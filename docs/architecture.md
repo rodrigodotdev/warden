@@ -69,7 +69,7 @@ concrete boundary reason.
 ## 3. Dependency direction
 
 ```text
-core        -> minimal foundational dependencies
+core        -> minimal foundational dependencies (serde, thiserror, secrecy, url)
 policy      -> core
 ports       -> core + policy
 mysql       -> core + policy + ports + sqlx + sqlparser

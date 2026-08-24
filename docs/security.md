@@ -49,6 +49,8 @@ control is accepted risk and must say so explicitly.
 | DSN in a tool response | non-serializable secret types; MCP models have no DSN field | unit + E2E |
 | Credential in log, trace, or error | sanitized error mapping; trace-field allowlist; panic hook without payload | unit + E2E |
 | Raw SQL in an operator log through the driver | `ConnectOptions::disable_statement_logging` on every connect options value | unit |
+| Connection setting smuggled through a DSN parameter or a `PG*` variable | `Dsn` rejects query strings and fragments; adapters build options field by field; PostgreSQL refuses an ambient environment (ADR-0031) | unit + AST guard |
+| Password logged by the driver's own URL or `.pgpass` parser | neither is ever called; `PgConnectOptions::new_without_pgpass` only (ADR-0031) | AST guard |
 | Malformed MCP payload | rmcp SDK; input-size limit; sanitized error | E2E |
 | Unauthorized transport access | OAuth/OIDC under the MCP specification; trusted `RequestContext` | HTTP E2E |
 | **Injection through returned data** | section 9; partial mitigation and partially accepted risk | — |
@@ -501,7 +503,9 @@ than one second at `WARN`, emitted through `tracing` with the statement in a
 `db.statement` field. A deployment that never writes a log line itself would still
 publish agent SQL at `WARN`. Both adapters call
 `ConnectOptions::disable_statement_logging` on every connect options value they build,
-for both pools, and Milestone 6's unit tests cover the call site.
+for both pools. Each adapter's tests parse its own `options.rs` and fail if the call
+is missing, duplicated, or moved out of the one chain that builds those values, so the
+control cannot be deleted by an edit that still compiles.
 
 SQL can contain emails, tokens, names, search strings, private messages, and literal
 secrets. A security product must not accidentally create a second sensitive-data
