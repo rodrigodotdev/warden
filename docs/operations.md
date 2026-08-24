@@ -58,6 +58,13 @@ sqlx = { version = "0.9", default-features = false, features = [
 ] }
 ```
 
+**Disabling `any` and `migrate` removes the API, not the code.** `sqlx` 0.9.0
+declares `sqlx-core` with `features = ["migrate"]` unconditionally and inherits its
+defaults, which include `any`, so both modules compile whatever the facade's feature
+list says. `sqlx::AnyPool` and `sqlx::migrate!` are still unreachable, which is the
+guarantee ADR-0005 and ADR-0009 need; ADR-0004 records the limitation and
+`tests/architecture.rs` pins both facts so an upstream change is noticed here.
+
 `bigdecimal` is mandatory and **must not** be replaced with `rust_decimal`. The latter
 is 96-bit and loses precision for large `NUMERIC` values, violating normalization rule
 1 (`docs/data-model.md` section 8.1).
@@ -151,9 +158,13 @@ distributed by that crate. It is a third-party redistribution notice, **not**
 Warden's project license. Today's distributable artifact is the source repository;
 there is no Dockerfile, Containerfile, or release archive yet. The architecture test
 compares its SHA-256 against the canonical crate text and parses future Dockerfile or
-Containerfile `COPY` instructions: only normalized `LICENSES` source paths count, so
-a destination merely named `LICENSES` cannot bypass the check. Milestone 12 packaging
-must copy that directory into each release artifact.
+Containerfile `COPY` instructions. A file passes only when the **final** build stage —
+the one a release artifact is built from, so a notice copied into a builder stage and
+discarded with it does not count — copies either `LICENSES` or that exact notice path
+to `/opt/warden/LICENSES`. A destination merely named `LICENSES`, an unrelated file
+under `LICENSES/`, and a non-normalized source such as `./LICENSES` all fail.
+Milestone 12 packaging must copy that directory to that destination in each release
+artifact.
 
 > **PENDING:** the project license is not selected, which blocks the `deny.toml`
 > license allowlist. This is a product choice between Apache-2.0, with its patent

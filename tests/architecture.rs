@@ -47,6 +47,11 @@ const WEBPKI_ROOTS_LICENSE: &str =
 const WEBPKI_ROOTS_LICENSE_SHA256: &str =
     "e271993808fec50ab29350b39539cdec611a9103f827e0aa26d61da70e2d33f8";
 
+/// The notice CDLA-Permissive-2.0 requires a redistribution to carry.
+const REQUIRED_NOTICE: &str = "LICENSES/webpki-roots-1.0.9-CDLA-Permissive-2.0.txt";
+/// Where `docs/operations.md` section 2.7 says a release image keeps it.
+const LICENSE_DESTINATION: &str = "/opt/warden/LICENSES";
+
 fn container_build_files(directory: &Path, files: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(directory)
         .unwrap_or_else(|error| panic!("could not read {}: {error}", directory.display()))
@@ -161,36 +166,71 @@ fn shell_words(arguments: &str) -> Option<Vec<String>> {
     Some(words)
 }
 
-fn copy_sources(instruction: &str) -> Option<Vec<String>> {
+/// The sources and the destination of one `COPY`, in either syntax.
+fn copy_paths(instruction: &str) -> Option<(Vec<String>, String)> {
     let (keyword, arguments) = instruction.trim().split_once(char::is_whitespace)?;
     if !keyword.eq_ignore_ascii_case("COPY") {
         return None;
     }
     let arguments = strip_copy_flags(arguments)?;
-    let paths = if arguments.starts_with('[') {
+    let mut paths = if arguments.starts_with('[') {
         serde_json::from_str::<Vec<String>>(arguments).ok()?
     } else {
         shell_words(arguments)?
     };
-    (paths.len() >= 2).then(|| paths[..paths.len() - 1].to_vec())
+    if paths.len() < 2 {
+        return None;
+    }
+    let destination = paths.pop()?;
+    Some((paths, destination))
 }
 
-fn is_normalized_license_source(source: &str) -> bool {
-    source == "LICENSES"
-        || source.strip_prefix("LICENSES/").is_some_and(|suffix| {
-            !suffix.is_empty()
-                && suffix
-                    .split('/')
-                    .all(|component| !component.is_empty() && component != "." && component != "..")
-        })
+/// The instructions of the image that actually ships, and no earlier stage's.
+///
+/// A notice copied into a builder stage is discarded with that stage. Only the last
+/// `FROM` opens the stage a release artifact is built from.
+fn final_stage_instructions(contents: &str) -> Vec<String> {
+    let instructions = logical_docker_instructions(contents);
+    let last_from = instructions.iter().rposition(|instruction| {
+        instruction
+            .split_once(char::is_whitespace)
+            .is_some_and(|(keyword, _)| keyword.eq_ignore_ascii_case("FROM"))
+    });
+    match last_from {
+        Some(index) => instructions[index + 1..].to_vec(),
+        None => Vec::new(),
+    }
 }
 
+/// Whether a `COPY` source is the notice itself or the directory holding it.
+///
+/// A normalized path only: `./LICENSES` and `../LICENSES` are rejected because the
+/// check has to describe one build context, not every spelling of one.
+fn is_required_license_source(source: &str) -> bool {
+    source == "LICENSES" || source == REQUIRED_NOTICE
+}
+
+/// Whether a `COPY` destination is the documented notice directory, or the notice's
+/// own path inside it.
+fn is_license_destination(destination: &str) -> bool {
+    let trimmed = destination.strip_suffix('/').unwrap_or(destination);
+    let notice = REQUIRED_NOTICE
+        .strip_prefix("LICENSES/")
+        .unwrap_or(REQUIRED_NOTICE);
+    trimmed == LICENSE_DESTINATION || trimmed == format!("{LICENSE_DESTINATION}/{notice}")
+}
+
+/// Whether the shipping image carries the required notice at its documented path.
 fn dockerfile_copies_licenses(contents: &str) -> bool {
-    logical_docker_instructions(contents)
+    final_stage_instructions(contents)
         .iter()
-        .filter_map(|instruction| copy_sources(instruction))
-        .flatten()
-        .any(|source| is_normalized_license_source(&source))
+        .filter_map(|instruction| copy_paths(instruction))
+        .any(|(sources, destination)| {
+            is_license_destination(&destination)
+                && sources
+                    .iter()
+                    .any(|source| is_required_license_source(source))
+        })
 }
 
 fn sha256_hex(contents: &str) -> String {
@@ -431,6 +471,31 @@ fn no_workspace_member_is_publishable() {
     );
 }
 
+/// The features `cargo metadata` resolved for one node.
+fn resolved_features(node: &Value) -> Vec<&str> {
+    node["features"]
+        .as_array()
+        .expect("node has no `features`")
+        .iter()
+        .filter_map(Value::as_str)
+        .collect()
+}
+
+/// The features one resolved package ended up with, by package name.
+fn features_of<'a>(md: &'a Value, package: &str) -> Vec<&'a str> {
+    let names = package_names(md);
+    md["resolve"]["nodes"]
+        .as_array()
+        .expect("missing `resolve.nodes`")
+        .iter()
+        .find(|node| {
+            let id = node["id"].as_str().expect("node has no id");
+            names.get(id).map(String::as_str) == Some(package)
+        })
+        .map(resolved_features)
+        .unwrap_or_else(|| panic!("{package} is not in the dependency graph"))
+}
+
 #[test]
 fn sqlx_any_feature_is_never_enabled() {
     let md = metadata();
@@ -445,12 +510,7 @@ fn sqlx_any_feature_is_never_enabled() {
             continue;
         }
 
-        let features: Vec<&str> = node["features"]
-            .as_array()
-            .expect("node has no `features`")
-            .iter()
-            .filter_map(Value::as_str)
-            .collect();
+        let features: Vec<&str> = resolved_features(node);
 
         assert!(
             !features.contains(&"any"),
@@ -463,6 +523,26 @@ fn sqlx_any_feature_is_never_enabled() {
             !features.contains(&"migrate"),
             "SQLx feature `migrate` is enabled, compiling a DDL migration executor \
              into a declared read-only gateway. Resolved features: {features:?}"
+        );
+    }
+}
+
+#[test]
+fn sqlx_core_still_compiles_the_migration_and_any_modules() {
+    // Not an aspiration: a pin on a limitation ADR-0004 records. `sqlx` 0.9.0
+    // declares `sqlx-core` with `features = ["migrate"]` unconditionally and inherits
+    // its defaults, which include `any`, so both modules compile no matter what the
+    // facade's features say. The test above is what keeps the *API* out of reach;
+    // this one fails the day upstream changes that, so the ADR is revisited rather
+    // than quietly outdated.
+    let md = metadata();
+    let features = features_of(&md, "sqlx-core");
+    for compiled in ["migrate", "any"] {
+        assert!(
+            features.contains(&compiled),
+            "sqlx-core no longer compiles `{compiled}`. ADR-0004 records that it \
+             does and that Warden accepts it; update the ADR and this pin together. \
+             Resolved features: {features:?}"
         );
     }
 }
@@ -484,7 +564,9 @@ fn distributed_webpki_roots_license_is_complete_and_future_images_copy_licenses(
             .unwrap_or_else(|error| panic!("could not read {}: {error}", file.display()));
         assert!(
             dockerfile_copies_licenses(&contents),
-            "{} must copy LICENSES into the image; M12 packaging must distribute the webpki-roots license",
+            "{} must copy LICENSES, or the webpki-roots notice itself, to \
+             {LICENSE_DESTINATION} in its final stage; CDLA-Permissive-2.0 requires \
+             the license text to accompany the redistributed root data",
             file.display()
         );
     }
@@ -493,6 +575,7 @@ fn distributed_webpki_roots_license_is_complete_and_future_images_copy_licenses(
 #[test]
 fn docker_copy_parser_accepts_normalized_license_source_with_flags_and_continuation() {
     let fixture = r#"
+        FROM scratch AS final
         COPY --chown=warden:warden --chmod=0644 \
           LICENSES/webpki-roots-1.0.9-CDLA-Permissive-2.0.txt /opt/warden/LICENSES/
     "#;
@@ -502,14 +585,43 @@ fn docker_copy_parser_accepts_normalized_license_source_with_flags_and_continuat
 #[test]
 fn docker_copy_parser_accepts_normalized_license_source_in_json_form() {
     assert!(dockerfile_copies_licenses(
-        r#"COPY ["LICENSES", "/opt/warden/LICENSES/"]"#
+        r#"
+            FROM scratch AS final
+            COPY ["LICENSES", "/opt/warden/LICENSES/"]
+        "#
     ));
 }
 
 #[test]
 fn docker_copy_parser_rejects_license_destination_and_non_normalized_source() {
-    let destination_only = "COPY --link app /opt/warden/LICENSES";
-    let non_normalized_source = "COPY ./LICENSES /opt/warden/LICENSES";
+    let destination_only = "FROM scratch\nCOPY --link app /opt/warden/LICENSES";
+    let non_normalized_source = "FROM scratch\nCOPY ./LICENSES /opt/warden/LICENSES";
     assert!(!dockerfile_copies_licenses(destination_only));
     assert!(!dockerfile_copies_licenses(non_normalized_source));
+}
+
+#[test]
+fn docker_copy_parser_rejects_an_unrelated_child_of_licenses() {
+    let fixture = "FROM scratch\nCOPY LICENSES/unrelated.txt /opt/warden/LICENSES/";
+    assert!(!dockerfile_copies_licenses(fixture));
+}
+
+#[test]
+fn docker_copy_parser_rejects_the_required_notice_at_the_wrong_destination() {
+    let fixture = concat!(
+        "FROM scratch\n",
+        "COPY LICENSES/webpki-roots-1.0.9-CDLA-Permissive-2.0.txt /tmp/notice.txt",
+    );
+    assert!(!dockerfile_copies_licenses(fixture));
+}
+
+#[test]
+fn docker_copy_parser_rejects_a_notice_copied_only_into_a_builder_stage() {
+    let fixture = concat!(
+        "FROM rust:1 AS builder\n",
+        "COPY LICENSES /opt/warden/LICENSES/\n",
+        "FROM scratch AS final\n",
+        "COPY --from=builder /app/warden /usr/local/bin/warden\n",
+    );
+    assert!(!dockerfile_copies_licenses(fixture));
 }

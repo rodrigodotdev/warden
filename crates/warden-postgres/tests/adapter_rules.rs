@@ -242,14 +242,88 @@ fn brace_delta(line: &str) -> i32 {
     opens.saturating_sub(closes)
 }
 
+/// Aliases that make a driver type reachable under a different name.
+///
+/// `use sqlx::postgres::PgPool as Backend;` followed by `pub type Leaked = Backend;`
+/// exports a pool under a name no list of driver types contains. Both renaming forms
+/// are resolved here — the import rename and the type alias — and type aliases are
+/// followed to a fixed point so a chain of them cannot outrun the scan.
+fn driver_type_names(lines: &[(usize, String)]) -> Vec<String> {
+    let mut names: Vec<String> = DRIVER_TYPES.iter().map(|name| (*name).to_owned()).collect();
+
+    for (_, line) in lines {
+        if !line.contains("use ") || !line.contains("sqlx") {
+            continue;
+        }
+        for alias in renamed_imports(line) {
+            if !names.contains(&alias) {
+                names.push(alias);
+            }
+        }
+    }
+
+    loop {
+        let before = names.len();
+        for (_, line) in lines {
+            let Some((alias, aliased)) = type_alias(line) else {
+                continue;
+            };
+            if names.contains(&alias) {
+                continue;
+            }
+            if names.iter().any(|name| names_type(&aliased, name)) {
+                names.push(alias);
+            }
+        }
+        if names.len() == before {
+            return names;
+        }
+    }
+}
+
+/// The names introduced by `as` in one `use` declaration.
+fn renamed_imports(line: &str) -> Vec<String> {
+    let mut aliases = Vec::new();
+    let mut renaming = false;
+    for token in line
+        .split(|character: char| !(character.is_alphanumeric() || character == '_'))
+        .filter(|token| !token.is_empty())
+    {
+        if renaming {
+            aliases.push(token.to_owned());
+        }
+        renaming = token == "as";
+    }
+    aliases
+}
+
+/// The alias and the aliased text of a single-line `type X = Y;` declaration.
+fn type_alias(line: &str) -> Option<(String, String)> {
+    let (declaration, aliased) = line.split_once('=')?;
+    let mut words = declaration.split_whitespace();
+    let name = loop {
+        match words.next()? {
+            "type" => break words.next()?,
+            _ => continue,
+        }
+    };
+    let name = name.split(['<', ':']).next()?.trim();
+    (!name.is_empty()).then(|| (name.to_owned(), aliased.to_owned()))
+}
+
+/// Finds SQLx types, including renamed ones, on exported declaration spans.
 fn driver_type_violations(lines: &[(usize, String)]) -> Vec<(usize, String)> {
+    let names = driver_type_names(lines);
     let mut violations = Vec::new();
     for span in exported_declaration_spans(lines) {
         for (number, line) in span {
-            for driver_type in DRIVER_TYPES {
-                if names_type(&line, driver_type) {
-                    violations.push((number, line.clone()));
-                }
+            // One report per offending line: an alias chain can make several names
+            // match the same declaration, and a duplicated line reads as two faults.
+            if names
+                .iter()
+                .any(|driver_type| names_type(&line, driver_type))
+            {
+                violations.push((number, line.clone()));
             }
         }
     }
@@ -277,9 +351,9 @@ fn only_the_analyzer_and_the_crate_root_export_anything() {
     assert!(
         violations.is_empty(),
         "these internal items are exported:\n{}\n\n\
-         Keeping the crate's public surface to `PostgreSqlAnalyzer` is what makes \
-         \"no parser AST leaves the adapter\" checkable at all (ADR-0007). Use \
-         `pub(crate)`.",
+         Keeping the crate's public surface to the four reviewed files is what \
+         makes \"no parser AST and no driver handle leaves the adapter\" checkable \
+         at all (ADR-0007, ADR-0005). Use `pub(crate)`.",
         violations.join("\n")
     );
 }
@@ -403,6 +477,50 @@ fn driver_surface_scan_catches_a_type_on_a_multiline_public_signature() {
             (56, "type ActiveTransaction: Transaction;".to_owned()),
         ],
         "a driver type on a public declaration continuation must be caught"
+    );
+}
+
+#[test]
+fn driver_surface_scan_follows_a_chain_of_private_type_aliases() {
+    let fixture = vec![
+        (10, "type Backend = PgPool;".to_owned()),
+        (11, "type Inner = Backend;".to_owned()),
+        (12, "pub struct Config {".to_owned()),
+        (13, "pub pool: Inner,".to_owned()),
+        (14, "}".to_owned()),
+    ];
+
+    assert_eq!(
+        driver_type_violations(&fixture),
+        vec![(13, "pub pool: Inner,".to_owned())],
+        "a chain of private aliases must stay tainted at the public field"
+    );
+}
+
+#[test]
+fn driver_surface_scan_leaves_an_unrelated_alias_alone() {
+    let fixture = vec![
+        (10, "type Rows = Vec<String>;".to_owned()),
+        (11, "pub fn rows() -> Rows { Vec::new() }".to_owned()),
+    ];
+
+    assert!(
+        driver_type_violations(&fixture).is_empty(),
+        "an alias that names no driver type is not a violation"
+    );
+}
+
+#[test]
+fn driver_surface_scan_resolves_a_renamed_sqlx_import_in_a_public_alias() {
+    let fixture = vec![
+        (10, "use sqlx::postgres::PgPool as Backend;".to_owned()),
+        (11, "pub type Leaked = Backend;".to_owned()),
+    ];
+
+    assert_eq!(
+        driver_type_violations(&fixture),
+        vec![(11, "pub type Leaked = Backend;".to_owned())],
+        "a renamed SQLx import must remain tainted through a public alias"
     );
 }
 
