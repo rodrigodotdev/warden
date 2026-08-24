@@ -35,5 +35,6 @@
     )
 )]
 
+mod functions;
 mod parse;
 mod statement;
