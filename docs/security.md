@@ -87,7 +87,7 @@ layer.
 **The table allowlist does not bound what the agent can read.** It operates on AST
 names, but names do not determine what a relation reads.
 
-Five structural bypasses exist:
+Seven structural bypasses exist:
 
 1. **Views.** `SELECT * FROM public_report` passes the allowlist while the view reads
    `users.password_hash`; the parser sees only the view name.
@@ -96,12 +96,34 @@ Five structural bypasses exist:
 4. **Identifier folding.** PostgreSQL folds unquoted identifiers to lowercase, so a
    deny-list entry named `Users` would never match. MySQL case sensitivity depends on
    `lower_case_table_names` and the file system.
-5. **CTE-name shadowing (MySQL analyzer).** `visit::collect` subtracts every
+5. **CTE-name shadowing (both analyzers).** `visit::collect` subtracts every
    unqualified relation whose name matches a declared CTE alias anywhere in the
    statement, not only within that alias's own scope. `WITH orders AS (SELECT * FROM
    orders) SELECT * FROM orders` self-references the real base table — MySQL resolves
    a non-`RECURSIVE` CTE's own body to a table of that name — but the analyzer drops
    it along with the alias, so `TableAllowDenyPolicy` never evaluates it.
+
+   The PostgreSQL analyzer folds each side by its own quoting rather than comparing
+   case-insensitively, which is accurate for that dialect, but it is equally
+   scope-blind: `WITH orders AS (SELECT * FROM orders) SELECT * FROM orders` loses
+   the real base table there too.
+
+6. **`INSERT`, `COPY`, and DDL target relations (both analyzers).** `INSERT INTO t`,
+   `COPY t FROM/TO`, and every DDL target (`CREATE TABLE`, `ALTER TABLE`, `DROP`,
+   ...) do not appear in `QueryAnalysis`'s object list. sqlparser routes each of
+   these through `Visitor::pre_visit_relation` — and `COPY`'s table through no
+   visitor hook at all — rather than through `TableFactor`, which is the hook both
+   analyzers implement. This is not an authorization gap under a read-only
+   profile: each such statement independently carries `RiskFlag::WriteStatement`
+   or `RiskFlag::Ddl`, and policy denies it on that evidence alone. It becomes
+   load-bearing the moment a write-permitting profile exists, at which point
+   `TableAllowDenyPolicy` would not see the relation being written.
+7. **User-defined casts on PostgreSQL.** `'x'::evil_type` and
+   `CAST('x' AS evil_type)` reach `Expr::Cast`, never `Expr::Function`, so the
+   function classification in section 7.3 never sees them. `CREATE CAST ... WITH
+   FUNCTION` and a type's input function both run arbitrary code. This does not
+   need a wildcard-to-`Unknown` `Expr` arm to close: creating the cast, or the type
+   it casts to, is DDL, and DDL is denied outright.
 
 **Design consequence:** the dedicated role's `GRANT SELECT` bounds read scope. The
 allowlist remains useful for reducing attack surface and improving error messages,
@@ -125,6 +147,13 @@ but public material does not present it as a security boundary.
   unquoted identifier and compares a quoted one exactly, MySQL compares
   case-insensitively regardless of backticks. An analyzer that cannot report quoting
   cannot build an `ObjectRef`.
+
+  **Shipped in Milestone 5.** `warden-postgres` applies the same rule to its own CTE
+  subtraction: an unquoted alias folds to lowercase, a quoted one does not, so
+  `WITH "Report" AS (…) SELECT * FROM report` correctly reports `report` as a base
+  table. It also refuses to describe `SELECT * FROM ONLY t`, which sqlparser 0.62
+  parses as a relation named `ONLY`; recording that name would make the object rules
+  evaluate a relation that does not exist.
 - **CTE names and subquery aliases are not `ObjectRef`.** The shipped MySQL analyzer
   does not track scope to distinguish them precisely; it approximates by dropping any
   unqualified relation whose name matches a declared CTE alias anywhere in the
@@ -319,6 +348,22 @@ unverified user-defined functions
 ```
 
 Function classification is conservative by definition.
+
+**How each one is detected (Milestone 5).** Data-modifying CTEs, locking clauses,
+`SELECT INTO`, `COPY`, `CALL`, and every function above come from the AST.
+`EXPLAIN ANALYZE` needs both of sqlparser's spellings: the bare form sets
+`Statement::Explain::analyze`, while the idiomatic `EXPLAIN (ANALYZE, BUFFERS)` form
+leaves that flag false and records the option list in `Statement::Explain::options`,
+so the analyzer reads both (ADR-0017). A user-defined operator invoked as
+`OPERATOR(schema.name)` produces no function node at all and is reported as
+`unknown_construct`. Unlike MySQL, no construct on this list needs a token-level
+guard: every one of them has an AST path (ADR-0028's bar).
+
+`FOR NO KEY UPDATE` and `FOR KEY SHARE` do **not** parse under sqlparser 0.62, so
+they are denied as parse errors rather than as locking reads. `FOR UPDATE` and
+`FOR SHARE` do parse into `Query::locks`, so `RiskFlag::LockingRead` has a real
+producer; the corpus records the two unparseable forms so that an upgrade which
+starts parsing one fails a test instead of passing silently.
 
 ### 7.4 Parser limitations
 

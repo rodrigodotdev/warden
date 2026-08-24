@@ -33,6 +33,7 @@ supersedes it; never change it silently.
 | [0026](0026-invariants-are-not-configurable.md) | Invariants have no configuration keys |
 | [0027](0027-identifier-quoting.md) | Identifier quoting is part of the analysis model |
 | [0028](0028-token-level-guard.md) | A token-level guard for constructs the parser rejects |
+| [0029](0029-pg-catalog-is-the-only-trusted-schema.md) | `pg_catalog` is the only trusted function schema |
 
 ADRs 0021–0026 are new in v0.3. ADR-0002 supersedes the v0.2 MSRV definition;
 ADR-0022 supersedes the single-event audit model; ADR-0023 resolves v0.2 open
