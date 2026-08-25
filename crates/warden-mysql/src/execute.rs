@@ -12,6 +12,7 @@ use std::future::Future;
 use std::sync::Arc;
 
 use futures_util::TryStreamExt as _;
+use sqlx::AssertSqlSafe;
 use sqlx::mysql::MySqlDatabaseError;
 use tokio::time::{Instant, timeout_at};
 use tokio_util::sync::CancellationToken;
@@ -180,9 +181,27 @@ impl MySqlQueryExecutor {
     /// failure is never reported in place of the outcome — `Ok` or `Err` — that
     /// triggered it.
     async fn kill(&self, connection_id: u64) {
+        // Not a bound parameter: against a real MySQL 8.4 container, a bound
+        // `KILL QUERY ?` does not merely fail to decode a response — it does not
+        // kill anything. `sqlx` 0.9.0's MySQL driver always sends a bound query
+        // through the prepared/binary protocol, and confirmed against a container
+        // (`docs/testing.md` section 4), not assumed: the client-side call returns
+        // `Err(Protocol("unknown column type 0xf3 ..."))`, `Com_kill` never
+        // increments, and the target query runs to completion. The literal form
+        // below is what actually kills — `Com_kill` increments and the target dies
+        // within milliseconds. `kill` therefore interpolates instead, which is the
+        // one audited exception to `docs/operations.md` section 6.3's "SQLx bind
+        // APIs only" — safe only because `connection_id`'s `u64` parameter type
+        // above is the guarantee, not merely a detail: its formatted form is always
+        // `[0-9]+`, so there is no injection surface *by construction*, whatever the
+        // value. That it is also server-sourced, read back from this same call's own
+        // `SELECT CONNECTION_ID()` moments earlier rather than from agent input,
+        // only explains why the value is *correct*; the type is why it *cannot* be
+        // an injection. `tests/adapter_rules.rs` pins this file to exactly this one
+        // interpolation — a second `format!` here needs its own review rather than
+        // inheriting this exemption.
         let deadline = Instant::now() + KILL_TIMEOUT;
-        let statement = sqlx::query("KILL QUERY ?")
-            .bind(connection_id)
+        let statement = sqlx::query(AssertSqlSafe(format!("KILL QUERY {connection_id}")))
             .execute(self.pools.control());
         let _outcome = timeout_at(deadline, statement).await;
     }

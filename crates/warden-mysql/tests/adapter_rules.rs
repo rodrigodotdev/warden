@@ -660,6 +660,42 @@ fn agent_sql_is_never_read_into_memory_before_it_is_bounded() {
 }
 
 #[test]
+fn the_only_format_in_execute_rs_builds_a_kill_query() {
+    // `docs/operations.md` section 6.3: SQLx bind APIs only, never `format!` into a
+    // statement, because an interpolated value can carry agent-controlled content.
+    // `kill`'s `KILL QUERY {connection_id}` is the one audited exception: against a
+    // real server, a *bound* `KILL QUERY ?` does not merely fail to decode — it
+    // does not kill anything. `sqlx` 0.9.0's MySQL driver cannot decode the
+    // response, confirmed against a container, not assumed:
+    // `Err(Protocol("unknown column type 0xf3 ..."))`, `Com_kill` never
+    // increments, and the target query runs to completion; the literal form is
+    // what actually kills. `kill` interpolates instead, and that is safe only
+    // because `connection_id` is typed `u64` at the call site: its formatted form
+    // is always `[0-9]+`, with no injection surface by construction. The type is
+    // the guarantee; that the value is also server-sourced, from Warden's own
+    // `SELECT CONNECTION_ID()`, only explains why it is correct, not why it cannot
+    // be an injection. A second `format!` in this file needs its own review rather
+    // than inheriting this exemption — which is what this test enforces, by
+    // failing the moment a second one appears without also naming `KILL QUERY`.
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/execute.rs");
+    let mut found = false;
+    for (number, line) in code_lines(&path) {
+        if line.contains("format!") {
+            assert!(
+                line.contains("KILL QUERY"),
+                "src/execute.rs:{number} interpolates with format! outside the \
+                 audited KILL QUERY exception"
+            );
+            found = true;
+        }
+    }
+    assert!(
+        found,
+        "src/execute.rs never calls format!, so the guard above passed on an absence"
+    );
+}
+
+#[test]
 fn the_scans_are_alive() {
     // A scan that finds nothing because its inputs are empty passes forever.
     assert!(names_type("pub fn f(s: &Statement)", "Statement"));
