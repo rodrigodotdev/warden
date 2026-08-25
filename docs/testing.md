@@ -97,11 +97,12 @@ not mask normal container-test concurrency there.
 
 **Milestone 7 measured a limit on that job's own concurrency.** `warden-mysql`'s
 `docker`-gated unit tests each start their own MySQL testcontainer; run at Rust's
-default unbounded test-thread count, that many simultaneous containers exhaust Docker
-and host resources and produce spurious `PoolTimedOut` failures, not a defect in the
+default test-thread count (`std::thread::available_parallelism()`, not unbounded),
+that many simultaneous containers still exhaust Docker and host resources on a
+standard CI runner and produce spurious `PoolTimedOut` failures, not a defect in the
 tests themselves. This is host capacity, not test isolation, so the fix belongs in how
 the job invokes `cargo test`, not as a per-test workaround: the dedicated Docker job
-should pass `--test-threads=4`, which removed the contention when measured.
+passes `--test-threads=4`, which removed the contention when measured.
 
 **MySQL:** connection; schema discovery; safe `SELECT`; parameter binding; read-only
 transaction; database user cannot write; Warden rejects writes before execution;

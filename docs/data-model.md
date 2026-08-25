@@ -245,6 +245,19 @@ Exhaustion returns `server_busy`.
 Profiles can configure these limits. Startup validation rejects zero and invalid
 values.
 
+**`max_result_bytes` bounds `rows` only, not the total response.** `ResultBuilder`
+(section 8.1) accounts only for the stored rows' JSON encoding; `columns` metadata is
+not part of what it counts (`ResultBuilder::finish`'s own doc comment says so). What
+actually reaches model context is `rows + columns` together, so the real upper bound
+on one response is `max_result_bytes` plus whatever `columns` costs, uncapped. Worst
+case on MySQL: a `SELECT *` against a table wide enough to fit the 64 KiB SQL
+statement-size cap can carry roughly 4096 columns, and each contributes its name (up
+to 64 bytes), its `database_type` string, and JSON object overhead — on the order of
+0.5 MiB, against a 256 KiB row budget. This is deliberate, not a bug: bounding
+`columns` too would require truncating schema information rows have already made
+visible. Milestone 12 must design the MCP tool contract against this real combined
+bound, not against `max_result_bytes` alone.
+
 ## 8. Result model
 
 One JSON object per row is not a suitable canonical model because duplicate column
@@ -290,6 +303,11 @@ pub enum ResultValue {
 5. The error may suggest an explicit cast.
 6. **Emit integers outside ±2^53 as strings.** Most MCP clients use JavaScript and
    lose precision above that bound; silently returning a wrong `bigint` is unacceptable.
+   **Exception:** `ResultValue::Json` serializes the driver's own `serde_json::Value`
+   document as-is, so a large integer inside a MySQL `JSON` (or, from Milestone 8, a
+   PostgreSQL `jsonb`) column still reaches the client as a raw JSON number and can
+   round. Rule 6 is enforced for `I64`/`U64`, the columnar integer types; it is not
+   applied recursively inside a document value (`docs/open-questions.md` section 2).
 7. **Bound `Array` depth**, initially at 8. This recursive type could otherwise allow a
    deeply nested PostgreSQL array to overflow the stack during normalization or
    serialization, violating the fuzzing invariant.

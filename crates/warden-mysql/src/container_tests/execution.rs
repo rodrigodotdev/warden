@@ -43,12 +43,20 @@ use crate::execute::MySqlQueryExecutor;
 
 /// An authorized statement, built from synthetic evidence.
 ///
-/// The evidence is synthetic on purpose. This file tests the **executor**, and a
-/// statement the analyzer would rightly deny — `SELECT SLEEP(30)`, or the
-/// [`HEAVY_JOIN`] cross join — is what exercises paths the analyzer's own policy
-/// would otherwise block. `SLEEP` does **not** prove the server deadline fires:
-/// see `HEAVY_JOIN`'s own doc comment for why, and why `SLEEP` is kept only for
-/// the cancellation tests, where a genuine `KILL QUERY` does terminate it. Two
+/// The evidence is synthetic on purpose. This file tests the **executor**, not the
+/// analyzer, so most tests build an `AuthorizedQuery` directly rather than routing
+/// SQL through `MySqlAnalyzer` and `PolicyEngine` first. The two statements this is
+/// used for are not in the same position with respect to the real analyzer, though:
+/// `SELECT SLEEP(30)` is a statement the analyzer would rightly deny — `SLEEP`
+/// carries `RiskFlag::DelayFunction` — so building it as `AuthorizedQuery` directly
+/// is what lets a test reach it at all. The [`HEAVY_JOIN`] cross join is not denied
+/// by anything: it carries no risk flag, `COUNT` classifies as `KnownSafe`, and
+/// `PolicySettings::default()` restricts no objects, so the real analyzer would
+/// authorize it too. It is still built synthetically here purely for convenience —
+/// to keep this file's tests independent of `MySqlAnalyzer` — not because the real
+/// path would have blocked it. `SLEEP` does **not** prove the server deadline
+/// fires: see `HEAVY_JOIN`'s own doc comment for why, and why `SLEEP` is kept only
+/// for the cancellation tests, where a genuine `KILL QUERY` does terminate it. Two
 /// tests below go through `MySqlAnalyzer` as well, so the real path is covered
 /// where it is the thing under test.
 fn authorized(
@@ -170,13 +178,27 @@ async fn fixture(pools: &MySqlConnectionPools) {
              created_at DATETIME,
              duration TIME,
              blob_value BLOB,
-             flag BOOLEAN
+             flag BOOLEAN,
+             bit_value BIT(8),
+             big_unsigned BIGINT UNSIGNED,
+             year_value YEAR,
+             ratio FLOAT,
+             status ENUM('active', 'inactive'),
+             stamp TIMESTAMP NULL
          )",
+        // `bit_value`, `big_unsigned`, `year_value`, `ratio`, `status`, and `stamp`
+        // are the six columns `docs/data-model.md` section 8.2 claims support for
+        // that no container test previously decoded from a real server: everything
+        // else in this row was already proven by an earlier row in this fixture.
+        // `big_unsigned` is `u64::MAX` specifically, so the round trip proves the
+        // full unsigned range, not merely a small value that would also fit `i64`.
         "INSERT INTO samples VALUES (1, 'first', 10.50, '{\"k\":1}', '2026-01-05', \
-         '2026-01-05 09:07:03', '01:02:03', X'000102', 1)",
+         '2026-01-05 09:07:03', '01:02:03', X'000102', 1, b'10101010', \
+         18446744073709551615, 2026, 2.5, 'active', '2026-01-05 09:07:03')",
         // Every nullable column is NULL, so one test can prove that NULL survives as
         // `ResultValue::Null` whatever the column's declared type is.
-        "INSERT INTO samples VALUES (2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)",
+        "INSERT INTO samples VALUES (2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, \
+         NULL, NULL, NULL, NULL, NULL, NULL)",
     ] {
         sqlx::query(AssertSqlSafe(statement.to_owned()))
             .execute(pools.control())
@@ -366,7 +388,8 @@ async fn a_bound_select_returns_normalized_rows() {
 
     let query = authorized(
         "SELECT id, name, price, payload, created_on, created_at, duration, blob_value, \
-         flag FROM samples WHERE id = ? ORDER BY id",
+         flag, bit_value, big_unsigned, year_value, ratio, status, stamp FROM samples \
+         WHERE id = ? ORDER BY id",
         vec![ParameterValue::I64(1)],
         ExecutionLimits::default(),
     );
@@ -393,7 +416,21 @@ async fn a_bound_select_returns_normalized_rows() {
     assert_eq!(
         types,
         [
-            "BIGINT", "VARCHAR", "DECIMAL", "JSON", "DATE", "DATETIME", "TIME", "BLOB", "BOOLEAN"
+            "BIGINT",
+            "VARCHAR",
+            "DECIMAL",
+            "JSON",
+            "DATE",
+            "DATETIME",
+            "TIME",
+            "BLOB",
+            "BOOLEAN",
+            "BIT",
+            "BIGINT UNSIGNED",
+            "YEAR",
+            "FLOAT",
+            "ENUM",
+            "TIMESTAMP",
         ]
     );
     assert!(
@@ -417,6 +454,19 @@ async fn a_bound_select_returns_normalized_rows() {
     assert_eq!(row[6], ResultValue::Time("01:02:03".to_owned()));
     assert_eq!(row[7], ResultValue::BytesBase64("AAEC".to_owned()));
     assert_eq!(row[8], ResultValue::Bool(true));
+    // `b'10101010'` is 170 in both directions, so this also proves the byte order
+    // `ValueKind::Unsigned`'s special-cased `BIT` decode uses is the right one.
+    assert_eq!(row[9], ResultValue::U64(170));
+    // The top of the unsigned range, not merely a value that would also fit `i64`:
+    // proof that `ValueKind::Unsigned` decodes the full 64-bit width, not 63.
+    assert_eq!(row[10], ResultValue::U64(u64::MAX));
+    assert_eq!(row[11], ResultValue::I64(2026));
+    assert_eq!(row[12], ResultValue::F64(2.5));
+    assert_eq!(row[13], ResultValue::String("active".to_owned()));
+    assert_eq!(
+        row[14],
+        ResultValue::DateTime("2026-01-05 09:07:03".to_owned())
+    );
 }
 
 #[tokio::test]
@@ -485,7 +535,8 @@ async fn null_survives_whatever_the_columns_type_is() {
 
     let query = authorized(
         "SELECT id, name, price, payload, created_on, created_at, duration, blob_value, \
-         flag FROM samples WHERE id = ?",
+         flag, bit_value, big_unsigned, year_value, ratio, status, stamp FROM samples \
+         WHERE id = ?",
         vec![ParameterValue::I64(2)],
         ExecutionLimits::default(),
     );
@@ -494,8 +545,8 @@ async fn null_survives_whatever_the_columns_type_is() {
     assert_eq!(result.rows.len(), 1);
     let row = &result.rows[0];
     assert_eq!(row[0], ResultValue::I64(2), "the primary key is never NULL");
-    // The other eight columns, including DATE and JSON, where a decode would
-    // otherwise have been attempted.
+    // The other fourteen columns, including DATE, JSON, BIT, and ENUM, where a
+    // decode would otherwise have been attempted.
     for (index, value) in row.iter().enumerate().skip(1) {
         assert_eq!(*value, ResultValue::Null, "column {index}");
     }

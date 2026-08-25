@@ -109,6 +109,22 @@ otherwise, none blocks M0–M5.
     Milestone 8 would inherit, and the value is available only through `describe`,
     which is the same path already rejected for `nullable`.
 
+17. **Should `ResultValue::Json` apply the big-integer string rule recursively?**
+    `docs/data-model.md` section 8.1, rule 6 quotes an `I64`/`U64` outside ±2^53 as a
+    string so a JavaScript MCP client cannot silently round it. `ResultValue::Json`
+    does not: its `Serialize` impl hands the driver's `serde_json::Value` straight to
+    `serde_json::Value::serialize`, so `{"order_id": 9007199254740993}` inside a
+    MySQL `JSON` column reaches the client as a raw JSON number and can round exactly
+    the way rule 6 exists to prevent. Byte accounting already treats a `Json` value
+    consistently either way — `json_value_bytes` counts an embedded large integer
+    unquoted, matching what actually gets emitted — so this is a semantic gap in the
+    precision guarantee, not a budget bug. Fixing it means rewriting the document
+    recursively at normalization time to re-quote out-of-range integers, which is a
+    `warden-core` decision affecting every adapter, not a MySQL one, so Milestone 7
+    left it unfixed and only documented it. Milestone 8's PostgreSQL `jsonb` path
+    inherits the same gap unchanged, since it reaches the client through the same
+    `ResultValue::Json` variant.
+
 ## 3. Future work deliberately outside v0.x
 
 ### Adapters

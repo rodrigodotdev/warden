@@ -343,7 +343,13 @@ mod tests {
     }
 
     #[test]
-    fn base64_length_is_an_upper_bound_on_the_encoder() {
+    fn base64_length_matches_the_real_encoder() {
+        // Exact equality, not merely an upper bound: `value()` calls `base64_len`
+        // to guard the per-value budget *before* encoding, specifically so a huge
+        // `BLOB` is never copied into a huge base64 `String` purely to be rejected.
+        // That guard is only sound because `base64_len` predicts the encoder's
+        // output length exactly — an upper bound alone would let a value pass this
+        // check and then encode larger than `max_value_bytes` allows.
         for raw in [0usize, 1, 2, 3, 4, 100, 65_536] {
             let encoded = BASE64.encode(vec![0u8; raw]);
             assert_eq!(base64_len(raw), encoded.len(), "{raw}");

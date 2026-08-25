@@ -52,7 +52,6 @@ async fn provision(root: &MySqlConnectionPools) {
     for statement in [
         format!("CREATE USER '{ROLE}'@'%' IDENTIFIED BY '{ROLE_PASSWORD}'"),
         format!("GRANT SELECT ON test.orders TO '{ROLE}'@'%'"),
-        "FLUSH PRIVILEGES".to_owned(),
     ] {
         sqlx::query(AssertSqlSafe(statement))
             .execute(root.control())

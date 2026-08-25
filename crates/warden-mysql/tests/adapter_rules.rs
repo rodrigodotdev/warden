@@ -677,6 +677,16 @@ fn the_only_format_in_execute_rs_builds_a_kill_query() {
     // be an injection. A second `format!` in this file needs its own review rather
     // than inheriting this exemption — which is what this test enforces, by
     // failing the moment a second one appears without also naming `KILL QUERY`.
+    //
+    // Scoped to `src/execute.rs` only, deliberately not `src/container_tests/`:
+    // those files are `#[cfg(all(test, feature = "docker"))]`, every statement they
+    // build with `format!` is Warden-authored fixture DDL and test data (table
+    // definitions, `REPEAT('a', n)` payloads, row counts), and no agent input ever
+    // reaches them. Widening this guard to cover them would fire on exactly that
+    // legitimate fixture-building code — see `wide_fixture`'s
+    // `format!("({id}, REPEAT('a', {payload_bytes}))")` in
+    // `src/container_tests/execution.rs` — and the fix for a false positive there
+    // would be to loosen this guard, not to keep it. Leave the scope as it is.
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/execute.rs");
     let mut found = false;
     for (number, line) in code_lines(&path) {
