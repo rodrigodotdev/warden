@@ -28,7 +28,7 @@ control is accepted risk and must say so explicitly.
 | DDL | same | same |
 | Write in a CTE (`DELETE ... RETURNING`) | recursive nested-statement analysis; read-only transaction; `GRANT` | PostgreSQL corpus |
 | `SELECT INTO` creating a table | `SELECT INTO` detection; no `CREATE` privilege | PostgreSQL corpus |
-| `INTO OUTFILE` / `DUMPFILE` | MySQL analyzer detection; no `FILE` privilege | MySQL corpus + privilege test (tested: `file_access_is_refused_by_privileges_as_well_as_by_policy`) |
+| `INTO OUTFILE` / `DUMPFILE` | MySQL analyzer detection; no `FILE` privilege | MySQL corpus + privilege test (MySQL tested: `file_access_is_refused_by_privileges_as_well_as_by_policy`) |
 | Function with side effects | function classification and default deny; restricted `GRANT EXECUTE` | corpus + integration |
 | Sequence mutation | `nextval`/`setval` detection; read-only transaction, which PostgreSQL rejects | corpus + PostgreSQL integration |
 | Session or user-variable mutation | session-mutation policy; pool hooks restore state | corpus + connection-reuse test |

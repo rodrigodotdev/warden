@@ -91,15 +91,17 @@ database role's write refusal, which remains M7 privilege-test work.
 Coverage uses `cargo llvm-cov --workspace --all-features --no-report --
 --test-threads=1`: all features include these container cases, while the serial test
 harness avoids intermittent PostgreSQL startup contention under LLVM instrumentation.
-The dedicated Docker gate remains parallel, so serial coverage does not mask normal
-container-test concurrency.
+The dedicated Docker gate (`docs/operations.md` section 12.2) is a separate CI job
+from coverage and does not inherit that `--test-threads=1`, so serial coverage does
+not mask normal container-test concurrency there.
 
-**Milestone 7 measured a limit on that parallelism.** `warden-mysql`'s `docker`-gated
-unit tests each start their own MySQL testcontainer; run at Rust's default unbounded
-test-thread count, that many simultaneous containers exhaust Docker and host resources
-and produce spurious `PoolTimedOut` failures, not a defect in the tests themselves.
-Passing `--test-threads=4` removes the contention. This is host capacity, not test
-isolation, so it belongs here rather than as a per-test workaround.
+**Milestone 7 measured a limit on that job's own concurrency.** `warden-mysql`'s
+`docker`-gated unit tests each start their own MySQL testcontainer; run at Rust's
+default unbounded test-thread count, that many simultaneous containers exhaust Docker
+and host resources and produce spurious `PoolTimedOut` failures, not a defect in the
+tests themselves. This is host capacity, not test isolation, so the fix belongs in how
+the job invokes `cargo test`, not as a per-test workaround: the dedicated Docker job
+should pass `--test-threads=4`, which removed the contention when measured.
 
 **MySQL:** connection; schema discovery; safe `SELECT`; parameter binding; read-only
 transaction; database user cannot write; Warden rejects writes before execution;
