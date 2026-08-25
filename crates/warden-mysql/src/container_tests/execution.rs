@@ -44,9 +44,13 @@ use crate::execute::MySqlQueryExecutor;
 /// An authorized statement, built from synthetic evidence.
 ///
 /// The evidence is synthetic on purpose. This file tests the **executor**, and a
-/// statement the analyzer would rightly deny — `SELECT SLEEP(20)` — is exactly what
-/// proves the server deadline fires. Two tests below go through `MySqlAnalyzer` as
-/// well, so the real path is covered where it is the thing under test.
+/// statement the analyzer would rightly deny — `SELECT SLEEP(30)`, or the
+/// [`HEAVY_JOIN`] cross join — is what exercises paths the analyzer's own policy
+/// would otherwise block. `SLEEP` does **not** prove the server deadline fires:
+/// see `HEAVY_JOIN`'s own doc comment for why, and why `SLEEP` is kept only for
+/// the cancellation tests, where a genuine `KILL QUERY` does terminate it. Two
+/// tests below go through `MySqlAnalyzer` as well, so the real path is covered
+/// where it is the thing under test.
 fn authorized(
     sql: &str,
     parameters: Vec<ParameterValue>,
@@ -229,10 +233,12 @@ const HEAVY_JOIN_ROWS: u32 = 8_000;
 ///
 /// `Com_kill` increments whenever the statement runs, whatever its target — a
 /// structural proof that `MySqlQueryExecutor::kill` actually reached the server
-/// rather than being silently dropped. (A real MySQL 8.4 server's response to
-/// preparing `KILL QUERY ?` does not decode in `sqlx` 0.9, which is why `kill`
-/// sends the connection id as literal, driver-verified text instead — confirmed
-/// against a container, not assumed.)
+/// rather than being silently dropped. (Against a real MySQL 8.4 server, a
+/// *bound* `KILL QUERY ?` does not merely fail to decode a response: it does not
+/// kill anything at all — `Com_kill` never increments and the target keeps
+/// running — confirmed against a container, not assumed. `kill` sends the
+/// connection id as a literal decimal string instead, built with `format!` from
+/// a `u64` rather than passed through a bind API, which is what actually kills.)
 async fn com_kill(pools: &MySqlConnectionPools) -> i64 {
     let row = sqlx::query("SHOW GLOBAL STATUS LIKE 'Com_kill'")
         .fetch_one(pools.control())
@@ -250,9 +256,16 @@ async fn com_kill(pools: &MySqlConnectionPools) -> i64 {
 /// bookkeeping can lag a process's disappearance from `information_schema.processlist`
 /// by a beat, and a flaky assertion here should get a generous, bounded retry rather
 /// than be deleted.
-async fn wait_until_nothing_runs(pools: &MySqlConnectionPools, marker: &str) {
+///
+/// `bound` is explicit, not a fixed constant, because it doubles as part of what
+/// the caller is proving. A bound comfortably below the connection's own
+/// `MAX_EXECUTION_TIME` (5s by default) means a pass can only be this poll's own
+/// `KILL QUERY` clearing the marker — not the server's unrelated timeout doing it
+/// on its own, which callers racing a long-running `SLEEP` or a heavy scan against
+/// the default timeout must rule out explicitly (see `cancellation_reaches_the_server`).
+async fn wait_until_nothing_runs(pools: &MySqlConnectionPools, marker: &str, bound: Duration) {
     let pattern = format!("%{marker}%");
-    let bound = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + bound;
     loop {
         // Excludes this very connection's own row: MySQL echoes a prepared
         // statement's bound values into its own `information_schema.processlist`
@@ -270,7 +283,7 @@ async fn wait_until_nothing_runs(pools: &MySqlConnectionPools, marker: &str) {
             return;
         }
         assert!(
-            std::time::Instant::now() < bound,
+            std::time::Instant::now() < deadline,
             "a query containing {marker:?} was still running after the bound"
         );
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -792,7 +805,7 @@ async fn a_row_truncated_result_is_ok_and_kills_the_orphaned_query() {
         after > before,
         "a truncated result must issue KILL QUERY for the 495 rows still in flight"
     );
-    wait_until_nothing_runs(&pools, "row_trunc_marker").await;
+    wait_until_nothing_runs(&pools, "row_trunc_marker", Duration::from_secs(5)).await;
 }
 
 #[tokio::test]
@@ -831,7 +844,7 @@ async fn a_byte_truncated_result_is_ok_and_kills_the_orphaned_query() {
         after > before,
         "a byte-truncated result must issue KILL QUERY for the ~499 rows still in flight"
     );
-    wait_until_nothing_runs(&pools, "byte_trunc_marker").await;
+    wait_until_nothing_runs(&pools, "byte_trunc_marker", Duration::from_secs(5)).await;
 }
 
 #[tokio::test]
@@ -917,7 +930,7 @@ async fn a_mid_stream_value_too_large_kills_the_orphaned_query() {
         "a value that fails mid-stream must issue KILL QUERY for the 100 rows still \
          in flight"
     );
-    wait_until_nothing_runs(&pools, "spike_marker").await;
+    wait_until_nothing_runs(&pools, "spike_marker", Duration::from_secs(5)).await;
 
     // The pool must not hand out a connection still wedged on the killed statement.
     let follow_up = authorized(
@@ -933,10 +946,15 @@ async fn a_mid_stream_value_too_large_kills_the_orphaned_query() {
 async fn the_connection_is_reusable_after_a_truncation() {
     let container = start_mysql().await;
     let mut settings = config(dsn(&container).await, tls());
-    // Exactly one connection in the pool: the follow-up query below can only be
-    // served by the very connection the truncated query's `KILL QUERY` and
-    // `ROLLBACK` just touched, so success there is not merely "the pool is
-    // healthy" but specifically "this connection is not wedged."
+    // Exactly one connection in the pool. This alone does not prove the follow-up
+    // below reuses the connection the truncation touched: sqlx's
+    // `test_before_acquire` defaults on (`execute.rs` leans on exactly that fact
+    // to discard a wedged connection), so a bad connection would be silently
+    // replaced within the same budget of one and the follow-up would still
+    // succeed either way. Pinning to one connection only makes the
+    // `SELECT CONNECTION_ID()` check below meaningful: with more than one
+    // connection available, "the id matches" could just mean the pool happened
+    // to hand back the same one, not that no replacement was needed.
     settings.agent_pool.max_connections = 1;
     settings.limits = ExecutionLimits {
         max_rows: 5,
@@ -951,6 +969,9 @@ async fn the_connection_is_reusable_after_a_truncation() {
     let runtime = runtime(Arc::clone(&executor), limits);
     let permit = runtime.acquire_query_permit().await.unwrap();
 
+    let id_query = authorized("SELECT CONNECTION_ID()", Vec::new(), limits);
+    let before = run(&executor, &permit, &id_query).await.unwrap();
+
     let truncated = authorized(
         "SELECT id, payload FROM wide_rows ORDER BY id",
         Vec::new(),
@@ -960,8 +981,18 @@ async fn the_connection_is_reusable_after_a_truncation() {
     assert!(result.truncated);
 
     // On this path the `ROLLBACK` is what drains the killed stream, typically
-    // observing the discarded `ER_QUERY_INTERRUPTED`. This second query must not
-    // see any of that.
+    // observing the discarded `ER_QUERY_INTERRUPTED`. Asking for the connection
+    // id again — rather than only running a query that happens to succeed — is
+    // what proves the *same* connection served both: if it had been wedged and
+    // `test_before_acquire` had discarded and replaced it, this would come back
+    // with a different id instead of failing outright.
+    let after = run(&executor, &permit, &id_query).await.unwrap();
+    assert_eq!(
+        before.rows[0][0], after.rows[0][0],
+        "the follow-up ran on a different connection, so this proves nothing \
+         about the one the truncation touched"
+    );
+
     let follow_up = authorized("SELECT id FROM wide_rows WHERE id = 0", Vec::new(), limits);
     let second = run(&executor, &permit, &follow_up).await.unwrap();
     assert_eq!(second.rows.len(), 1);
@@ -1005,7 +1036,10 @@ async fn the_server_deadline_fires_before_the_client_one() {
         .unwrap_err();
     let elapsed = started.elapsed();
 
-    // ER_QUERY_TIMEOUT, pinned by number as ADR-0033 requires.
+    // `error` alone only shows the port's own shape; the elapsed-time assertion
+    // below is what rules out the *client's* `timeout_at` producing the same
+    // `ExecuteError::Timeout` and leaves the server's own `ER_QUERY_TIMEOUT` as
+    // the only source it could be.
     assert_eq!(error, ExecuteError::Timeout);
     assert!(
         elapsed < limits.client_timeout(),
@@ -1013,16 +1047,38 @@ async fn the_server_deadline_fires_before_the_client_one() {
          abort first",
         limits.client_timeout()
     );
+
+    // The number itself, pinned directly as ADR-0033 requires: the identical
+    // statement, run raw on the same pool so it inherits the same 2s
+    // `MAX_EXECUTION_TIME`, fails with the server's own numbered error.
+    let raw_error = sqlx::query(AssertSqlSafe(HEAVY_JOIN.to_owned()))
+        .execute(pools.agent())
+        .await
+        .unwrap_err();
+    let number = raw_error
+        .as_database_error()
+        .and_then(|database| database.try_downcast_ref::<sqlx::mysql::MySqlDatabaseError>())
+        .map(sqlx::mysql::MySqlDatabaseError::number);
+    // ER_QUERY_TIMEOUT
+    assert_eq!(number, Some(3024), "{raw_error:?}");
 }
 
 #[tokio::test]
 async fn cancellation_reaches_the_server() {
-    // The test that tells `KILL QUERY` actually reached and stopped the server,
-    // rather than a dropped future that merely looks the same from the caller's
-    // side: `Com_kill` only increments when the server executes the statement, and
-    // the processlist poll confirms the target actually died — `execute_read_only`
-    // returning `Cancelled` would look identical even if the kill had silently
-    // failed.
+    // The test that tells `KILL QUERY` actually reached and stopped the *right*
+    // connection, rather than a dropped future that merely looks the same from
+    // the caller's side, or a `kill(wrong_id)` that still increments `Com_kill`
+    // without touching the target. Both of those weaker failures are ruled out by
+    // the same fact: the connection's own `MAX_EXECUTION_TIME` is
+    // `ExecutionLimits::default().timeout` (5s), so `wait_until_nothing_runs`
+    // below is given a 2s bound — comfortably enough for a real, correctly
+    // targeted kill, but strictly less than the 5s the server's own timeout would
+    // need to clear the marker on its own. A pass within 2s can only be this
+    // test's own `KILL QUERY`. (`Cancelled` itself is produced client-side by the
+    // token below, not by classifying a database error — see
+    // `a_kill_from_outside_the_token_still_maps_to_cancelled` for the container
+    // test that exercises the `ER_QUERY_INTERRUPTED` (1317) mapping arm
+    // directly.)
     let container = start_mysql().await;
     let pools = Arc::new(
         MySqlConnectionPools::connect(config(dsn(&container).await, tls()))
@@ -1049,12 +1105,87 @@ async fn cancellation_reaches_the_server() {
     };
     let (outcome, ()) = tokio::join!(call, canceller);
 
-    // ER_QUERY_INTERRUPTED, pinned by number as ADR-0033 requires.
+    // Produced by the `CancellationToken` branch, client-side.
     assert_eq!(outcome.unwrap_err(), ExecuteError::Cancelled);
 
     let after = com_kill(&pools).await;
     assert!(after > before, "KILL QUERY never reached the server");
-    wait_until_nothing_runs(&pools, "cancel_marker").await;
+    wait_until_nothing_runs(&pools, "cancel_marker", Duration::from_secs(2)).await;
+}
+
+#[tokio::test]
+async fn a_kill_from_outside_the_token_still_maps_to_cancelled() {
+    // ADR-0033 promises a container test pinning `ER_QUERY_INTERRUPTED` (1317) to
+    // `ExecuteError::Cancelled`. `cancellation_reaches_the_server` does not do
+    // that: its `Cancelled` comes from the `CancellationToken` branch in
+    // `collect`, client-side, before the database is ever asked anything — the
+    // one place a real 1317 is observed, the draining `ROLLBACK`, deliberately
+    // discards it (see `execute.rs`'s own comment on that discard). This test
+    // never touches the token at all, so the only way `Cancelled` can come back
+    // is through `execute_error`'s `ER_QUERY_INTERRUPTED => ExecuteError::Cancelled`
+    // arm classifying a genuine database error the row stream itself observed.
+    //
+    // `HEAVY_JOIN`, not `SLEEP`: `SLEEP` absorbs a real `KILL` the same way it
+    // absorbs `MAX_EXECUTION_TIME` (confirmed the same way — see `HEAVY_JOIN`'s
+    // own doc comment) and returns a row instead of erroring, which would make
+    // this test pass on a query that never actually interrupted.
+    let container = start_mysql().await;
+    let pools = Arc::new(
+        MySqlConnectionPools::connect(config(dsn(&container).await, tls()))
+            .await
+            .unwrap(),
+    );
+    wide_fixture(&pools, HEAVY_JOIN_ROWS, 20).await;
+
+    let executor = Arc::new(MySqlQueryExecutor::new(Arc::clone(&pools)));
+    let runtime = runtime(Arc::clone(&executor), ExecutionLimits::default());
+    let permit = runtime.acquire_query_permit().await.unwrap();
+    let query = authorized(
+        "SELECT /* external_kill_marker */ COUNT(*) FROM wide_rows a, wide_rows b \
+         WHERE a.payload <> b.payload",
+        Vec::new(),
+        ExecutionLimits::default(),
+    );
+
+    // Never cancelled — the only handle proving that below is this value's own
+    // absence of a `.cancel()` call anywhere in this test.
+    let never_cancelled = CancellationToken::new();
+
+    let call = executor.execute_read_only(&query, &permit, deadline(), never_cancelled);
+    let killer = async {
+        // Finds the statement from a second connection, exactly as an operator
+        // running `KILL QUERY` by hand would, then kills it — well within the
+        // 5s default `MAX_EXECUTION_TIME`, so nothing else could be the cause.
+        let bound = std::time::Instant::now() + Duration::from_secs(3);
+        let id: u64 = loop {
+            let found: Option<u64> = sqlx::query_scalar(
+                "SELECT id FROM information_schema.processlist \
+                 WHERE info LIKE '%external_kill_marker%' AND id <> CONNECTION_ID()",
+            )
+            .fetch_optional(pools.control())
+            .await
+            .unwrap();
+            if let Some(id) = found {
+                break id;
+            }
+            assert!(
+                std::time::Instant::now() < bound,
+                "the marked query never showed up in the processlist"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        sqlx::query(AssertSqlSafe(format!("KILL QUERY {id}")))
+            .execute(pools.control())
+            .await
+            .unwrap();
+    };
+
+    let (outcome, ()) = tokio::join!(call, killer);
+    assert_eq!(
+        outcome.unwrap_err(),
+        ExecuteError::Cancelled,
+        "a real ER_QUERY_INTERRUPTED (1317) must classify as Cancelled"
+    );
 }
 
 #[tokio::test]
