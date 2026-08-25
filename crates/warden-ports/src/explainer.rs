@@ -21,13 +21,27 @@ use warden_policy::AuthorizedQuery;
 
 use crate::BoxFuture;
 use crate::error::ExplainError;
+use crate::runtime::QueryPermit;
 
 /// Plans an authorized statement without running it.
 pub trait Explainer: Send + Sync {
     /// Produces a structured plan for the statement.
+    ///
+    /// `permit` is the connection's concurrency slot, and it is a parameter rather
+    /// than a caller's discipline. `ConnectionRuntime::explainer()` hands this trait
+    /// object to anyone who asks, so without the parameter nothing stops a call that
+    /// never waited for a slot, and SPEC section 6, invariant 17 would hold only for
+    /// as long as every future call site remembered it (ADR-0032). Planning also runs
+    /// real work on the server and shares `agent_pool` with `execute_read_only`
+    /// (`docs/mcp.md` section 3.1), so its concurrency must be bounded by the same
+    /// permit.
+    ///
+    /// It proves a permit exists; it does not prove the permit came from this
+    /// connection. ADR-0032 states that limit rather than implying more.
     fn explain<'a>(
         &'a self,
         query: &'a AuthorizedQuery,
+        permit: &'a QueryPermit,
         deadline: Instant,
         cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<QueryPlan, ExplainError>>;
@@ -41,6 +55,7 @@ mod tests {
     use std::time::Duration;
 
     use warden_core::dialect::Dialect;
+    use warden_core::limits::ExecutionLimits;
 
     use super::*;
     use crate::testing;
@@ -49,9 +64,11 @@ mod tests {
     async fn an_explainer_works_behind_a_trait_object() {
         let explainer: Arc<dyn Explainer> = Arc::new(testing::FakeExplainer::default());
         let query = testing::authorized(Dialect::PostgreSql);
+        let (_runtime, permit) = testing::with_permit(ExecutionLimits::default()).await;
         let plan = explainer
             .explain(
                 &query,
+                &permit,
                 Instant::now() + Duration::from_secs(5),
                 CancellationToken::new(),
             )
@@ -67,9 +84,11 @@ mod tests {
     async fn a_failed_prefix_verification_is_a_failure_not_a_warning() {
         let explainer = testing::FakeExplainer::failing(ExplainError::PrefixVerificationFailed);
         let query = testing::authorized(Dialect::PostgreSql);
+        let (_runtime, permit) = testing::with_permit(ExecutionLimits::default()).await;
         let error = explainer
             .explain(
                 &query,
+                &permit,
                 Instant::now() + Duration::from_secs(5),
                 CancellationToken::new(),
             )
@@ -82,10 +101,16 @@ mod tests {
     async fn a_cancelled_token_stops_planning_before_its_deadline() {
         let explainer = testing::FakeExplainer::taking(Duration::from_secs(30));
         let query = testing::authorized(Dialect::PostgreSql);
+        let (_runtime, permit) = testing::with_permit(ExecutionLimits::default()).await;
         let cancel = CancellationToken::new();
         cancel.cancel();
         let error = explainer
-            .explain(&query, Instant::now() + Duration::from_secs(5), cancel)
+            .explain(
+                &query,
+                &permit,
+                Instant::now() + Duration::from_secs(5),
+                cancel,
+            )
             .await
             .unwrap_err();
         assert_eq!(error, ExplainError::Cancelled);
@@ -95,9 +120,11 @@ mod tests {
     async fn the_deadline_reaches_the_adapter_instead_of_being_a_dropped_future() {
         let explainer = testing::FakeExplainer::taking(Duration::from_secs(30));
         let query = testing::authorized(Dialect::PostgreSql);
+        let (_runtime, permit) = testing::with_permit(ExecutionLimits::default()).await;
         let error = explainer
             .explain(
                 &query,
+                &permit,
                 Instant::now() + Duration::from_secs(5),
                 CancellationToken::new(),
             )

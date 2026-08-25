@@ -174,6 +174,7 @@ pub trait QueryExecutor: Send + Sync {
     fn execute_read_only<'a>(
         &'a self,
         query: &'a AuthorizedQuery,
+        permit: &'a QueryPermit,
         deadline: Instant,
         cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<ResultSet, ExecuteError>>;
@@ -187,8 +188,9 @@ pub trait SchemaInspector: Send + Sync {
 }
 
 pub trait Explainer: Send + Sync {
-    fn explain<'a>(&'a self, query: &'a AuthorizedQuery, deadline: Instant,
-        cancel: CancellationToken) -> BoxFuture<'a, Result<QueryPlan, ExplainError>>;
+    fn explain<'a>(&'a self, query: &'a AuthorizedQuery, permit: &'a QueryPermit,
+        deadline: Instant, cancel: CancellationToken)
+        -> BoxFuture<'a, Result<QueryPlan, ExplainError>>;
 }
 
 pub trait AuditSink: Send + Sync {
@@ -255,17 +257,23 @@ bounds are structural rather than a caller's responsibility. `ConnectionRuntime:
 validates the limits and rejects an analyzer whose dialect differs from the
 connection's.
 
-Under the current design, holding a permit across a call is a convention, not a type
-guarantee: `executor()` and `explainer()` hand out their trait objects unconditionally,
-so nothing stops a caller from invoking `execute_read_only` or `explain` without ever
-calling `acquire_query_permit` first. Both methods must hold a permit for the whole
-call — `execute_read_only` because it is the query SPEC section 6, invariant 17
-bounds, and `explain` because planning runs real work on the server (`docs/mcp.md`
-section 3.1) and shares `agent_pool` with `execute_read_only` (section 6.1 below), so
-its concurrency must be bounded by the same permit rather than left to the pool alone.
-A future milestone implementing the service layer is expected to enforce this
-structurally rather than merely follow it as documented practice; see
-`docs/open-questions.md` for the candidate designs.
+The permit is a parameter, not a caller's discipline: `execute_read_only` and
+`explain` both take a `&QueryPermit` witness, so `executor()` and `explainer()` can
+keep handing out their trait objects unconditionally while a call site that never
+called `acquire_query_permit` first is a compile error rather than a runtime gap
+(ADR-0032). `execute_read_only` needs it because it is the query SPEC section 6,
+invariant 17 bounds, and `explain` needs it because planning runs real work on the
+server (`docs/mcp.md` section 3.1) and shares `agent_pool` with `execute_read_only`
+(section 6.1 below), so its concurrency must be bounded by the same permit rather than
+left to the pool alone.
+
+The parameter proves *a* permit exists; it does not prove the permit came from
+*this* connection, or from `AuditSink::record_attempt` having run first (ADR-0022).
+Nothing today stops a caller from acquiring a permit on one `ConnectionRuntime` and
+handing it to another's executor — the type only says `&QueryPermit`, not
+`&QueryPermit` scoped to a particular connection. Milestone 11 owns the service layer
+that makes that pairing, and the attempt-before-execution ordering, structural rather
+than left to the caller; see `docs/open-questions.md` for what remains open.
 
 `available_permits` returns a copied `usize`, not the semaphore itself, so it hands
 out no way to raise the limit — only to read it. Diagnostics and tests use it; no

@@ -9,6 +9,7 @@ These remain listed because they were open in v0.2 and someone may search for th
 | 5 — best MySQL server-side timeout strategy without rewriting SQL | `SET SESSION MAX_EXECUTION_TIME` through `after_connect`—ADR-0024 |
 | 13 — do views automatically inherit table policy? | No. `GRANT` is the read boundary; the allowlist reduces attack surface—ADR-0023 |
 | 1 — does `AuthorizedQuery` live in policy or core? | In `warden-policy` with the `AllowDecision` token—ADR-0010 |
+| 14 (permit half) — does anything besides convention stop an adapter from bypassing the query permit? | No longer convention: `execute_read_only` and `explain` both take `&QueryPermit` as a parameter—ADR-0032 |
 
 ## 2. Still open
 
@@ -79,21 +80,16 @@ otherwise, none blocks M0–M5.
     Milestone 9 is expected to make it, so it lands there as an accepted change
     rather than a surprise.
 
-14. **Does anything besides convention stop an adapter from bypassing the query
-    permit or the audit attempt?** No. `ConnectionRuntime::executor()` and
-    `explainer()` hand out their trait objects unconditionally, so
-    `execute_read_only`/`explain` compile and run without ever calling
-    `acquire_query_permit`, and the audit two-phase ordering (ADR-0022) likewise
-    lives only in a doc comment — of the milestone's three structural claims, only
-    "an unauthorized statement cannot execute" is enforced by types. The same gap
-    means `explain` concurrency is currently bounded by `agent_pool`, not by
-    `max_concurrent_queries` (SPEC invariant 17), even though planning runs real work
-    on the server. Two resolutions are on the table: move `execute_read_only` and
-    `explain` onto `ConnectionRuntime` itself, which would acquire the permit
-    internally and drop the `executor()`/`explainer()` accessors, or add a
-    `&QueryPermit` witness parameter so the call site cannot compile without a slot.
-    Both are cheap now and expensive once Milestone 7/8 ship adapters, which is why
-    this is recorded ahead of Milestone 11 rather than left to be discovered there.
+14. **Does anything besides convention stop an adapter from bypassing the audit
+    attempt?** No. ADR-0022 requires the attempt to be recorded before the
+    concurrency permit is acquired, and that ordering lives only in a doc comment:
+    nothing in the types stops a caller from acquiring a permit and executing before
+    `AuditSink::record_attempt` has run, or from never calling it at all. The permit
+    half of this question is resolved — ADR-0032 makes `&QueryPermit` a parameter of
+    `execute_read_only` and `explain`, so a missing permit is now a compile error —
+    but ADR-0032 explicitly does not order the permit against the audit attempt; it
+    only proves a permit exists. Milestone 11's service layer is expected to make the
+    attempt-before-execution ordering structural rather than left to the caller.
 
 ## 3. Future work deliberately outside v0.x
 

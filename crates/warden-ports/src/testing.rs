@@ -48,7 +48,7 @@ use crate::executor::QueryExecutor;
 use crate::explainer::Explainer;
 use crate::inspector::SchemaInspector;
 use crate::registry::ConnectionRegistry;
-use crate::runtime::{ConnectionRuntime, ConnectionRuntimeParts};
+use crate::runtime::{ConnectionRuntime, ConnectionRuntimeParts, QueryPermit};
 
 /// The statement every fixture uses.
 pub(crate) const SQL: &str = "SELECT id FROM orders";
@@ -244,6 +244,7 @@ impl QueryExecutor for FakeExecutor {
     fn execute_read_only<'a>(
         &'a self,
         query: &'a AuthorizedQuery,
+        _permit: &'a QueryPermit,
         deadline: Instant,
         cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<ResultSet, ExecuteError>> {
@@ -389,6 +390,7 @@ impl Explainer for FakeExplainer {
     fn explain<'a>(
         &'a self,
         query: &'a AuthorizedQuery,
+        _permit: &'a QueryPermit,
         deadline: Instant,
         cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<QueryPlan, ExplainError>> {
@@ -490,6 +492,16 @@ pub(crate) fn try_runtime(
         inspector: Arc::new(FakeInspector::default()),
         explainer: Arc::new(FakeExplainer::default()),
     })
+}
+
+/// A runtime and one permit taken from it.
+///
+/// Both are returned because a test almost always needs both: the permit to pass to
+/// a port, and the runtime to assert `available_permits` against.
+pub(crate) async fn with_permit(limits: ExecutionLimits) -> (ConnectionRuntime, QueryPermit) {
+    let runtime = runtime(Dialect::MySql, limits);
+    let permit = runtime.acquire_query_permit().await.unwrap();
+    (runtime, permit)
 }
 
 /// A registry holding exactly the fixture connection.
