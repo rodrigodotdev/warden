@@ -20,7 +20,7 @@
 
 use warden_core::connection::ConnectionName;
 use warden_core::error::{PublicError, PublicErrorCode};
-use warden_core::result::NormalizationError;
+use warden_core::result::{NormalizationError, ResultBuildError};
 use warden_policy::{DenyCode, DenyReason, PolicyRejection};
 
 /// Why analysis produced no evidence at all.
@@ -124,6 +124,21 @@ impl PublicError for ExecuteError {
             Self::ResultTooLarge { .. } => PublicErrorCode::QueryResultTooLarge,
             Self::Normalization(error) => error.public_code(),
             Self::Database { .. } => PublicErrorCode::QueryExecutionError,
+        }
+    }
+}
+
+/// A row the core refused becomes the execution failure the model sees.
+///
+/// Both size variants collapse into one public code: `docs/security.md` section 10
+/// has a single `query_result_too_large`, and telling the agent which of the two
+/// budgets it hit would be a distinction it cannot act on differently.
+impl From<ResultBuildError> for ExecuteError {
+    fn from(error: ResultBuildError) -> Self {
+        match error {
+            ResultBuildError::Normalization(source) => Self::Normalization(source),
+            ResultBuildError::ValueTooLarge { limit, .. }
+            | ResultBuildError::ResultTooLarge { limit, .. } => Self::ResultTooLarge { limit },
         }
     }
 }
@@ -475,6 +490,36 @@ mod tests {
             PublicErrorCode::QueryNormalizationError
         );
         assert!(error.to_string().contains("order_state"), "{error}");
+    }
+
+    #[test]
+    fn a_result_build_failure_maps_by_kind_not_by_which_budget() {
+        let too_large = ExecuteError::from(ResultBuildError::ValueTooLarge {
+            column: "payload".to_owned(),
+            actual: 100,
+            limit: 64,
+        });
+        assert_eq!(
+            too_large.public_code(),
+            PublicErrorCode::QueryResultTooLarge
+        );
+
+        let result_too_large = ExecuteError::from(ResultBuildError::ResultTooLarge {
+            actual: 1000,
+            limit: 256,
+        });
+        assert_eq!(
+            result_too_large.public_code(),
+            PublicErrorCode::QueryResultTooLarge
+        );
+
+        let normalization = ExecuteError::from(ResultBuildError::Normalization(
+            NormalizationError::ArrayTooDeep { max: 8 },
+        ));
+        assert_eq!(
+            normalization.public_code(),
+            PublicErrorCode::QueryNormalizationError
+        );
     }
 
     #[test]

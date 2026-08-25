@@ -33,6 +33,19 @@ impl Dialect {
             Self::PostgreSql => "postgresql",
         }
     }
+
+    /// An example cast that turns a value of an unsupported type into text.
+    ///
+    /// `docs/data-model.md` section 8.1, rule 5 allows the error to suggest a cast.
+    /// The suggestion has to be in the dialect the agent is writing, or it is one
+    /// more thing that fails.
+    #[must_use]
+    pub fn text_cast_example(self, column: &str) -> String {
+        match self {
+            Self::MySql => format!("CAST({column} AS CHAR)"),
+            Self::PostgreSql => format!("{column}::text"),
+        }
+    }
 }
 
 impl TryFrom<String> for Dialect {
