@@ -44,6 +44,17 @@ const ER_QUERY_INTERRUPTED: u16 = 1317;
 /// by the time this runs — reusing it would make every timeout skip its own kill.
 const KILL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// How long the read-only transaction's own `ROLLBACK` gets, once a result already
+/// exists.
+///
+/// Also a fresh budget rather than the query's `deadline`, for the same reason as
+/// `KILL_TIMEOUT`: a query that finishes right at its deadline would otherwise get
+/// zero time to release its connection. `ROLLBACK` is connection hygiene, not part of
+/// the agent's query, and its own outcome is never propagated (see `run`'s success
+/// arm), so this budget only bounds how long a cleanup step is allowed to hold the
+/// connection — it does not gate whether the caller gets its result.
+const ROLLBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Runs authorized statements on one MySQL connection's `agent_pool`.
 #[derive(Debug)]
 pub struct MySqlQueryExecutor {
@@ -105,21 +116,51 @@ impl MySqlQueryExecutor {
 
         match outcome {
             Ok(result) => {
+                // MySQL sends a result set with no cursor: breaking out of
+                // `collect`'s row loop at the row budget does not tell the server to
+                // stop sending, it only stops Warden from reading further. A
+                // truncated result therefore still has rows in flight, and a real
+                // `KILL QUERY` is the only thing that stops them — without it the
+                // connection would go back to the pool, or close, while the
+                // statement is still producing rows on the wire, exactly the
+                // orphaned-query gap ADR-0024 closes.
+                if result.truncated {
+                    self.kill(connection_id).await;
+                }
+
                 // Rollback, not commit: a read-only transaction has nothing to
-                // commit, and awaiting it returns a connection the pool can hand out
-                // rather than one still mid-statement (`docs/operations.md` 6.2).
-                // The cancellation token is deliberately not consulted: a request
-                // that was cancelled still wants its connection back intact.
-                bounded(deadline, transaction.rollback()).await?;
+                // commit. Its own outcome is deliberately discarded rather than
+                // propagated with `?`: `result` already exists and is already
+                // correct, and a slow or failed `ROLLBACK` has no bearing on data
+                // already collected, so it must never overwrite a valid result with
+                // `ExecuteError::Timeout`. (When the branch above killed the query,
+                // this `ROLLBACK` is also what drains and observes the resulting
+                // `ER_QUERY_INTERRUPTED` — a second reason its error must never
+                // surface as this call's error.) It gets its own short budget rather
+                // than the query's `deadline` for the same reason `kill` does: a
+                // query that finishes right at its deadline would otherwise get no
+                // time at all to release its connection. The cancellation token is
+                // deliberately not consulted either: a request that was cancelled
+                // still wants its connection back intact.
+                let rollback_deadline = Instant::now() + ROLLBACK_TIMEOUT;
+                let _rollback_outcome = bounded(rollback_deadline, transaction.rollback()).await;
                 Ok(result)
             }
             Err(error) => {
-                if matches!(error, ExecuteError::Timeout | ExecuteError::Cancelled) {
-                    self.kill(connection_id).await;
-                }
+                // Every non-success exit from `collect` — a timeout, a
+                // cancellation, or a row/value/byte budget failure discovered
+                // mid-stream — can leave the server still sending rows for a
+                // statement Warden has stopped reading, for the same no-cursor
+                // reason as the truncated case above, so the kill is unconditional
+                // here rather than limited to `Timeout`/`Cancelled`. Best effort:
+                // its own failure is never reported in place of `error`, which is
+                // the failure the agent actually needs.
+                self.kill(connection_id).await;
                 // Dropping queues a ROLLBACK without awaiting it. Awaiting one on a
                 // connection whose statement may still be running would hang, and
-                // the pool's `test_before_acquire` discards anything unusable.
+                // the pool's `test_before_acquire` discards anything unusable. The
+                // kill above runs first so the connection cannot return to the pool,
+                // and its id be reused, before `KILL QUERY` lands.
                 drop(transaction);
                 Err(error)
             }

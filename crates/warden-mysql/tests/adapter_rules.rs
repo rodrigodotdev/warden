@@ -632,15 +632,23 @@ fn agent_sql_is_never_read_into_memory_before_it_is_bounded() {
     // `execute.rs` is scanned rather than the whole crate because Warden's own static
     // SQL — the health check, `SELECT CONNECTION_ID()` — is finite and single-row, so
     // `fetch_one` is correct there and wrong only for agent SQL.
+    //
+    // The ban applies to the whole file rather than only a line that also names
+    // `bind::statement`: rustfmt can wrap a long call onto its own line, at which
+    // point a same-line check matches nothing and the ban silently stops applying —
+    // including against a second `.fetch(` a future change (Milestone 10's EXPLAIN
+    // path, say) could add. `CONNECTION_ID` is the exemption instead: it is the one
+    // legitimate buffering call in this file, and the line that makes it,
+    // `sqlx::query_scalar("SELECT CONNECTION_ID()").fetch_one(...)`, names
+    // `CONNECTION_ID` on the very line that buffers, which is self-documenting in a
+    // way a line-proximity heuristic against agent SQL is not.
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/execute.rs");
     let mut streams = false;
     for (number, line) in code_lines(&path) {
         for buffering in BUFFERING_FETCHES {
-            // `SELECT CONNECTION_ID()` is Warden's own statement and legitimately
-            // fetches one row; the ban is on the line that carries the agent's SQL.
             assert!(
-                !(line.contains(buffering) && line.contains("bind::statement")),
-                "src/execute.rs:{number} buffers the agent result with {buffering}"
+                !(line.contains(buffering) && !line.contains("CONNECTION_ID")),
+                "src/execute.rs:{number} buffers a result with {buffering}"
             );
         }
         streams |= line.contains(".fetch(");
