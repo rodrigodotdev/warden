@@ -237,6 +237,13 @@ fn format_date(date: time::Date) -> String {
 /// the server produced it, with no offset appended: inventing `Z` for a value whose
 /// zone Warden does not pin would be worse than emitting none
 /// (`docs/architecture.md` section 11).
+///
+/// This is not a byte-for-byte reproduction of MySQL's own text output: the
+/// fractional part is written from the decoded microseconds, so it is omitted
+/// entirely at zero and always six digits otherwise. A `DATETIME(3)` column's
+/// declared precision (`.000`) is not preserved — every digit shown is a true
+/// stored microsecond, but the column's own width is lost
+/// (`docs/open-questions.md` section 2).
 fn format_timestamp(stamp: time::PrimitiveDateTime) -> String {
     let mut rendered = format!(
         "{} {:02}:{:02}:{:02}",

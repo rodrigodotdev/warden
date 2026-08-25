@@ -294,6 +294,15 @@ pub enum ResultValue {
    deeply nested PostgreSQL array to overflow the stack during normalization or
    serialization, violating the fuzzing invariant.
 
+`QueryStats.bytes` is the exact length of the stored rows' JSON encoding, escaping
+included—not the driver's wire size, not an in-memory decoded size.
+`ResultValue::json_bytes` computes this figure directly, without producing the JSON
+text, so it always matches what `serde_json::to_string` would have written. This is
+the same quantity `max_result_bytes` and `max_value_bytes` bound, because what the
+budget protects is model context, and model context is spent on the JSON an agent
+actually receives, not on how the database or the driver represented the value
+internally.
+
 Example error:
 
 ```text
@@ -303,9 +312,15 @@ Cast it explicitly, for example: custom_state::text
 
 ### 8.2 Types by adapter
 
-**MySQL:** NULL; signed and unsigned integers; floating point; `DECIMAL` preserved as
-a string; `CHAR`/`VARCHAR`/`TEXT`; binary/blob; `DATE`; `TIME`;
-`DATETIME`/`TIMESTAMP`; `JSON`; and semantically identifiable boolean types.
+**MySQL:** NULL; signed and unsigned integers, including `YEAR` (signed) and `BIT`
+(unsigned); floating point; `DECIMAL` preserved as a string; `CHAR`/`VARCHAR`/`TEXT`;
+binary/blob; `DATE`; `TIME`; `DATETIME`/`TIMESTAMP`; `JSON`; and semantically
+identifiable boolean types. `GEOMETRY` is not representable and fails safely with a
+cast suggestion, the same as an unrecognized PostgreSQL type. `ResultColumn::nullable`
+is always `None` on MySQL—the driver's column metadata does not report it—and a
+zero-row MySQL result carries no columns at all, because the driver exposes column
+definitions only through a row (section 8.1's normalization rules still apply; nothing
+about a column is invented to fill the gap).
 
 **PostgreSQL:** NULL; `bool`; `int2`/`int4`/`int8`; `float4`/`float8`; `NUMERIC`
 with preserved precision; `text`/`varchar`; `bytea`; `date`; `time`;

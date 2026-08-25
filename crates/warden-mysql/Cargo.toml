@@ -47,7 +47,9 @@ serde_json = { workspace = true }
 # MySQL sends DATE and DATETIME as packed binary in the prepared-statement
 # protocol, so they cannot be read as text. These are the types sqlx's `time`
 # feature decodes them into; no formatting feature is used, because the three
-# formatters below are `write!` calls producing MySQL's own canonical text.
+# formatters in normalize.rs are plain `write!` calls. They are not a byte-for-byte
+# reproduction of the server's own text output: a DATETIME(n) column's declared
+# fractional precision is not preserved (docs/open-questions.md section 2).
 time = { workspace = true }
 
 [dev-dependencies]

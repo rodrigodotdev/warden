@@ -75,8 +75,10 @@ Milestone 6 covers the connection itself: TLS handshake and private-CA verificat
 the server-side deadline on both pools, PostgreSQL's startup options reaching the
 server while a DSN that would relax them is refused, `default_transaction_read_only` refusing DDL outside any
 policy, statement-cache behaviour on both engines, the exact pool defaults under
-saturation, and readiness surviving a saturated agent pool. Milestones 7 and 8 add the
-query-level rows below.
+saturation, and readiness surviving a saturated agent pool. Milestone 7 adds MySQL's
+query-level rows below—read-only transactions, deadlines, cancellation, row/byte
+truncation, concurrency, and privilege rejection, each proven against a real
+container. PostgreSQL's equivalent rows remain Milestone 8 work.
 
 PostgreSQL's official container image serves no TLS certificate chain. Its M6 test
 therefore proves that required TLS refuses a cleartext downgrade, while MySQL's private
@@ -91,6 +93,13 @@ Coverage uses `cargo llvm-cov --workspace --all-features --no-report --
 harness avoids intermittent PostgreSQL startup contention under LLVM instrumentation.
 The dedicated Docker gate remains parallel, so serial coverage does not mask normal
 container-test concurrency.
+
+**Milestone 7 measured a limit on that parallelism.** `warden-mysql`'s `docker`-gated
+unit tests each start their own MySQL testcontainer; run at Rust's default unbounded
+test-thread count, that many simultaneous containers exhaust Docker and host resources
+and produce spurious `PoolTimedOut` failures, not a defect in the tests themselves.
+Passing `--test-threads=4` removes the contention. This is host capacity, not test
+isolation, so it belongs here rather than as a per-test workaround.
 
 **MySQL:** connection; schema discovery; safe `SELECT`; parameter binding; read-only
 transaction; database user cannot write; Warden rejects writes before execution;

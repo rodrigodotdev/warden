@@ -91,6 +91,24 @@ otherwise, none blocks M0–M5.
     only proves a permit exists. Milestone 11's service layer is expected to make the
     attempt-before-execution ordering structural rather than left to the caller.
 
+15. **Should the session time zone be pinned?** MySQL's `TIMESTAMP` is currently
+    emitted in whatever zone the server session uses, unpinned. Setting
+    `time_zone = '+00:00'` in `after_connect` would make it deterministic, but it is a
+    real behavioral change — it changes what an agent's own `NOW()` query returns, not
+    only how a stored value is displayed — so Milestone 7 left it undone rather than
+    fold it into an execution milestone. It needs its own decision and its own ADR.
+
+16. **Should `ResultColumn` carry a fractional-second precision field?** MySQL's
+    `format_timestamp` and `format_time` (`crates/warden-mysql/src/normalize.rs`) omit
+    the `.ffffff` suffix when microseconds are zero and always render exactly six
+    digits when non-zero, so a `DATETIME(3)` column reads back as `09:07:03` where
+    mysql-client prints `09:07:03.000`. No data is corrupted — every digit shown is a
+    true stored microsecond and the represented instant is identical — but the
+    column's declared precision is lost in the rendering. Reproducing it needs a
+    fractional-precision field on `ResultColumn`, a `warden-core` model change
+    Milestone 8 would inherit, and the value is available only through `describe`,
+    which is the same path already rejected for `nullable`.
+
 ## 3. Future work deliberately outside v0.x
 
 ### Adapters
