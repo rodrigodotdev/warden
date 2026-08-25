@@ -15,13 +15,6 @@
 //! else, so every failure here collapses into the same `UnsupportedType`, and the
 //! driver's message is dropped rather than wrapped.
 
-// `dead_code` is not a workspace lint (`Cargo.toml` `[workspace.lints]` lists
-// neither it nor an equivalent), so this is not silencing one. `columns` and `row`
-// are the interface `execute.rs` calls in the next task; until that module exists,
-// nothing outside this file's own tests reaches this module, and the plain (no
-// `cfg(test)`) build would otherwise call every item here dead.
-#![allow(dead_code)]
-
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use sqlx::mysql::types::MySqlTime;

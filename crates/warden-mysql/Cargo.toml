@@ -29,6 +29,14 @@ sqlx = { workspace = true }
 # `time` only: this crate needs `timeout_at` for connection health checks. It starts
 # no runtime; the binary does.
 tokio = { workspace = true, features = ["time"] }
+# `CancellationToken` lives in the ungated `tokio_util::sync` module, so the
+# workspace's `default-features = false` is enough (verified against tokio-util
+# 0.7.19), the same as `warden-ports`.
+tokio-util = { workspace = true }
+# `Query::fetch` returns a `BoxStream` and sqlx re-exports no way to advance one.
+# `TryStreamExt::try_next` is how a result is consumed one row at a time, which
+# docs/operations.md section 6.6 requires.
+futures-util = { workspace = true }
 sqlparser = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }

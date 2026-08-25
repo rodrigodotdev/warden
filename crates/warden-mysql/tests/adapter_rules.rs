@@ -14,7 +14,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// The only files allowed to declare a `pub` item. Everything else is internal.
-const PUBLIC_FILES: &[&str] = &["lib.rs", "analyzer.rs", "connection.rs", "error.rs"];
+const PUBLIC_FILES: &[&str] = &[
+    "lib.rs",
+    "analyzer.rs",
+    "connection.rs",
+    "error.rs",
+    "execute.rs",
+];
 
 /// Type names that would carry a parser AST across the crate boundary.
 const AST_TYPES: &[&str] = &[
@@ -611,6 +617,37 @@ fn no_wildcard_arm_matches_a_warden_core_security_enum() {
          Adding a variant there must break this crate's build, not slip through a \
          wildcard (ADR-0021).",
         violations.join("\n")
+    );
+}
+
+/// Calls that would read a whole result into memory before any bound applied.
+const BUFFERING_FETCHES: &[&str] = &["fetch_all(", "fetch_one(", "fetch_optional("];
+
+#[test]
+fn agent_sql_is_never_read_into_memory_before_it_is_bounded() {
+    // `docs/operations.md` section 6.6: the row, value, and byte budgets apply while
+    // rows arrive. A buffering call spends the memory first and truncates afterwards,
+    // and the difference is invisible in a passing functional test.
+    //
+    // `execute.rs` is scanned rather than the whole crate because Warden's own static
+    // SQL — the health check, `SELECT CONNECTION_ID()` — is finite and single-row, so
+    // `fetch_one` is correct there and wrong only for agent SQL.
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/execute.rs");
+    let mut streams = false;
+    for (number, line) in code_lines(&path) {
+        for buffering in BUFFERING_FETCHES {
+            // `SELECT CONNECTION_ID()` is Warden's own statement and legitimately
+            // fetches one row; the ban is on the line that carries the agent's SQL.
+            assert!(
+                !(line.contains(buffering) && line.contains("bind::statement")),
+                "src/execute.rs:{number} buffers the agent result with {buffering}"
+            );
+        }
+        streams |= line.contains(".fetch(");
+    }
+    assert!(
+        streams,
+        "src/execute.rs never calls `.fetch`, so the ban above passed on an absence"
     );
 }
 
