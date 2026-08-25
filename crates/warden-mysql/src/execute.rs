@@ -157,10 +157,12 @@ impl MySqlQueryExecutor {
                 // the failure the agent actually needs.
                 self.kill(connection_id).await;
                 // Dropping queues a ROLLBACK without awaiting it. Awaiting one on a
-                // connection whose statement may still be running would hang, and
-                // the pool's `test_before_acquire` discards anything unusable. The
-                // kill above runs first so the connection cannot return to the pool,
-                // and its id be reused, before `KILL QUERY` lands.
+                // connection whose statement may still be running would hang.
+                // `test_before_acquire` — sqlx's own default, which `pool.rs` never
+                // overrides — discards anything unusable before the pool hands it
+                // out again. The kill above runs first so the connection cannot
+                // return to the pool, and its id be reused, before `KILL QUERY`
+                // lands.
                 drop(transaction);
                 Err(error)
             }
@@ -170,9 +172,13 @@ impl MySqlQueryExecutor {
     /// Asks the server to stop the statement running on `connection_id`.
     ///
     /// On `control_pool`, because the agent connection is busy — the second reason
-    /// ADR-0025's split pays for itself. Best effort: its failure is never reported
-    /// in place of the timeout or cancellation that caused it, which is the error
-    /// the agent actually needs.
+    /// ADR-0025's split pays for itself. Called whenever Warden stops reading a
+    /// result the server may still be writing: a truncated result on the ordinary
+    /// success path, and every `ExecuteError` variant on the failure path, not only
+    /// a timeout or a cancellation — MySQL's protocol has no cursor, so nothing else
+    /// tells the server Warden has stopped. Best effort in every case: its own
+    /// failure is never reported in place of the outcome — `Ok` or `Err` — that
+    /// triggered it.
     async fn kill(&self, connection_id: u64) {
         let deadline = Instant::now() + KILL_TIMEOUT;
         let statement = sqlx::query("KILL QUERY ?")
