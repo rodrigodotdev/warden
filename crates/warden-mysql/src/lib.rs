@@ -20,6 +20,8 @@
 //! public surface names no SQLx type at all. The composition root builds a pools
 //! value, passes it to the executor, and never depends on `sqlx` itself.
 //! `tests/adapter_rules.rs` enforces that the same way it enforces the AST rule.
+//! Normalization reads driver values and produces only `warden-core` types, so no
+//! `sqlx` type crosses out of that module either.
 //!
 //! # How analysis fails, and how it does not
 //!
@@ -45,6 +47,7 @@ mod connection;
 mod error;
 mod fingerprint;
 mod functions;
+mod normalize;
 mod options;
 mod parse;
 mod pool;

@@ -32,6 +32,15 @@ tokio = { workspace = true, features = ["time"] }
 sqlparser = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }
+# docs/data-model.md section 8.1 rule 3: binary values leave as base64.
+base64 = { workspace = true }
+# A JSON column becomes `ResultValue::Json`.
+serde_json = { workspace = true }
+# MySQL sends DATE and DATETIME as packed binary in the prepared-statement
+# protocol, so they cannot be read as text. These are the types sqlx's `time`
+# feature decodes them into; no formatting feature is used, because the three
+# formatters below are `write!` calls producing MySQL's own canonical text.
+time = { workspace = true }
 
 [dev-dependencies]
 # Depend only on `testcontainers-modules`, which re-exports `testcontainers`. A
