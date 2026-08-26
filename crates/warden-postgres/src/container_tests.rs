@@ -10,6 +10,8 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+mod execution;
+
 use std::time::Duration;
 
 use sqlx::{AssertSqlSafe, Row};
