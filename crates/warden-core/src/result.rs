@@ -38,6 +38,28 @@ pub enum NormalizationError {
         /// The offending column.
         column: String,
     },
+    /// The value is outside what the normalized model can represent.
+    ///
+    /// Distinct from [`NormalizationError::UnsupportedType`]: the column's type is
+    /// supported, and other rows of the same column normalize without complaint —
+    /// this one value does not. PostgreSQL's `infinity` and `-infinity` timestamps,
+    /// its dates beyond year 9999, and its `NaN` numerics are the cases this exists
+    /// for. Carries the column and the type name and nothing else, exactly as
+    /// [`NormalizationError::UnsupportedType`] does
+    /// (`docs/data-model.md` section 8.1, rule 4).
+    #[error(
+        "column {column:?} holds a {database_type} value with no JSON representation; \
+         cast it explicitly, for example: {}",
+        cast_example(.dialect, .column)
+    )]
+    UnrepresentableValue {
+        /// The offending column.
+        column: String,
+        /// The dialect that produced the value.
+        dialect: Dialect,
+        /// The database type name.
+        database_type: String,
+    },
     /// A row did not match the column metadata.
     #[error("row {row} has {actual} values but the result has {expected} columns")]
     RowWidthMismatch {
@@ -538,6 +560,18 @@ impl ResultBuilder {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    #[test]
+    fn an_unrepresentable_value_blames_the_value_and_not_the_type() {
+        let rendered = NormalizationError::UnrepresentableValue {
+            column: "valid_until".to_owned(),
+            dialect: Dialect::PostgreSql,
+            database_type: "TIMESTAMPTZ".to_owned(),
+        }
+        .to_string();
+        assert!(rendered.contains("TIMESTAMPTZ"), "{rendered}");
+        assert!(rendered.contains("valid_until::text"), "{rendered}");
+        assert!(!rendered.contains("unsupported"), "{rendered}");
+    }
     use std::time::Duration;
 
     use super::*;

@@ -18,6 +18,16 @@ default = []
 docker = []
 
 [dependencies]
+# docs/data-model.md section 8.1 rule 3: binary values leave as base64.
+base64 = { workspace = true }
+# A `json` or `jsonb` column becomes `ResultValue::Json`.
+serde_json = { workspace = true }
+# PostgreSQL sends DATE, TIME, TIMESTAMP and TIMESTAMPTZ as packed binary in the
+# extended protocol, so they cannot be read as text. `normalize.rs` decodes the
+# underlying integer itself for the three that can overflow `time`'s calendar and
+# uses `time`'s own types for the arithmetic and the rendering; the three
+# formatters are plain `write!` calls, so no formatting feature is used here.
+time = { workspace = true }
 warden-core = { workspace = true }
 warden-policy = { workspace = true }
 warden-ports = { workspace = true }

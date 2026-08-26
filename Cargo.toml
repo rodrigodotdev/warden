@@ -87,7 +87,7 @@ syn = { version = "2", features = ["full", "visit"] }
 
 # Serialization and errors
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["arbitrary_precision"] }
 toml = "1.1"
 thiserror = "2.0"
 anyhow = "1.0"
@@ -98,7 +98,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 # Secrets and types
 secrecy = "0.10"
-time = { version = "0.3", features = ["formatting", "parsing"] }
+# Dates and times. `formatting`/`parsing` serve the config and DSN layers;
+# `macros` gives `warden-postgres` a `const` PostgreSQL epoch, which is what lets
+# it convert a wire integer into a date with checked arithmetic instead of handing
+# the value to a `sqlx` decoder that panics on `infinity` (SPEC section 6,
+# invariant 31). `time-macros` is already in `Cargo.lock` through `sqlx`, so the
+# dependency graph does not grow.
+time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
 uuid = { version = "1.24", features = ["v4"] }
 bigdecimal = "0.4"
 base64 = "0.23"

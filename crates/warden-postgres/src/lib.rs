@@ -19,6 +19,8 @@
 //! ADR-0025) and hands out neither: the accessors are `pub(crate)`, so the crate's
 //! public surface names no SQLx type at all. `tests/adapter_rules.rs` enforces that
 //! the same way it enforces the AST rule.
+//! Normalization reads driver values and produces only `warden-core` types, so no
+//! SQLx type crosses out of that module either.
 //!
 //! Every statement destined for `agent_pool` is built by `crate::query::agent_query`,
 //! which applies `.persistent(false)`. That flag is per query, not per pool, so
@@ -52,6 +54,7 @@ mod connection;
 mod error;
 mod fingerprint;
 mod functions;
+mod normalize;
 mod options;
 mod parse;
 mod pool;

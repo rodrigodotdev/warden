@@ -6,7 +6,7 @@
 
 use std::fmt;
 
-use serde::de::{self, Deserialize, Deserializer, Visitor};
+use serde::de::{self, Deserialize, Deserializer};
 
 use crate::MAX_EXACT_JSON_INTEGER;
 
@@ -57,11 +57,10 @@ pub enum ParameterValue {
 impl ParameterValue {
     /// Builds a float parameter, rejecting values JSON cannot carry exactly.
     ///
-    /// `serde_json` discards the literal text of a number, so an integer larger
-    /// than `u64::MAX` is indistinguishable from a float once parsed. Rejecting the
-    /// whole integral range at or above 2^53 is conservative and keeps the promise
-    /// in `docs/data-model.md` section 3.1 that Warden never silently wraps or
-    /// truncates a value.
+    /// JSON floating-point parameters are bound as `f64`. Rejecting the whole
+    /// integral range at or above 2^53 is conservative and keeps the promise in
+    /// `docs/data-model.md` section 3.1 that Warden never silently wraps or truncates
+    /// a value.
     pub fn float(value: f64) -> Result<Self, ParameterError> {
         if !value.is_finite() {
             return Err(ParameterError::NotFinite);
@@ -70,6 +69,27 @@ impl ParameterValue {
             return Err(ParameterError::InexactInteger);
         }
         Ok(Self::F64(value))
+    }
+
+    /// Classifies a JSON number without rounding integer syntax into a float.
+    fn from_json_number(number: serde_json::Number) -> Result<Self, ParameterError> {
+        if let Some(value) = number.as_u64() {
+            return Ok(Self::U64(value));
+        }
+        if let Some(value) = number.as_i64() {
+            return Ok(Self::I64(value));
+        }
+
+        let token = number.to_string();
+        if token.contains(['.', 'e', 'E']) {
+            let value = number.as_f64().ok_or(ParameterError::NotFinite)?;
+            return Self::float(value);
+        }
+
+        // With serde_json's arbitrary-precision parsing, reaching this branch means
+        // the input used integer syntax but did not fit either i64 or u64. Never
+        // round that exact token through f64.
+        Err(ParameterError::InexactInteger)
     }
 }
 
@@ -88,54 +108,26 @@ impl fmt::Debug for ParameterValue {
     }
 }
 
-struct ParameterValueVisitor;
-
-impl Visitor<'_> for ParameterValueVisitor {
-    type Value = ParameterValue;
-
-    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("null, a boolean, a finite number, or a string")
-    }
-
-    fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
-        Ok(ParameterValue::Null)
-    }
-
-    fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
-        Ok(ParameterValue::Null)
-    }
-
-    fn visit_bool<E: de::Error>(self, value: bool) -> Result<Self::Value, E> {
-        Ok(ParameterValue::Bool(value))
-    }
-
-    fn visit_i64<E: de::Error>(self, value: i64) -> Result<Self::Value, E> {
-        Ok(ParameterValue::I64(value))
-    }
-
-    fn visit_u64<E: de::Error>(self, value: u64) -> Result<Self::Value, E> {
-        Ok(ParameterValue::U64(value))
-    }
-
-    fn visit_f64<E: de::Error>(self, value: f64) -> Result<Self::Value, E> {
-        ParameterValue::float(value).map_err(de::Error::custom)
-    }
-
-    fn visit_str<E: de::Error>(self, value: &str) -> Result<Self::Value, E> {
-        Ok(ParameterValue::String(value.to_owned()))
-    }
-
-    fn visit_string<E: de::Error>(self, value: String) -> Result<Self::Value, E> {
-        Ok(ParameterValue::String(value))
-    }
-}
-
 impl<'de> Deserialize<'de> for ParameterValue {
-    /// A hand-written visitor, not `#[serde(untagged)]`: the visitor sees the JSON
-    /// number's arm directly, which is what makes rejecting an inexact integer
-    /// possible at all.
+    /// Deserializes through serde_json's exact number token representation.
+    ///
+    /// This type is an MCP JSON boundary, so using [`serde_json::Value`] here is
+    /// deliberate. With the workspace's arbitrary-precision feature it handles
+    /// serde_json's private number protocol internally; Warden then distinguishes
+    /// integer syntax from decimal/exponent syntax without depending on that private
+    /// token itself.
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        deserializer.deserialize_any(ParameterValueVisitor)
+        match serde_json::Value::deserialize(deserializer)? {
+            serde_json::Value::Null => Ok(Self::Null),
+            serde_json::Value::Bool(value) => Ok(Self::Bool(value)),
+            serde_json::Value::Number(number) => {
+                Self::from_json_number(number).map_err(de::Error::custom)
+            }
+            serde_json::Value::String(value) => Ok(Self::String(value)),
+            serde_json::Value::Array(_) | serde_json::Value::Object(_) => Err(de::Error::custom(
+                "parameter must be null, a boolean, a finite number, or a string",
+            )),
+        }
     }
 }
 
@@ -164,8 +156,9 @@ mod tests {
 
     #[test]
     fn rejects_integers_that_json_cannot_carry_exactly() {
-        // `serde_json` parses this as an f64 because it exceeds u64::MAX, which is
-        // exactly the silent-truncation path this rule exists to close.
+        // The arbitrary-precision parser keeps this exact token. Warden classifies
+        // its integer syntax before considering any f64 conversion, closing the
+        // silent-rounding path directly.
         let error = serde_json::from_str::<ParameterValue>("18446744073709551616")
             .unwrap_err()
             .to_string();
@@ -181,6 +174,14 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<ParameterValue>("-9223372036854775808").unwrap(),
             ParameterValue::I64(i64::MIN)
+        );
+    }
+
+    #[test]
+    fn a_high_precision_decimal_remains_a_finite_f64_parameter() {
+        assert_eq!(
+            serde_json::from_str::<ParameterValue>("0.123456789012345678901234567890").unwrap(),
+            ParameterValue::F64(0.123_456_789_012_345_68)
         );
     }
 
