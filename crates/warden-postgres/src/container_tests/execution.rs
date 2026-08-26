@@ -32,7 +32,7 @@ use warden_core::pool::PoolSettings;
 use warden_core::query::{InputLimits, QueryRequest};
 use warden_core::result::{ResultSet, ResultValue};
 use warden_policy::{AnalyzedQuery, AuthorizedQuery, PolicyEngine, PolicySettings};
-use warden_ports::error::ExecuteError;
+use warden_ports::error::{ConnectionError, ExecuteError};
 use warden_ports::{
     ConnectionRuntime, ConnectionRuntimeParts, QueryAnalyzer, QueryExecutor, QueryPermit,
 };
@@ -219,6 +219,124 @@ async fn fixture(pools: &PostgreSqlConnectionPools) {
     transaction.commit().await.unwrap();
 }
 
+/// A statement that keeps producing rows long after Warden stops reading.
+///
+/// A modest payload forces PostgreSQL to flush the first bounded batch promptly;
+/// tiny rows can remain buffered long enough that the client has not seen its
+/// sentinel even though `pg_stat_activity` already proves the query is active.
+/// `pg_sleep` per row keeps the query alive for minutes without a cancel. If the
+/// cancel regresses, the five-second server deadline still limits this fixture to
+/// roughly 200 KiB rather than an unbounded response.
+///
+/// The alias is the marker [`wait_until_nothing_runs`] looks for in
+/// `pg_stat_activity`. Warden's real analyzer would deny this statement —
+/// `pg_sleep` carries `RiskFlag::DelayFunction` — which is exactly why the test
+/// builds it as an `AuthorizedQuery` directly: the property under test lives below
+/// the policy engine.
+const SLOW_STREAM: &str = "SELECT repeat('x', 2048) || i::text AS warden_orphan_marker \
+     FROM generate_series(1, 100000) i \
+     CROSS JOIN LATERAL (SELECT pg_sleep(0.05) WHERE i IS NOT NULL) AS delayed";
+
+/// A statement with real per-row work, guaranteed to outlive a two-second deadline.
+const HEAVY_COUNT: &str =
+    "SELECT count(*) AS warden_heavy_marker FROM generate_series(1, 2000000000) i";
+
+/// Bound for observing that a query reached, or left, the server.
+const SERVER_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// Aggregate post-query budget: cancel, rollback, and deallocation get two seconds
+/// each and can run sequentially.
+const EXECUTOR_CLEANUP_BUDGET: Duration = Duration::from_secs(6);
+
+/// Polls, with a bound, until no backend is still running a statement whose text
+/// contains `marker`.
+///
+/// A poll rather than a single check: the cancel request and the draining `ROLLBACK`
+/// have both been awaited by the time `execute_read_only` returns, but
+/// `pg_stat_activity` can lag a backend leaving the `active` state by a beat, and a
+/// flaky assertion here should get a generous, bounded retry rather than be deleted.
+///
+/// `deadline` bounds only this server-side observation. Callers poll concurrently
+/// with executor cleanup, so the cancellation proof is not delayed by rollback or
+/// statement deallocation. For cancellation tests it is comfortably below the
+/// connection's own `statement_timeout` (5 s by default), which means a pass can
+/// only be Warden's own `pg_cancel_backend` clearing the marker — not the server's
+/// unrelated timeout doing it on its own.
+///
+/// The marker travels as a bound parameter, so this poll's own row in
+/// `pg_stat_activity` never contains it; `pid <> pg_backend_pid()` is belt and
+/// braces.
+async fn wait_until_nothing_runs(
+    pools: &PostgreSqlConnectionPools,
+    marker: &str,
+    deadline: Instant,
+) {
+    let pattern = format!("%{marker}%");
+    loop {
+        let running: i64 = tokio::time::timeout_at(
+            deadline,
+            sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity \
+                 WHERE query LIKE $1 AND state = 'active' AND pid <> pg_backend_pid()",
+            )
+            .bind(&pattern)
+            .fetch_one(pools.control()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("timed out observing {marker:?} after cancellation"))
+        .unwrap();
+        assert!(
+            Instant::now() < deadline,
+            "observation of {marker:?} completed after its cancellation deadline"
+        );
+        if running == 0 {
+            return;
+        }
+        tokio::time::timeout_at(deadline, tokio::time::sleep(Duration::from_millis(50)))
+            .await
+            .unwrap_or_else(|_| {
+                panic!("a backend running {marker:?} was still active at its cancellation deadline")
+            });
+    }
+}
+
+/// The pid of the one backend running a statement containing `marker`, once it
+/// appears.
+async fn backend_running(
+    pools: &PostgreSqlConnectionPools,
+    marker: &str,
+    deadline: Instant,
+) -> i32 {
+    let pattern = format!("%{marker}%");
+    loop {
+        let found: Option<i32> = tokio::time::timeout_at(
+            deadline,
+            sqlx::query_scalar(
+                "SELECT pid FROM pg_stat_activity \
+                 WHERE query LIKE $1 AND state = 'active' AND pid <> pg_backend_pid() \
+                 LIMIT 1",
+            )
+            .bind(&pattern)
+            .fetch_optional(pools.control()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {marker:?} to start"))
+        .unwrap();
+        assert!(
+            Instant::now() < deadline,
+            "observation of {marker:?} completed after its startup deadline"
+        );
+        if let Some(pid) = found {
+            return pid;
+        }
+        tokio::time::timeout_at(deadline, tokio::time::sleep(Duration::from_millis(50)))
+            .await
+            .unwrap_or_else(|_| {
+                panic!("no backend started running {marker:?} before its deadline")
+            });
+    }
+}
+
 #[tokio::test]
 async fn fixture_keeps_the_control_pool_read_only() {
     let container = start_postgres().await;
@@ -234,6 +352,655 @@ async fn fixture_keeps_the_control_pool_read_only() {
         setting(pools.control(), "default_transaction_read_only").await,
         "on"
     );
+
+    pools.close().await;
+}
+
+#[tokio::test]
+async fn no_session_state_leaks_between_requests() {
+    // PostgreSQL undoes a session-level `SET` made inside a transaction when that
+    // transaction rolls back, and every agent statement runs inside one, so the
+    // executor's `ROLLBACK` is what makes this true rather than a hope. The pid
+    // assertion is what makes the test meaningful: without it, a pool that handed
+    // out a second connection would pass vacuously.
+    let container = start_postgres().await;
+    let limits = ExecutionLimits {
+        max_concurrent_queries: 1,
+        ..ExecutionLimits::default()
+    };
+    let mut settings = config(dsn(&container).await);
+    settings.limits = limits;
+    settings.agent_pool.max_connections = 1;
+    let pools = Arc::new(PostgreSqlConnectionPools::connect(settings).await.unwrap());
+    let (executor, runtime) = harness(Arc::clone(&pools), limits).await;
+    let permit = runtime.acquire_query_permit().await.unwrap();
+
+    let first = authorized(
+        "SELECT set_config('warden.leak', 'yes', false) AS written, \
+         pg_backend_pid() AS pid",
+        Vec::new(),
+        limits,
+    );
+    let result = run(&executor, &permit, &first).await.unwrap();
+    assert_eq!(result.rows[0][0], ResultValue::String("yes".to_owned()));
+    let first_pid = result.rows[0][1].clone();
+
+    let second = authorized(
+        "SELECT current_setting('warden.leak', true) AS leaked, \
+         current_setting('statement_timeout') AS deadline, \
+         pg_backend_pid() AS pid",
+        Vec::new(),
+        limits,
+    );
+    let result = run(&executor, &permit, &second).await.unwrap();
+    assert_eq!(
+        result.rows[0][2], first_pid,
+        "the two requests must share a connection for this test to mean anything"
+    );
+    assert_eq!(
+        result.rows[0][0],
+        // PostgreSQL preserves a custom GUC's placeholder after a rolled-back
+        // `set_config`, so its missing value is empty rather than SQL NULL. The
+        // security property is that the request's `yes` value did not survive.
+        ResultValue::String(String::new()),
+        "a session setting written by one request survived into the next"
+    );
+    assert_eq!(
+        result.rows[0][1],
+        ResultValue::String("5s".to_owned()),
+        "the previous request's SET LOCAL survived its own transaction"
+    );
+
+    // `control_pool` was never touched either.
+    let control: String = sqlx::query_scalar("SELECT current_setting('statement_timeout')")
+        .fetch_one(pools.control())
+        .await
+        .unwrap();
+    assert_eq!(control, "5s");
+
+    pools.close().await;
+}
+
+#[tokio::test]
+async fn concurrency_is_bounded_on_a_real_executor() {
+    // SPEC section 6, invariants 16 and 17 pair, measured on a runtime that
+    // actually holds a PostgreSQL executor rather than a fake one.
+    let container = start_postgres().await;
+    let limits = ExecutionLimits {
+        max_concurrent_queries: 1,
+        max_queue_wait: Duration::from_secs(1),
+        ..ExecutionLimits::default()
+    };
+    let mut settings = config(dsn(&container).await);
+    settings.limits = limits;
+    let pools = Arc::new(PostgreSqlConnectionPools::connect(settings).await.unwrap());
+    let (executor, runtime) = harness(Arc::clone(&pools), limits).await;
+
+    let held = runtime.acquire_query_permit().await.unwrap();
+
+    let started = std::time::Instant::now();
+    let error = runtime.acquire_query_permit().await.unwrap_err();
+    let elapsed = started.elapsed();
+    assert!(matches!(error, ConnectionError::Busy { .. }), "{error:?}");
+    assert!(
+        elapsed >= Duration::from_millis(900) && elapsed < Duration::from_secs(3),
+        "waited {elapsed:?}; max_queue_wait is 1s"
+    );
+
+    drop(held);
+    let reacquired = runtime.acquire_query_permit().await.unwrap();
+    let query = authorized("SELECT 1 AS ok", Vec::new(), limits);
+    let result = run(&executor, &reacquired, &query).await.unwrap();
+    assert_eq!(result.rows[0][0], ResultValue::I64(1));
+
+    pools.close().await;
+}
+
+#[tokio::test]
+async fn the_server_deadline_fires_before_the_client_one() {
+    // ADR-0024 and `docs/operations.md` section 5.3: with the server deadline
+    // shorter, the normal path is a clean server error and an intact pooled
+    // connection, and `tokio::time::timeout_at` is only a safety net. A client
+    // timeout during row streaming would instead force sqlx to discard the
+    // connection, which drains a pool of five under repeated slow queries.
+    let container = start_postgres().await;
+    let limits = ExecutionLimits {
+        timeout: Duration::from_secs(2),
+        max_concurrent_queries: 1,
+        ..ExecutionLimits::default()
+    };
+    let mut settings = config(dsn(&container).await);
+    settings.limits = limits;
+    settings.agent_pool.max_connections = 1;
+    let pools = Arc::new(PostgreSqlConnectionPools::connect(settings).await.unwrap());
+    let (executor, runtime) = harness(Arc::clone(&pools), limits).await;
+    let permit = runtime.acquire_query_permit().await.unwrap();
+
+    let pid_query = authorized("SELECT pg_backend_pid() AS pid", Vec::new(), limits);
+    let initial_pid = run(&executor, &permit, &pid_query).await.unwrap().rows[0][0].clone();
+    let query = authorized(HEAVY_COUNT, Vec::new(), limits);
+    let client_deadline = Instant::now() + limits.client_timeout();
+    let activity_deadline = Instant::now() + Duration::from_secs(1);
+    let cleanup_deadline = client_deadline + EXECUTOR_CLEANUP_BUDGET;
+    let call = tokio::time::timeout_at(
+        cleanup_deadline,
+        executor.execute_read_only(
+            &query,
+            &permit,
+            // The client deadline is `timeout + margin`, which
+            // `ExecutionLimits::client_timeout` derives and validation keeps
+            // strictly longer than the server one.
+            client_deadline,
+            CancellationToken::new(),
+        ),
+    );
+    let query_phase = async {
+        let observed_pid = backend_running(&pools, "warden_heavy_marker", activity_deadline).await;
+        assert_eq!(
+            initial_pid,
+            ResultValue::I64(i64::from(observed_pid)),
+            "the deadline query must run on the pinned agent backend"
+        );
+        // This observes the query leaving PostgreSQL before the client deadline
+        // while rollback and statement deallocation are still free to continue.
+        wait_until_nothing_runs(&pools, "warden_heavy_marker", client_deadline).await;
+    };
+    let (outcome, ()) = tokio::join!(call, query_phase);
+    let error = outcome
+        .unwrap_or_else(|_| panic!("executor cleanup exceeded its aggregate budget"))
+        .unwrap_err();
+
+    assert_eq!(error, ExecuteError::Timeout);
+    assert_eq!(error.public_code(), PublicErrorCode::QueryTimeout);
+
+    // The same physical session came back intact: a replacement could also run
+    // `SELECT 1`, while the identical backend PID proves server timeout cleanup did
+    // not retire the connection. The per-request deadline remains transaction-local.
+    let plain = authorized(
+        "SELECT pg_backend_pid() AS pid, current_setting('statement_timeout') AS deadline",
+        Vec::new(),
+        limits,
+    );
+    assert_eq!(
+        run(&executor, &permit, &plain).await.unwrap().rows[0],
+        vec![initial_pid, ResultValue::String("2s".to_owned())]
+    );
+
+    pools.close().await;
+}
+
+#[tokio::test]
+async fn cancellation_reaches_the_server() {
+    let container = start_postgres().await;
+    let pools = Arc::new(
+        PostgreSqlConnectionPools::connect(config(dsn(&container).await))
+            .await
+            .unwrap(),
+    );
+    let (executor, runtime) = harness(Arc::clone(&pools), ExecutionLimits::default()).await;
+    let permit = runtime.acquire_query_permit().await.unwrap();
+
+    let cancel = CancellationToken::new();
+    let query = authorized(
+        "SELECT pg_sleep(30) AS warden_cancel_marker",
+        Vec::new(),
+        ExecutionLimits::default(),
+    );
+    let activity_deadline = Instant::now() + SERVER_OBSERVATION_TIMEOUT;
+    let cleanup_deadline = activity_deadline + EXECUTOR_CLEANUP_BUDGET;
+    let call = tokio::time::timeout_at(
+        cleanup_deadline,
+        executor.execute_read_only(&query, &permit, deadline(), cancel.clone()),
+    );
+    let canceller = async {
+        // The backend marker is server-observable synchronization: the test never
+        // races cancellation against connection checkout or query dispatch.
+        backend_running(&pools, "warden_cancel_marker", activity_deadline).await;
+        let cancellation_deadline = Instant::now() + SERVER_OBSERVATION_TIMEOUT;
+        cancel.cancel();
+        // Observe the query phase separately. Rollback and deallocation continue
+        // concurrently and are awaited by `call` under their aggregate budget.
+        wait_until_nothing_runs(&pools, "warden_cancel_marker", cancellation_deadline).await;
+    };
+    let (outcome, ()) = tokio::join!(call, canceller);
+
+    // The token's own arm wins the `biased` select, so the agent sees `Cancelled`
+    // rather than the `57014` the server will report a moment later.
+    assert_eq!(
+        outcome
+            .unwrap_or_else(|_| panic!("executor cleanup exceeded its aggregate budget"))
+            .unwrap_err(),
+        ExecuteError::Cancelled
+    );
+
+    pools.close().await;
+}
+
+#[tokio::test]
+async fn a_cancel_from_outside_the_token_is_reported_as_a_timeout() {
+    // ADR-0034's documented consequence, pinned so it is a decision rather than a
+    // surprise: PostgreSQL reports a statement timeout and a cancel request under
+    // the same `57014`, and Warden maps that code to `Timeout` because the server
+    // deadline is the designed ordinary path. A DBA cancelling a backend therefore
+    // reaches the agent as `query_timeout`.
+    let container = start_postgres().await;
+    let pools = Arc::new(
+        PostgreSqlConnectionPools::connect(config(dsn(&container).await))
+            .await
+            .unwrap(),
+    );
+    let (executor, runtime) = harness(Arc::clone(&pools), ExecutionLimits::default()).await;
+    let permit = runtime.acquire_query_permit().await.unwrap();
+
+    let query = authorized(
+        "SELECT pg_sleep(30) AS warden_external_marker",
+        Vec::new(),
+        ExecutionLimits::default(),
+    );
+    let activity_deadline = Instant::now() + SERVER_OBSERVATION_TIMEOUT;
+    let cleanup_deadline = activity_deadline + EXECUTOR_CLEANUP_BUDGET;
+    let call = tokio::time::timeout_at(cleanup_deadline, run(&executor, &permit, &query));
+    let outsider = async {
+        let pid = backend_running(&pools, "warden_external_marker", activity_deadline).await;
+        let cancellation_deadline = Instant::now() + SERVER_OBSERVATION_TIMEOUT;
+        let cancelled: bool = tokio::time::timeout_at(
+            cancellation_deadline,
+            sqlx::query_scalar("SELECT pg_cancel_backend($1)")
+                .bind(pid)
+                .fetch_one(pools.control()),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("pg_cancel_backend did not finish before its deadline"))
+        .unwrap();
+        assert!(
+            cancelled,
+            "pg_cancel_backend did not deliver a signal to pid {pid}"
+        );
+        wait_until_nothing_runs(&pools, "warden_external_marker", cancellation_deadline).await;
+    };
+    let (outcome, ()) = tokio::join!(call, outsider);
+
+    let error = outcome
+        .unwrap_or_else(|_| panic!("executor cleanup exceeded its aggregate budget"))
+        .unwrap_err();
+    assert_eq!(error, ExecuteError::Timeout, "ADR-0034");
+    assert_eq!(error.public_code(), PublicErrorCode::QueryTimeout);
+
+    pools.close().await;
+}
+
+#[tokio::test]
+async fn the_pool_survives_a_timeout_a_cancellation_and_a_database_error() {
+    let container = start_postgres().await;
+    let limits = ExecutionLimits {
+        timeout: Duration::from_secs(2),
+        ..ExecutionLimits::default()
+    };
+    let mut settings = config(dsn(&container).await);
+    settings.limits = limits;
+    let pools = Arc::new(PostgreSqlConnectionPools::connect(settings).await.unwrap());
+    let (executor, runtime) = harness(Arc::clone(&pools), limits).await;
+    let permit = runtime.acquire_query_permit().await.unwrap();
+
+    // 1. A server-side timeout.
+    let timeout_query = authorized(HEAVY_COUNT, Vec::new(), limits);
+    let error = executor
+        .execute_read_only(
+            &timeout_query,
+            &permit,
+            Instant::now() + limits.client_timeout(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(error, ExecuteError::Timeout);
+
+    // 2. A cancellation, after the server confirms the statement is in flight.
+    let cancel = CancellationToken::new();
+    let cancel_query = authorized("SELECT pg_sleep(30)", Vec::new(), limits);
+    let call = executor.execute_read_only(&cancel_query, &permit, deadline(), cancel.clone());
+    let canceller = async {
+        backend_running(
+            &pools,
+            "SELECT pg_sleep(30)",
+            Instant::now() + Duration::from_secs(2),
+        )
+        .await;
+        cancel.cancel();
+    };
+    let (outcome, ()) = tokio::join!(call, canceller);
+    assert_eq!(outcome.unwrap_err(), ExecuteError::Cancelled);
+
+    // 3. A genuine database error.
+    let bad_query = authorized("SELECT * FROM does_not_exist", Vec::new(), limits);
+    let error = run(&executor, &permit, &bad_query).await.unwrap_err();
+    assert!(matches!(error, ExecuteError::Database { .. }), "{error:?}");
+
+    // The pool must still be usable after all three.
+    let plain = authorized("SELECT 1 AS ok", Vec::new(), limits);
+    let result = run(&executor, &permit, &plain).await.unwrap();
+    assert_eq!(result.rows[0][0], ResultValue::I64(1));
+    pools.health_check(deadline()).await.unwrap();
+
+    pools.close().await;
+}
+
+#[tokio::test]
+async fn the_row_bound_truncates_the_result() {
+    let container = start_postgres().await;
+    let pools = Arc::new(
+        PostgreSqlConnectionPools::connect(config(dsn(&container).await))
+            .await
+            .unwrap(),
+    );
+    let limits = ExecutionLimits {
+        max_rows: 5,
+        ..ExecutionLimits::default()
+    };
+    let (executor, runtime) = harness(Arc::clone(&pools), limits).await;
+    let permit = runtime.acquire_query_permit().await.unwrap();
+
+    let query = authorized(
+        "SELECT i FROM generate_series(1, 100) i",
+        Vec::new(),
+        limits,
+    );
+    let result = run(&executor, &permit, &query).await.unwrap();
+
+    assert_eq!(result.rows.len(), 5);
+    assert!(result.truncated);
+    assert_eq!(result.stats.rows_returned, 5);
+
+    pools.close().await;
+}
+
+#[tokio::test]
+async fn an_unrepresentable_row_sentinel_cannot_replace_valid_rows_with_an_error() {
+    let container = start_postgres().await;
+    let pools = Arc::new(
+        PostgreSqlConnectionPools::connect(config(dsn(&container).await))
+            .await
+            .unwrap(),
+    );
+    let limits = ExecutionLimits {
+        max_rows: 2,
+        ..ExecutionLimits::default()
+    };
+    let (executor, runtime) = harness(Arc::clone(&pools), limits).await;
+    let permit = runtime.acquire_query_permit().await.unwrap();
+
+    let query = authorized(
+        "SELECT CASE WHEN i <= 2 THEN i::numeric ELSE 'NaN'::numeric END AS value \
+         FROM generate_series(1, 3) i ORDER BY i",
+        Vec::new(),
+        limits,
+    );
+    let result = run(&executor, &permit, &query).await.unwrap();
+
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![ResultValue::Decimal("1".to_owned())],
+            vec![ResultValue::Decimal("2".to_owned())],
+        ]
+    );
+    assert!(result.truncated);
+    assert_eq!(result.stats.rows_returned, 2);
+
+    pools.close().await;
+}
+
+#[tokio::test]
+async fn the_total_byte_bound_truncates_the_result() {
+    let container = start_postgres().await;
+    let pools = Arc::new(
+        PostgreSqlConnectionPools::connect(config(dsn(&container).await))
+            .await
+            .unwrap(),
+    );
+    let limits = ExecutionLimits {
+        max_value_bytes: 512,
+        max_result_bytes: 512,
+        ..ExecutionLimits::default()
+    };
+    let (executor, runtime) = harness(Arc::clone(&pools), limits).await;
+    let permit = runtime.acquire_query_permit().await.unwrap();
+
+    let query = authorized(
+        "SELECT repeat('a', 100) AS payload FROM generate_series(1, 50) i",
+        Vec::new(),
+        limits,
+    );
+    let result = run(&executor, &permit, &query).await.unwrap();
+
+    assert!(result.truncated);
+    assert!(!result.rows.is_empty(), "at least one row must be returned");
+    assert!(result.rows.len() < 50, "{}", result.rows.len());
+    assert!(result.stats.bytes <= 512, "{}", result.stats.bytes);
+
+    pools.close().await;
+}
+
+#[tokio::test]
+async fn the_per_value_bound_fails_the_whole_result() {
+    let container = start_postgres().await;
+    let pools = Arc::new(
+        PostgreSqlConnectionPools::connect(config(dsn(&container).await))
+            .await
+            .unwrap(),
+    );
+    let limits = ExecutionLimits {
+        max_value_bytes: 64,
+        ..ExecutionLimits::default()
+    };
+    let (executor, runtime) = harness(Arc::clone(&pools), limits).await;
+    let permit = runtime.acquire_query_permit().await.unwrap();
+
+    // An error, not a substitution: `ResultValue` has no "omitted" variant, and
+    // inventing one would put a value in the agent's context the database never
+    // returned (`docs/data-model.md` section 7).
+    let query = authorized("SELECT repeat('a', 200) AS payload", Vec::new(), limits);
+    let error = run(&executor, &permit, &query).await.unwrap_err();
+    assert!(
+        matches!(error, ExecuteError::ResultTooLarge { limit: 64 }),
+        "{error:?}"
+    );
+    assert_eq!(error.public_code(), PublicErrorCode::QueryResultTooLarge);
+
+    pools.close().await;
+}
+
+#[tokio::test]
+async fn nothing_fits_fails_rather_than_truncates_to_empty() {
+    let container = start_postgres().await;
+    let pools = Arc::new(
+        PostgreSqlConnectionPools::connect(config(dsn(&container).await))
+            .await
+            .unwrap(),
+    );
+    // The value fits its own budget; the first row alone does not fit the result
+    // budget. Truncating to zero rows would report success for a result the agent
+    // never received any of.
+    let limits = ExecutionLimits {
+        max_value_bytes: 32,
+        max_result_bytes: 32,
+        ..ExecutionLimits::default()
+    };
+    let (executor, runtime) = harness(Arc::clone(&pools), limits).await;
+    let permit = runtime.acquire_query_permit().await.unwrap();
+
+    let query = authorized("SELECT repeat('a', 30) AS payload", Vec::new(), limits);
+    let error = run(&executor, &permit, &query).await.unwrap_err();
+    assert!(
+        matches!(error, ExecuteError::ResultTooLarge { limit: 32 }),
+        "{error:?}"
+    );
+
+    pools.close().await;
+}
+
+#[tokio::test]
+async fn a_truncated_result_is_ok_and_cancels_the_orphaned_query() {
+    let container = start_postgres().await;
+    let pools = Arc::new(
+        PostgreSqlConnectionPools::connect(config(dsn(&container).await))
+            .await
+            .unwrap(),
+    );
+    let limits = ExecutionLimits {
+        max_rows: 5,
+        ..ExecutionLimits::default()
+    };
+    let (executor, runtime) = harness(Arc::clone(&pools), limits).await;
+    let permit = runtime.acquire_query_permit().await.unwrap();
+
+    let query = authorized(SLOW_STREAM, Vec::new(), limits);
+    let activity_deadline = Instant::now() + SERVER_OBSERVATION_TIMEOUT;
+    let cleanup_deadline = activity_deadline + EXECUTOR_CLEANUP_BUDGET;
+    let call = tokio::time::timeout_at(
+        cleanup_deadline,
+        executor.execute_read_only(&query, &permit, deadline(), CancellationToken::new()),
+    );
+    let query_phase = async {
+        backend_running(&pools, "warden_orphan_marker", activity_deadline).await;
+        let cancellation_deadline = Instant::now() + SERVER_OBSERVATION_TIMEOUT;
+        wait_until_nothing_runs(&pools, "warden_orphan_marker", cancellation_deadline).await;
+    };
+    let (outcome, ()) = tokio::join!(call, query_phase);
+    let result = outcome
+        .unwrap_or_else(|_| panic!("executor cleanup exceeded its aggregate budget"))
+        .unwrap();
+
+    // Truncation is a success, not a failure: the agent gets rows and is told to
+    // narrow the query (`docs/mcp.md` section 1.3).
+    assert_eq!(result.rows.len(), 5);
+    assert!(result.truncated);
+
+    pools.close().await;
+}
+
+#[tokio::test]
+async fn a_byte_truncated_result_cancels_the_orphaned_query_too() {
+    // The byte bound reaches the same `RowOutcome::Truncated` by a different route,
+    // and the cancel must fire on both. `docs/operations.md` section 6.2 records
+    // that "stopped reading early" is its own event, separate from success or
+    // failure.
+    let container = start_postgres().await;
+    let pools = Arc::new(
+        PostgreSqlConnectionPools::connect(config(dsn(&container).await))
+            .await
+            .unwrap(),
+    );
+    let limits = ExecutionLimits {
+        max_value_bytes: 4_096,
+        max_result_bytes: 4_096,
+        ..ExecutionLimits::default()
+    };
+    let (executor, runtime) = harness(Arc::clone(&pools), limits).await;
+    let permit = runtime.acquire_query_permit().await.unwrap();
+
+    let query = authorized(SLOW_STREAM, Vec::new(), limits);
+    let activity_deadline = Instant::now() + SERVER_OBSERVATION_TIMEOUT;
+    let cleanup_deadline = activity_deadline + EXECUTOR_CLEANUP_BUDGET;
+    let call = tokio::time::timeout_at(
+        cleanup_deadline,
+        executor.execute_read_only(&query, &permit, deadline(), CancellationToken::new()),
+    );
+    let query_phase = async {
+        backend_running(&pools, "warden_orphan_marker", activity_deadline).await;
+        let cancellation_deadline = Instant::now() + SERVER_OBSERVATION_TIMEOUT;
+        wait_until_nothing_runs(&pools, "warden_orphan_marker", cancellation_deadline).await;
+    };
+    let (outcome, ()) = tokio::join!(call, query_phase);
+    let result = outcome
+        .unwrap_or_else(|_| panic!("executor cleanup exceeded its aggregate budget"))
+        .unwrap();
+    assert!(result.truncated);
+    assert!(!result.rows.is_empty());
+
+    pools.close().await;
+}
+
+#[tokio::test]
+async fn a_mid_stream_value_too_large_cancels_the_orphaned_query() {
+    // The failure path's cancel, which is unconditional rather than limited to a
+    // timeout or a cancellation: a budget failure discovered mid-stream leaves rows
+    // in flight exactly as a truncation does.
+    let container = start_postgres().await;
+    let pools = Arc::new(
+        PostgreSqlConnectionPools::connect(config(dsn(&container).await))
+            .await
+            .unwrap(),
+    );
+    let limits = ExecutionLimits {
+        max_value_bytes: 4_096,
+        ..ExecutionLimits::default()
+    };
+    let (executor, runtime) = harness(Arc::clone(&pools), limits).await;
+    let permit = runtime.acquire_query_permit().await.unwrap();
+
+    // Row 1 is stored and large enough to flush promptly; row 2 exceeds the
+    // per-value budget, so the call fails partway through a stream the server is
+    // still writing.
+    let query = authorized(
+        "SELECT CASE WHEN i = 1 THEN repeat('s', 2048) ELSE repeat('a', 8192) END \
+         AS warden_orphan_marker FROM generate_series(1, 100000) i \
+         CROSS JOIN LATERAL (SELECT pg_sleep(0.05) WHERE i IS NOT NULL) AS delayed",
+        Vec::new(),
+        limits,
+    );
+    let activity_deadline = Instant::now() + SERVER_OBSERVATION_TIMEOUT;
+    let cleanup_deadline = activity_deadline + EXECUTOR_CLEANUP_BUDGET;
+    let call = tokio::time::timeout_at(
+        cleanup_deadline,
+        executor.execute_read_only(&query, &permit, deadline(), CancellationToken::new()),
+    );
+    let query_phase = async {
+        backend_running(&pools, "warden_orphan_marker", activity_deadline).await;
+        let cancellation_deadline = Instant::now() + SERVER_OBSERVATION_TIMEOUT;
+        wait_until_nothing_runs(&pools, "warden_orphan_marker", cancellation_deadline).await;
+    };
+    let (outcome, ()) = tokio::join!(call, query_phase);
+    let error = outcome
+        .unwrap_or_else(|_| panic!("executor cleanup exceeded its aggregate budget"))
+        .unwrap_err();
+    assert!(
+        matches!(error, ExecuteError::ResultTooLarge { .. }),
+        "{error:?}"
+    );
+
+    pools.close().await;
+}
+
+#[tokio::test]
+async fn a_complete_result_leaves_the_connection_immediately_reusable() {
+    // The negative of the three tests above. PostgreSQL offers no counter that says
+    // "no cancel was sent", so the property is asserted where it would actually
+    // break: a spurious `pg_cancel_backend` racing the `ROLLBACK` would abort the
+    // transaction and surface on the very next statement over the same pool.
+    let container = start_postgres().await;
+    let pools = Arc::new(
+        PostgreSqlConnectionPools::connect(config(dsn(&container).await))
+            .await
+            .unwrap(),
+    );
+    let (executor, runtime) = harness(Arc::clone(&pools), ExecutionLimits::default()).await;
+    let permit = runtime.acquire_query_permit().await.unwrap();
+
+    for _ in 0..10 {
+        let query = authorized(
+            "SELECT i FROM generate_series(1, 20) i",
+            Vec::new(),
+            ExecutionLimits::default(),
+        );
+        let result = run(&executor, &permit, &query).await.unwrap();
+        assert_eq!(result.rows.len(), 20);
+        assert!(!result.truncated);
+    }
+    pools
+        .health_check(Instant::now() + Duration::from_secs(5))
+        .await
+        .unwrap();
 
     pools.close().await;
 }
