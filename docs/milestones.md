@@ -214,12 +214,12 @@ that the supposedly generic core was secretly shaped around MySQL.
 - [x] Unknown functions are denied by default
 - [x] MySQL file access and output are denied
 - [x] PostgreSQL sequence mutation is denied
-- [ ] Dedicated test roles demonstrably cannot write
-- [ ] Read-only transactions are verified
-- [ ] Every query has client-side **and** server-side deadlines
-- [ ] Rows, bytes per value, and total bytes are bounded
-- [ ] Queue wait is bounded with `server_busy`
-- [ ] Concurrency per connection is bounded
+- [x] Dedicated test roles demonstrably cannot write (MySQL; PostgreSQL is M8)
+- [x] Read-only transactions are verified (MySQL; PostgreSQL is M8)
+- [x] Every query has client-side **and** server-side deadlines (MySQL; PostgreSQL is M8)
+- [x] Rows, bytes per value, and total bytes are bounded (MySQL; PostgreSQL is M8)
+- [x] Queue wait is bounded with `server_busy` (MySQL; PostgreSQL is M8)
+- [x] Concurrency per connection is bounded (MySQL; PostgreSQL is M8)
 - [ ] Schema search and description work on both engines with object policy
 - [ ] Non-executing `EXPLAIN` works on both engines with reparse verification
 - [ ] MCP over stdio exposes generic tools with annotations and output schemas

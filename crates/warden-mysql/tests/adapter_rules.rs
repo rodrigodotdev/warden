@@ -14,7 +14,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// The only files allowed to declare a `pub` item. Everything else is internal.
-const PUBLIC_FILES: &[&str] = &["lib.rs", "analyzer.rs", "connection.rs", "error.rs"];
+const PUBLIC_FILES: &[&str] = &[
+    "lib.rs",
+    "analyzer.rs",
+    "connection.rs",
+    "error.rs",
+    "execute.rs",
+];
 
 /// Type names that would carry a parser AST across the crate boundary.
 const AST_TYPES: &[&str] = &[
@@ -611,6 +617,91 @@ fn no_wildcard_arm_matches_a_warden_core_security_enum() {
          Adding a variant there must break this crate's build, not slip through a \
          wildcard (ADR-0021).",
         violations.join("\n")
+    );
+}
+
+/// Calls that would read a whole result into memory before any bound applied.
+const BUFFERING_FETCHES: &[&str] = &["fetch_all(", "fetch_one(", "fetch_optional("];
+
+#[test]
+fn agent_sql_is_never_read_into_memory_before_it_is_bounded() {
+    // `docs/operations.md` section 6.6: the row, value, and byte budgets apply while
+    // rows arrive. A buffering call spends the memory first and truncates afterwards,
+    // and the difference is invisible in a passing functional test.
+    //
+    // `execute.rs` is scanned rather than the whole crate because Warden's own static
+    // SQL — the health check, `SELECT CONNECTION_ID()` — is finite and single-row, so
+    // `fetch_one` is correct there and wrong only for agent SQL.
+    //
+    // The ban applies to the whole file rather than only a line that also names
+    // `bind::statement`: rustfmt can wrap a long call onto its own line, at which
+    // point a same-line check matches nothing and the ban silently stops applying —
+    // including against a second `.fetch(` a future change (Milestone 10's EXPLAIN
+    // path, say) could add. `CONNECTION_ID` is the exemption instead: it is the one
+    // legitimate buffering call in this file, and the line that makes it,
+    // `sqlx::query_scalar("SELECT CONNECTION_ID()").fetch_one(...)`, names
+    // `CONNECTION_ID` on the very line that buffers, which is self-documenting in a
+    // way a line-proximity heuristic against agent SQL is not.
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/execute.rs");
+    let mut streams = false;
+    for (number, line) in code_lines(&path) {
+        for buffering in BUFFERING_FETCHES {
+            assert!(
+                !(line.contains(buffering) && !line.contains("CONNECTION_ID")),
+                "src/execute.rs:{number} buffers a result with {buffering}"
+            );
+        }
+        streams |= line.contains(".fetch(");
+    }
+    assert!(
+        streams,
+        "src/execute.rs never calls `.fetch`, so the ban above passed on an absence"
+    );
+}
+
+#[test]
+fn the_only_format_in_execute_rs_builds_a_kill_query() {
+    // `docs/operations.md` section 6.3: SQLx bind APIs only, never `format!` into a
+    // statement, because an interpolated value can carry agent-controlled content.
+    // `kill`'s `KILL QUERY {connection_id}` is the one audited exception: against a
+    // real server, a *bound* `KILL QUERY ?` does not merely fail to decode — it
+    // does not kill anything. `sqlx` 0.9.0's MySQL driver cannot decode the
+    // response, confirmed against a container, not assumed:
+    // `Err(Protocol("unknown column type 0xf3 ..."))`, `Com_kill` never
+    // increments, and the target query runs to completion; the literal form is
+    // what actually kills. `kill` interpolates instead, and that is safe only
+    // because `connection_id` is typed `u64` at the call site: its formatted form
+    // is always `[0-9]+`, with no injection surface by construction. The type is
+    // the guarantee; that the value is also server-sourced, from Warden's own
+    // `SELECT CONNECTION_ID()`, only explains why it is correct, not why it cannot
+    // be an injection. A second `format!` in this file needs its own review rather
+    // than inheriting this exemption — which is what this test enforces, by
+    // failing the moment a second one appears without also naming `KILL QUERY`.
+    //
+    // Scoped to `src/execute.rs` only, deliberately not `src/container_tests/`:
+    // those files are `#[cfg(all(test, feature = "docker"))]`, every statement they
+    // build with `format!` is Warden-authored fixture DDL and test data (table
+    // definitions, `REPEAT('a', n)` payloads, row counts), and no agent input ever
+    // reaches them. Widening this guard to cover them would fire on exactly that
+    // legitimate fixture-building code — see `wide_fixture`'s
+    // `format!("({id}, REPEAT('a', {payload_bytes}))")` in
+    // `src/container_tests/execution.rs` — and the fix for a false positive there
+    // would be to loosen this guard, not to keep it. Leave the scope as it is.
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/execute.rs");
+    let mut found = false;
+    for (number, line) in code_lines(&path) {
+        if line.contains("format!") {
+            assert!(
+                line.contains("KILL QUERY"),
+                "src/execute.rs:{number} interpolates with format! outside the \
+                 audited KILL QUERY exception"
+            );
+            found = true;
+        }
+    }
+    assert!(
+        found,
+        "src/execute.rs never calls format!, so the guard above passed on an absence"
     );
 }
 

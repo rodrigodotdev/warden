@@ -11,6 +11,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+mod execution;
+mod privileges;
+
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -108,6 +111,17 @@ impl Drop for TemporaryCertificate {
 
 fn deadline() -> Instant {
     Instant::now() + Duration::from_secs(10)
+}
+
+/// The TLS settings both submodules use.
+///
+/// Certificate verification has its own tests above; execution and privilege tests
+/// only need the handshake to happen.
+fn tls() -> TlsSettings {
+    TlsSettings {
+        mode: TlsMode::Required,
+        root_certificate: None,
+    }
 }
 
 #[tokio::test]

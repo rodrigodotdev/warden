@@ -4,11 +4,14 @@
 //! column names are legal SQL, so rows are positional and metadata is separate
 //! (`docs/data-model.md` section 8).
 
+use std::time::Duration;
+
 use serde::ser::{Serialize, SerializeSeq, Serializer};
 
 use crate::MAX_EXACT_JSON_INTEGER;
 use crate::dialect::Dialect;
 use crate::error::{PublicError, PublicErrorCode};
+use crate::limits::ExecutionLimits;
 
 /// The deepest accepted [`ResultValue::Array`] nesting.
 ///
@@ -52,7 +55,8 @@ pub enum NormalizationError {
     /// (`docs/data-model.md` section 8.1, rules 4 and 5).
     #[error(
         "column {column:?} uses unsupported {dialect} type {database_type:?}; \
-         cast it explicitly, for example: {column}::text"
+         cast it explicitly, for example: {}",
+        cast_example(.dialect, .column)
     )]
     UnsupportedType {
         /// The offending column.
@@ -68,6 +72,12 @@ impl PublicError for NormalizationError {
     fn public_code(&self) -> PublicErrorCode {
         PublicErrorCode::QueryNormalizationError
     }
+}
+
+/// Indirection for the `#[error]` attribute, which takes field references but is
+/// clearer with a named call than with a method chain inside a format argument.
+fn cast_example(dialect: &Dialect, column: &str) -> String {
+    dialect.text_cast_example(column)
 }
 
 /// One column's metadata.
@@ -128,26 +138,36 @@ impl ResultSet {
     /// response shape.
     pub fn validate(&self) -> Result<(), NormalizationError> {
         for (index, row) in self.rows.iter().enumerate() {
-            if row.len() != self.columns.len() {
-                return Err(NormalizationError::RowWidthMismatch {
-                    row: index,
-                    expected: self.columns.len(),
-                    actual: row.len(),
-                });
-            }
-            for (value, column) in row.iter().zip(&self.columns) {
-                value.validate_depth()?;
-                if let ResultValue::F64(number) = value
-                    && !number.is_finite()
-                {
-                    return Err(NormalizationError::NonFiniteFloat {
-                        column: column.name.clone(),
-                    });
-                }
-            }
+            check_row(index, row, &self.columns)?;
         }
         Ok(())
     }
+}
+
+/// The three invariants every row must satisfy, wherever it came from.
+fn check_row(
+    index: usize,
+    row: &[ResultValue],
+    columns: &[ResultColumn],
+) -> Result<(), NormalizationError> {
+    if row.len() != columns.len() {
+        return Err(NormalizationError::RowWidthMismatch {
+            row: index,
+            expected: columns.len(),
+            actual: row.len(),
+        });
+    }
+    for (value, column) in row.iter().zip(columns) {
+        value.validate_depth()?;
+        if let ResultValue::F64(number) = value
+            && !number.is_finite()
+        {
+            return Err(NormalizationError::NonFiniteFloat {
+                column: column.name.clone(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// One normalized cell.
@@ -213,6 +233,127 @@ impl ResultValue {
         }
         Ok(())
     }
+
+    /// The exact length of this value's JSON encoding, in bytes.
+    ///
+    /// The byte budgets of `docs/data-model.md` section 7 bound what reaches model
+    /// context, which is JSON, so this counts the encoded form rather than the Rust
+    /// one. It is computed instead of serialized because measuring a 64 KiB value by
+    /// copying it is the allocation the budget exists to avoid, and because an
+    /// approximation that ignored escaping would let a value made entirely of quote
+    /// characters occupy twice the budget it was checked against.
+    ///
+    /// The walk is iterative for the same reason [`ResultValue::validate_depth`] is:
+    /// recursing over a hostile value is the stack overflow that
+    /// SPEC section 6, invariant 31 forbids.
+    #[must_use]
+    pub fn json_bytes(&self) -> usize {
+        let mut total = 0usize;
+        let mut stack = vec![self];
+        while let Some(value) = stack.pop() {
+            total = total.saturating_add(match value {
+                Self::Array(items) => {
+                    stack.extend(items.iter());
+                    // Two brackets and one comma between neighbours.
+                    2 + items.len().saturating_sub(1)
+                }
+                scalar => scalar.scalar_json_bytes(),
+            });
+        }
+        total
+    }
+
+    /// The encoded length of everything except an array.
+    fn scalar_json_bytes(&self) -> usize {
+        match self {
+            Self::Null => 4,
+            Self::Bool(true) => 4,
+            Self::Bool(false) => 5,
+            // The same predicate `Serialize` uses, so the count matches the bytes.
+            Self::I64(value) => integer_bytes(value.unsigned_abs(), *value < 0),
+            Self::U64(value) => integer_bytes(*value, false),
+            // `serde_json::Number` formats an f64 with the same `ryu` encoding the
+            // serializer uses, so this is exact rather than an upper bound. A
+            // non-finite float has no `Number` and serializes as `null`, which
+            // `ResultSet::validate` rejects before it can be returned anyway.
+            Self::F64(value) => {
+                serde_json::Number::from_f64(*value).map_or(4, |number| number.to_string().len())
+            }
+            Self::Decimal(text)
+            | Self::String(text)
+            | Self::BytesBase64(text)
+            | Self::Date(text)
+            | Self::Time(text)
+            | Self::DateTime(text)
+            | Self::Uuid(text) => json_string_bytes(text),
+            Self::Json(document) => json_value_bytes(document),
+            // Unreachable from `json_bytes`, which handles arrays on its own stack.
+            Self::Array(items) => 2 + items.len().saturating_sub(1),
+        }
+    }
+}
+
+/// Digits in the decimal form of `value`, at least one.
+fn decimal_digits(value: u64) -> usize {
+    let mut digits = 1;
+    let mut remaining = value;
+    while remaining >= 10 {
+        remaining /= 10;
+        digits += 1;
+    }
+    digits
+}
+
+/// The encoded length of an integer, quoted above 2^53.
+fn integer_bytes(magnitude: u64, negative: bool) -> usize {
+    let digits = decimal_digits(magnitude) + usize::from(negative);
+    if magnitude > MAX_EXACT_JSON_INTEGER {
+        digits + 2
+    } else {
+        digits
+    }
+}
+
+/// The encoded length of a JSON string, including quotes and `serde_json`'s escapes.
+fn json_string_bytes(text: &str) -> usize {
+    let mut bytes = 2;
+    for character in text.chars() {
+        bytes += match character {
+            '"' | '\\' | '\n' | '\r' | '\t' | '\u{08}' | '\u{0c}' => 2,
+            control if control < '\u{20}' => 6,
+            other => other.len_utf8(),
+        };
+    }
+    bytes
+}
+
+/// The encoded length of a JSON document, walked iteratively.
+fn json_value_bytes(document: &serde_json::Value) -> usize {
+    let mut total = 0usize;
+    let mut stack = vec![document];
+    while let Some(value) = stack.pop() {
+        total = total.saturating_add(match value {
+            serde_json::Value::Null => 4,
+            serde_json::Value::Bool(true) => 4,
+            serde_json::Value::Bool(false) => 5,
+            serde_json::Value::Number(number) => number.to_string().len(),
+            serde_json::Value::String(text) => json_string_bytes(text),
+            serde_json::Value::Array(items) => {
+                stack.extend(items.iter());
+                2 + items.len().saturating_sub(1)
+            }
+            serde_json::Value::Object(entries) => {
+                stack.extend(entries.values());
+                // Braces, the commas between entries, and each `"key":`.
+                2 + entries.len().saturating_sub(1)
+                    + entries
+                        .keys()
+                        .map(|key| json_string_bytes(key) + 1)
+                        .sum::<usize>()
+            }
+        });
+    }
+    total
 }
 
 /// Integers outside ±2^53 serialize as strings.
@@ -260,6 +401,139 @@ impl Serialize for ResultValue {
     }
 }
 
+/// A row that could not be added to a result.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ResultBuildError {
+    /// The row was not a valid normalized row.
+    #[error(transparent)]
+    Normalization(#[from] NormalizationError),
+    /// One value exceeded `max_value_bytes`.
+    ///
+    /// An error rather than a substitution: [`ResultValue`] has no "omitted"
+    /// variant, and inventing one would put a value in the agent's context that the
+    /// database never returned (`docs/data-model.md` section 7).
+    #[error("value in column {column:?} is {actual} bytes; the maximum is {limit}")]
+    ValueTooLarge {
+        /// The offending column.
+        column: String,
+        /// The value's encoded size.
+        actual: usize,
+        /// The configured per-value budget.
+        limit: usize,
+    },
+    /// The first row alone exceeded `max_result_bytes`, so nothing can be returned.
+    #[error("the first row is {actual} bytes; the result budget is {limit}")]
+    ResultTooLarge {
+        /// The row's encoded size.
+        actual: usize,
+        /// The configured total budget.
+        limit: usize,
+    },
+}
+
+/// Whether the caller should keep reading rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RowOutcome {
+    /// The row was stored; keep reading.
+    Accepted,
+    /// A bound was reached; stop reading and return what is here.
+    Truncated,
+}
+
+/// A result assembled under its row, value, and byte budgets.
+///
+/// The budgets apply while rows arrive, never afterwards: `docs/operations.md`
+/// section 6.6 forbids building an unbounded response and truncating it, because the
+/// memory is already spent by then.
+#[derive(Debug)]
+pub struct ResultBuilder {
+    columns: Vec<ResultColumn>,
+    rows: Vec<Vec<ResultValue>>,
+    limits: ExecutionLimits,
+    bytes: usize,
+    truncated: bool,
+}
+
+impl ResultBuilder {
+    /// Starts a result with the given column metadata and bounds.
+    #[must_use]
+    pub fn new(columns: Vec<ResultColumn>, limits: ExecutionLimits) -> Self {
+        Self {
+            columns,
+            rows: Vec::new(),
+            limits,
+            bytes: 0,
+            truncated: false,
+        }
+    }
+
+    /// The column metadata every row is checked against.
+    #[must_use]
+    pub fn columns(&self) -> &[ResultColumn] {
+        &self.columns
+    }
+
+    /// Adds one row, or reports that a bound stopped the result here.
+    pub fn push_row(&mut self, row: Vec<ResultValue>) -> Result<RowOutcome, ResultBuildError> {
+        // The `max_rows + 1`-th row is read only to learn that it exists
+        // (`docs/operations.md` section 6.5) and is never stored.
+        if self.rows.len() >= self.limits.max_rows {
+            self.truncated = true;
+            return Ok(RowOutcome::Truncated);
+        }
+        check_row(self.rows.len(), &row, &self.columns)?;
+
+        let mut row_bytes = 2 + row.len().saturating_sub(1);
+        for (value, column) in row.iter().zip(&self.columns) {
+            let value_bytes = value.json_bytes();
+            if value_bytes > self.limits.max_value_bytes {
+                return Err(ResultBuildError::ValueTooLarge {
+                    column: column.name.clone(),
+                    actual: value_bytes,
+                    limit: self.limits.max_value_bytes,
+                });
+            }
+            row_bytes = row_bytes.saturating_add(value_bytes);
+        }
+
+        let total = self.bytes.saturating_add(row_bytes);
+        if total > self.limits.max_result_bytes {
+            if self.rows.is_empty() {
+                // Truncating to zero rows would report success for a result the
+                // agent never received any of.
+                return Err(ResultBuildError::ResultTooLarge {
+                    actual: row_bytes,
+                    limit: self.limits.max_result_bytes,
+                });
+            }
+            self.truncated = true;
+            return Ok(RowOutcome::Truncated);
+        }
+
+        self.bytes = total;
+        self.rows.push(row);
+        Ok(RowOutcome::Accepted)
+    }
+
+    /// Finishes the result and records how long the execution took.
+    ///
+    /// `stats.bytes` is the sum of the stored rows' encodings; it does not include
+    /// the column metadata, which is not part of what the budget bounds.
+    #[must_use]
+    pub fn finish(self, duration: Duration) -> ResultSet {
+        ResultSet {
+            stats: QueryStats {
+                rows_returned: self.rows.len(),
+                bytes: self.bytes,
+                duration,
+            },
+            columns: self.columns,
+            rows: self.rows,
+            truncated: self.truncated,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -283,6 +557,18 @@ mod tests {
                 duration: Duration::from_millis(1234),
             },
         }
+    }
+
+    fn columns() -> Vec<ResultColumn> {
+        vec![ResultColumn {
+            name: "value".to_owned(),
+            database_type: "TEXT".to_owned(),
+            nullable: Some(false),
+        }]
+    }
+
+    fn row(n: usize) -> Vec<ResultValue> {
+        vec![ResultValue::String("x".repeat(n))]
     }
 
     #[test]
@@ -399,6 +685,116 @@ mod tests {
         assert_eq!(
             error.public_code(),
             PublicErrorCode::QueryNormalizationError
+        );
+
+        let mysql_error = NormalizationError::UnsupportedType {
+            column: "custom_state".to_owned(),
+            dialect: Dialect::MySql,
+            database_type: "order_state".to_owned(),
+        };
+        let mysql_rendered = mysql_error.to_string();
+        assert!(mysql_rendered.contains("order_state"), "{mysql_rendered}");
+        assert!(
+            mysql_rendered.contains("CAST(custom_state AS CHAR)"),
+            "{mysql_rendered}"
+        );
+    }
+
+    #[test]
+    fn the_byte_count_is_the_serializers_own_length() {
+        let values = vec![
+            ResultValue::Null,
+            ResultValue::Bool(true),
+            ResultValue::Bool(false),
+            ResultValue::I64(0),
+            ResultValue::I64(-7),
+            ResultValue::I64(9_007_199_254_740_992),
+            ResultValue::I64(9_007_199_254_740_993),
+            ResultValue::I64(i64::MIN),
+            ResultValue::U64(u64::MAX),
+            ResultValue::F64(1.5),
+            ResultValue::F64(1e30),
+            ResultValue::F64(-0.000_001),
+            ResultValue::String(String::new()),
+            ResultValue::String("plain".to_owned()),
+            ResultValue::String("quote\" back\\ tab\t".to_owned()),
+            ResultValue::String("control\u{01}".to_owned()),
+            ResultValue::String("emoji \u{1f512}".to_owned()),
+            ResultValue::Decimal("0.1000000000000000001".to_owned()),
+            ResultValue::Json(serde_json::json!({"a": [1, 2.5, null], "b\"": "c"})),
+            ResultValue::array(vec![
+                ResultValue::I64(1),
+                ResultValue::array(vec![ResultValue::String("x".to_owned())]).unwrap(),
+            ])
+            .unwrap(),
+        ];
+        for value in values {
+            assert_eq!(
+                value.json_bytes(),
+                serde_json::to_string(&value).unwrap().len(),
+                "{value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn rows_stop_at_max_rows_and_the_extra_row_is_not_stored() {
+        let limits = ExecutionLimits {
+            max_rows: 2,
+            ..ExecutionLimits::default()
+        };
+        let mut builder = ResultBuilder::new(columns(), limits);
+        for _ in 0..2 {
+            assert_eq!(builder.push_row(row(1)).unwrap(), RowOutcome::Accepted);
+        }
+        assert_eq!(builder.push_row(row(1)).unwrap(), RowOutcome::Truncated);
+
+        let result = builder.finish(Duration::from_millis(1));
+        assert_eq!(result.rows.len(), 2);
+        assert!(result.truncated);
+        assert_eq!(result.stats.rows_returned, 2);
+        result.validate().unwrap();
+    }
+
+    #[test]
+    fn a_value_over_its_budget_is_an_error_and_never_a_substitution() {
+        let limits = ExecutionLimits {
+            max_value_bytes: 16,
+            ..ExecutionLimits::default()
+        };
+        let mut builder = ResultBuilder::new(columns(), limits);
+        let error = builder
+            .push_row(vec![ResultValue::String("x".repeat(64))])
+            .unwrap_err();
+        assert!(
+            matches!(error, ResultBuildError::ValueTooLarge { limit: 16, .. }),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn the_total_budget_truncates_after_one_row_and_fails_before_any() {
+        // A budget that the second row cannot fit into truncates. `max_value_bytes`
+        // is set well above any row used here, so only `max_result_bytes` is under
+        // test: a 64-character string encodes to 66 JSON bytes (two quotes), which
+        // must stay under the per-value budget for the last case to exercise
+        // `ResultTooLarge` rather than `ValueTooLarge`.
+        let limits = ExecutionLimits {
+            max_value_bytes: 128,
+            max_result_bytes: 20,
+            ..ExecutionLimits::default()
+        };
+        let mut builder = ResultBuilder::new(columns(), limits);
+        assert_eq!(builder.push_row(row(8)).unwrap(), RowOutcome::Accepted);
+        assert_eq!(builder.push_row(row(8)).unwrap(), RowOutcome::Truncated);
+        assert!(builder.finish(Duration::ZERO).truncated);
+
+        // A budget the first row cannot fit into has nothing to truncate to.
+        let mut builder = ResultBuilder::new(columns(), limits);
+        let error = builder.push_row(row(64)).unwrap_err();
+        assert!(
+            matches!(error, ResultBuildError::ResultTooLarge { limit: 20, .. }),
+            "{error:?}"
         );
     }
 }

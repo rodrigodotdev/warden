@@ -1,17 +1,17 @@
-//! Warden's MySQL adapter: analysis and connections now, execution, inspection and
-//! explain in Milestones 7, 9 and 10.
+//! Warden's MySQL adapter: analysis, connections, and execution now, inspection and
+//! explain in Milestones 9 and 10.
 //!
 //! This crate may depend on `warden-core`, `warden-policy`, `warden-ports`, `sqlx`,
 //! and `sqlparser`, but never `rmcp`.
 //!
 //! # The AST stops here
 //!
-//! Every module below is private, and the crate exports four names: the analyzer,
-//! the two connection types, and their error. Their signatures name only
-//! `warden-core`, `warden-policy`, and `warden-ports` types, so no `sqlparser` type
-//! can appear in a public signature (SPEC section 6, invariant 28; ADR-0007).
+//! Every module below is private, and the crate exports five names: the analyzer,
+//! the executor, the two connection types, and their error. Their signatures name
+//! only `warden-core`, `warden-policy`, and `warden-ports` types, so no `sqlparser`
+//! type can appear in a public signature (SPEC section 6, invariant 28; ADR-0007).
 //! `tests/adapter_rules.rs` enforces that mechanically rather than by review, over
-//! the four files allowed to declare a `pub` item.
+//! the five files allowed to declare a `pub` item.
 //!
 //! # The driver stops here too
 //!
@@ -20,6 +20,8 @@
 //! public surface names no SQLx type at all. The composition root builds a pools
 //! value, passes it to the executor, and never depends on `sqlx` itself.
 //! `tests/adapter_rules.rs` enforces that the same way it enforces the AST rule.
+//! Normalization reads driver values and produces only `warden-core` types, so no
+//! `sqlx` type crosses out of that module either.
 //!
 //! # How analysis fails, and how it does not
 //!
@@ -41,10 +43,13 @@
 //! all (ADR-0021).
 
 mod analyzer;
+mod bind;
 mod connection;
 mod error;
+mod execute;
 mod fingerprint;
 mod functions;
+mod normalize;
 mod options;
 mod parse;
 mod pool;
@@ -58,3 +63,4 @@ mod container_tests;
 pub use analyzer::MySqlAnalyzer;
 pub use connection::{MySqlConnectionConfig, MySqlConnectionPools};
 pub use error::ConnectError;
+pub use execute::MySqlQueryExecutor;

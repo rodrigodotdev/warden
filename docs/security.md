@@ -24,11 +24,11 @@ control is accepted risk and must say so explicitly.
 
 | Threat | Controls | Test |
 |---|---|---|
-| Root DML | root-statement policy; read-only transaction; `default_transaction_read_only`; no-write `GRANT` | corpus + integration + privilege test |
+| Root DML | root-statement policy; read-only transaction; `default_transaction_read_only`; no-write `GRANT` | corpus + integration + privilege test (MySQL tested: `the_transaction_refuses_a_write_even_as_root`, `the_role_refuses_every_write_warden_never_sends`) |
 | DDL | same | same |
 | Write in a CTE (`DELETE ... RETURNING`) | recursive nested-statement analysis; read-only transaction; `GRANT` | PostgreSQL corpus |
 | `SELECT INTO` creating a table | `SELECT INTO` detection; no `CREATE` privilege | PostgreSQL corpus |
-| `INTO OUTFILE` / `DUMPFILE` | MySQL analyzer detection; no `FILE` privilege | MySQL corpus + privilege test |
+| `INTO OUTFILE` / `DUMPFILE` | MySQL analyzer detection; no `FILE` privilege | MySQL corpus + privilege test (MySQL tested: `file_access_is_refused_by_privileges_as_well_as_by_policy`) |
 | Function with side effects | function classification and default deny; restricted `GRANT EXECUTE` | corpus + integration |
 | Sequence mutation | `nextval`/`setval` detection; read-only transaction, which PostgreSQL rejects | corpus + PostgreSQL integration |
 | Session or user-variable mutation | session-mutation policy; pool hooks restore state | corpus + connection-reuse test |
@@ -39,7 +39,7 @@ control is accepted risk and must say so explicitly.
 | Expensive regex | server timeout; concurrency limit | load |
 | Recursive query | server timeout; row limit | integration |
 | Excessive concurrency | per-connection semaphore; `max_queue_wait`; pool limit | concurrency test |
-| Massive result | `max_rows`, `max_value_bytes`, `max_result_bytes`; incremental streaming | integration |
+| Massive result | `max_rows`, `max_value_bytes`, `max_result_bytes`; incremental streaming | integration (MySQL tested: `a_row_truncated_result_is_ok_and_kills_the_orphaned_query`, `a_byte_truncated_result_is_ok_and_kills_the_orphaned_query`, `a_complete_result_fires_no_kill`) |
 | Deeply nested SQL causing stack overflow | sqlparser `recursive-protection`; explicit `with_recursion_limit`; input-size limit | fuzz |
 | Read from a forbidden table | role's **`GRANT SELECT`** is the real boundary; allowlist reduces attack surface | privilege test |
 | Read through a view that bypasses the allowlist | role `GRANT`; allowlist explicitly is not a boundary | privilege test + documentation |
@@ -571,11 +571,11 @@ isolated.
 - [ ] PostgreSQL sequence mutation is tested
 - [ ] PostgreSQL locking tests exist
 - [ ] `EXPLAIN` cannot select `ANALYZE`
-- [ ] Real-database timeouts cover client and server
-- [ ] Semaphore and `max_queue_wait` are tested
-- [ ] Per-value and total-byte limits are tested
-- [ ] Pool reuse after cancellation is tested
-- [ ] Database-role write rejection is tested
+- [x] Real-database timeouts cover client and server (MySQL only; PostgreSQL is M8)
+- [x] Semaphore and `max_queue_wait` are tested (MySQL only; PostgreSQL is M8)
+- [x] Per-value and total-byte limits are tested (MySQL only; PostgreSQL is M8)
+- [x] Pool reuse after cancellation is tested (MySQL only; PostgreSQL is M8)
+- [x] Database-role write rejection is tested (MySQL only; PostgreSQL is M8)
 - [ ] MCP error sanitization is tested
 - [ ] Fail-closed audit attempts are tested
 - [ ] HTTP authorization is tested before publishing remote-production guidance

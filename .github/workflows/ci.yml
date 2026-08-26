@@ -71,11 +71,29 @@ jobs:
         with:
           shared-key: docker
 
+      # `--test-threads=4` bounds how many testcontainers this job starts at once.
+      # `warden-mysql` is where this was measured (docs/testing.md, "Milestone 7
+      # measured a limit on that job's own concurrency"): its container tests grew
+      # from 9 to 35 across this milestone, and letting `cargo test` use the
+      # runner's full default thread count launched that many MySQL 8.4 containers
+      # simultaneously, exhausting Docker and host resources for spurious
+      # `PoolTimedOut` failures unrelated to the code under test. The same flag is
+      # applied to the other two crates in this step for consistency, since they
+      # share this job's Docker daemon and host resources and the identical
+      # one-container-per-test pattern — not because either has hit the limit yet.
+      # timeout-minutes: 40 was checked against this milestone's growth, not left
+      # untouched by oversight. Locally, `warden-mysql`'s full suite (121 tests, 37
+      # of them container tests) finishes in about two minutes wall-clock at
+      # `--test-threads=4` with an unthrottled Docker daemon; `warden-tracer` and
+      # `warden-postgres` run far fewer container tests each. Even a CI runner many
+      # times slower stays comfortably inside 40 minutes, so this budget is
+      # unchanged — unlike the coverage job below, which runs the same containers
+      # serially under LLVM instrumentation and needed a real increase.
       - name: Integration tests (Testcontainers)
         run: |
-          cargo test -p warden-tracer --features docker -- --nocapture
-          cargo test -p warden-mysql --features docker -- --nocapture
-          cargo test -p warden-postgres --features docker -- --nocapture
+          cargo test -p warden-tracer --features docker -- --test-threads=4 --nocapture
+          cargo test -p warden-mysql --features docker -- --test-threads=4 --nocapture
+          cargo test -p warden-postgres --features docker -- --test-threads=4 --nocapture
         timeout-minutes: 40
 
   msrv:
@@ -142,9 +160,17 @@ jobs:
       # missing test. GitHub-hosted runners provide a Docker daemon, which the
       # `docker` job above already relies on. LLVM instrumentation makes concurrent
       # PostgreSQL container startup intermittently exceed the 3s pool acquire limit;
-      # serialize only this coverage collection. The dedicated Docker gate remains
-      # parallel and validates the normal test mode separately.
+      # serialize only this coverage collection. The dedicated Docker gate above runs
+      # the same suite at `--test-threads=4` instead of this job's `--test-threads=1`,
+      # so it validates normal, bounded-concurrency test mode separately.
+      #
+      # `warden-mysql` alone starts 35 MySQL 8.4 containers across this job's serial,
+      # LLVM-instrumented run, up from 9 before Milestone 7. A full local
+      # `cargo llvm-cov --workspace --all-features -- --test-threads=1` run on
+      # comparable hardware finished in roughly 45 minutes; a hosted runner is
+      # typically slower, so the timeout below is set well above that, not at it, to
+      # avoid trading a real regression for a flaky-timeout regression.
       - run: cargo llvm-cov --workspace --all-features --no-report -- --test-threads=1
-        timeout-minutes: 40
+        timeout-minutes: 70
       - run: cargo llvm-cov report --workspace --html --output-dir coverage
       - run: cargo llvm-cov report --workspace --summary-only --fail-under-lines 95

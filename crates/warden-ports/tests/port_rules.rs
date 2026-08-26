@@ -193,6 +193,28 @@ fn every_port_and_method_is_documented_in_the_architecture() {
 }
 
 #[test]
+fn every_port_that_runs_a_query_takes_a_concurrency_permit() {
+    // The two ports that run work on the server. `SchemaInspector` is deliberately
+    // absent: it runs Warden's own static SQL on `control_pool`, which the
+    // connection's query bound does not govern (ADR-0025).
+    for (file, name, method) in [
+        ("executor.rs", "QueryExecutor", "execute_read_only"),
+        ("explainer.rs", "Explainer", "explain"),
+    ] {
+        let declaration = trait_body(&read(file), name).join(" ");
+        assert!(
+            declaration.contains(&format!("fn {method}")),
+            "{name} does not declare {method}"
+        );
+        assert!(
+            declaration.contains("permit: &'a QueryPermit"),
+            "{name}::{method} takes no permit, so SPEC section 6, invariant 17 is a \
+             convention again (ADR-0032)"
+        );
+    }
+}
+
+#[test]
 fn an_audit_record_cannot_be_serialized() {
     let source = read("audit.rs");
     assert!(
@@ -271,6 +293,7 @@ impl QueryExecutor for Stub {
     fn execute_read_only<'a>(
         &'a self,
         _query: &'a AuthorizedQuery,
+        _permit: &'a QueryPermit,
         _deadline: Instant,
         _cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<ResultSet, ExecuteError>> {
@@ -302,6 +325,7 @@ impl Explainer for Stub {
     fn explain<'a>(
         &'a self,
         _query: &'a AuthorizedQuery,
+        _permit: &'a QueryPermit,
         _deadline: Instant,
         _cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<QueryPlan, ExplainError>> {

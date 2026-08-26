@@ -3063,13 +3063,18 @@ version = "0.1.0"
 name = "warden-mysql"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
+ "futures-util",
+ "serde_json",
  "sha2 0.11.0",
  "sqlparser",
  "sqlx",
  "syn 2.0.119",
  "testcontainers-modules",
  "thiserror",
+ "time",
  "tokio",
+ "tokio-util",
  "warden-core",
  "warden-policy",
  "warden-ports",

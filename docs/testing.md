@@ -75,8 +75,10 @@ Milestone 6 covers the connection itself: TLS handshake and private-CA verificat
 the server-side deadline on both pools, PostgreSQL's startup options reaching the
 server while a DSN that would relax them is refused, `default_transaction_read_only` refusing DDL outside any
 policy, statement-cache behaviour on both engines, the exact pool defaults under
-saturation, and readiness surviving a saturated agent pool. Milestones 7 and 8 add the
-query-level rows below.
+saturation, and readiness surviving a saturated agent pool. Milestone 7 adds MySQL's
+query-level rows below—read-only transactions, deadlines, cancellation, row/byte
+truncation, concurrency, and privilege rejection, each proven against a real
+container. PostgreSQL's equivalent rows remain Milestone 8 work.
 
 PostgreSQL's official container image serves no TLS certificate chain. Its M6 test
 therefore proves that required TLS refuses a cleartext downgrade, while MySQL's private
@@ -89,8 +91,18 @@ database role's write refusal, which remains M7 privilege-test work.
 Coverage uses `cargo llvm-cov --workspace --all-features --no-report --
 --test-threads=1`: all features include these container cases, while the serial test
 harness avoids intermittent PostgreSQL startup contention under LLVM instrumentation.
-The dedicated Docker gate remains parallel, so serial coverage does not mask normal
-container-test concurrency.
+The dedicated Docker gate (`docs/operations.md` section 12.2) is a separate CI job
+from coverage and does not inherit that `--test-threads=1`, so serial coverage does
+not mask normal container-test concurrency there.
+
+**Milestone 7 measured a limit on that job's own concurrency.** `warden-mysql`'s
+`docker`-gated unit tests each start their own MySQL testcontainer; run at Rust's
+default test-thread count (`std::thread::available_parallelism()`, not unbounded),
+that many simultaneous containers still exhaust Docker and host resources on a
+standard CI runner and produce spurious `PoolTimedOut` failures, not a defect in the
+tests themselves. This is host capacity, not test isolation, so the fix belongs in how
+the job invokes `cargo test`, not as a per-test workaround: the dedicated Docker job
+passes `--test-threads=4`, which removed the contention when measured.
 
 **MySQL:** connection; schema discovery; safe `SELECT`; parameter binding; read-only
 transaction; database user cannot write; Warden rejects writes before execution;

@@ -245,6 +245,19 @@ Exhaustion returns `server_busy`.
 Profiles can configure these limits. Startup validation rejects zero and invalid
 values.
 
+**`max_result_bytes` bounds `rows` only, not the total response.** `ResultBuilder`
+(section 8.1) accounts only for the stored rows' JSON encoding; `columns` metadata is
+not part of what it counts (`ResultBuilder::finish`'s own doc comment says so). What
+actually reaches model context is `rows + columns` together, so the real upper bound
+on one response is `max_result_bytes` plus whatever `columns` costs, uncapped. Worst
+case on MySQL: a `SELECT *` against a table wide enough to fit the 64 KiB SQL
+statement-size cap can carry roughly 4096 columns, and each contributes its name (up
+to 64 bytes), its `database_type` string, and JSON object overhead — on the order of
+0.5 MiB, against a 256 KiB row budget. This is deliberate, not a bug: bounding
+`columns` too would require truncating schema information rows have already made
+visible. Milestone 12 must design the MCP tool contract against this real combined
+bound, not against `max_result_bytes` alone.
+
 ## 8. Result model
 
 One JSON object per row is not a suitable canonical model because duplicate column
@@ -290,9 +303,23 @@ pub enum ResultValue {
 5. The error may suggest an explicit cast.
 6. **Emit integers outside ±2^53 as strings.** Most MCP clients use JavaScript and
    lose precision above that bound; silently returning a wrong `bigint` is unacceptable.
+   **Exception:** `ResultValue::Json` serializes the driver's own `serde_json::Value`
+   document as-is, so a large integer inside a MySQL `JSON` (or, from Milestone 8, a
+   PostgreSQL `jsonb`) column still reaches the client as a raw JSON number and can
+   round. Rule 6 is enforced for `I64`/`U64`, the columnar integer types; it is not
+   applied recursively inside a document value (`docs/open-questions.md` section 2).
 7. **Bound `Array` depth**, initially at 8. This recursive type could otherwise allow a
    deeply nested PostgreSQL array to overflow the stack during normalization or
    serialization, violating the fuzzing invariant.
+
+`QueryStats.bytes` is the exact length of the stored rows' JSON encoding, escaping
+included—not the driver's wire size, not an in-memory decoded size.
+`ResultValue::json_bytes` computes this figure directly, without producing the JSON
+text, so it always matches what `serde_json::to_string` would have written. This is
+the same quantity `max_result_bytes` and `max_value_bytes` bound, because what the
+budget protects is model context, and model context is spent on the JSON an agent
+actually receives, not on how the database or the driver represented the value
+internally.
 
 Example error:
 
@@ -303,9 +330,15 @@ Cast it explicitly, for example: custom_state::text
 
 ### 8.2 Types by adapter
 
-**MySQL:** NULL; signed and unsigned integers; floating point; `DECIMAL` preserved as
-a string; `CHAR`/`VARCHAR`/`TEXT`; binary/blob; `DATE`; `TIME`;
-`DATETIME`/`TIMESTAMP`; `JSON`; and semantically identifiable boolean types.
+**MySQL:** NULL; signed and unsigned integers, including `YEAR` (signed) and `BIT`
+(unsigned); floating point; `DECIMAL` preserved as a string; `CHAR`/`VARCHAR`/`TEXT`;
+binary/blob; `DATE`; `TIME`; `DATETIME`/`TIMESTAMP`; `JSON`; and semantically
+identifiable boolean types. `GEOMETRY` is not representable and fails safely with a
+cast suggestion, the same as an unrecognized PostgreSQL type. `ResultColumn::nullable`
+is always `None` on MySQL—the driver's column metadata does not report it—and a
+zero-row MySQL result carries no columns at all, because the driver exposes column
+definitions only through a row (section 8.1's normalization rules still apply; nothing
+about a column is invented to fill the gap).
 
 **PostgreSQL:** NULL; `bool`; `int2`/`int4`/`int8`; `float4`/`float8`; `NUMERIC`
 with preserved precision; `text`/`varchar`; `bytea`; `date`; `time`;

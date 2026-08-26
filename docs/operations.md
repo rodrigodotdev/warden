@@ -437,11 +437,43 @@ path.
 This matters because a client timeout during row streaming forces SQLx to discard the
 connection; repeated slow queries can drain a pool of five.
 
+**Milestone 7 measured the MySQL side of this ordering, and corrected a plan
+assumption in the process.** `SELECT SLEEP(n)` does not prove the server deadline: a
+real MySQL 8.4 server does not abort `SLEEP` when `MAX_EXECUTION_TIME` fires—`SLEEP`
+catches the interrupt internally and returns `1`. The container tests instead run a
+cross join with real per-row work under a two-second server deadline; it aborted at
+**2.05 seconds**, arriving at `MySqlQueryExecutor` as `ExecuteError::Timeout` with the
+connection returned to the pool intact. `SLEEP` is kept only where cancellation, not a
+deadline, is under test: a `KILL QUERY` (section 5.4) does terminate it.
+
+`deadline` bounds the query, not the call. On the truncation path, `MySqlQueryExecutor`
+issues a `KILL QUERY` under its own budget and then a `ROLLBACK` under its own budget,
+both after the query itself has already resolved (section 6.2), so total call latency
+can exceed the configured `deadline` by up to `KILL_TIMEOUT + ROLLBACK_TIMEOUT`—2s + 2s
+at today's constants. A caller enforcing its own aggregate request timeout needs to
+budget for that sum, not for `deadline` alone (Milestone 11).
+
 ### 5.4 Explicit cancellation
 
 `QueryExecutor::execute_read_only` accepts `deadline` and `CancellationToken` so the
 adapter can issue real cancellation—a PostgreSQL cancel request or MySQL `KILL QUERY`—
 instead of merely being dropped.
+
+**Milestone 7 measured MySQL's cancellation path.** It is `KILL QUERY <id>`, sent on
+`control_pool` rather than `agent_pool` because the connection running the target
+statement is busy and cannot be asked for its own id—`<id>` therefore costs one
+`SELECT CONNECTION_ID()` round trip at the start of every call, before the agent's
+statement begins (ADR-0025).
+
+`KILL` does **not** accept a bound parameter, which the plan left open. Against a real
+MySQL 8.4 container, `KILL QUERY ?` (and the `KILL ?` / `KILL CONNECTION ?` forms)
+never kill the target at all: `Com_kill` stays at zero and the statement runs to
+completion. sqlx 0.9.0 always sends a bound argument through the binary protocol, and
+its `protocol/text/column.rs` has no arm for the server's prepared-statement response
+column type (`0xf3`), so the client call fails to decode the response rather than
+merely failing to kill anything. `MySqlQueryExecutor::kill` therefore sends
+`KILL QUERY <id>` as an interpolated literal—the one audited exception to section
+6.3's bind-only rule, recorded there.
 
 ## 6. Execution
 
@@ -461,6 +493,13 @@ same on both backends. MySQL's read-only transaction is weaker than commonly ass
 it prevents table writes, not `SELECT ... INTO OUTFILE`, `GET_LOCK`, or `SLEEP`, which
 is why other layers remain necessary.
 
+**Milestone 7 measured this on MySQL 8.4.** With the connecting account as **root**—
+every privilege granted—an `INSERT` inside `START TRANSACTION READ ONLY` was still
+refused, with `ER_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION` (1792). The barrier is the
+session's own state, not the connecting role's grants: the dedicated `warden_ro`
+role's own refusal (`docs/security.md` section 3) is a second, independent barrier,
+not a restatement of this one.
+
 ### 6.2 Finalization
 
 Choose a consistent per-adapter strategy: rollback after a read, or commit if driver
@@ -468,6 +507,25 @@ semantics require it. There must be no semantic write.
 
 Test the strategy for pool reuse, cancellation, timeout, partial row consumption,
 normalization failure, and database errors.
+
+**MySQL's strategy, measured in Milestone 7.** MySQL streams a result with no cursor:
+once a query starts sending rows, sqlx will not send another command on that
+connection until every remaining row packet has been drained, whether or not Warden is
+still reading them. `MySqlQueryExecutor::run` treats "stopped reading early" as its
+own event, separate from success or failure:
+
+- On **success**, `ROLLBACK` runs under its own fresh budget, and its outcome—success,
+  timeout, or error—is discarded. A slow or failed rollback must never overwrite a
+  result that is already collected and already correct.
+- On **failure**, the transaction is dropped rather than rolled back explicitly:
+  dropping queues a `ROLLBACK` without awaiting it, because awaiting one on a
+  connection whose statement may still be running would hang.
+- A `KILL QUERY` (section 5.4) is issued whenever Warden stops reading a stream the
+  server may still be writing. That is not limited to timeouts and cancellations: a
+  **successful but truncated** result also has rows still in flight, and every
+  `ExecuteError` variant on the failure path does too. Container tests measure
+  `Com_kill` increasing on both truncation paths—the row bound and the byte bound—and
+  confirm that a complete, undrained result issues no kill at all.
 
 ### 6.3 Parameter binding
 
@@ -479,6 +537,13 @@ format!("SELECT ... WHERE id = '{}'", user_value)
 ```
 
 Use SQLx bind APIs. Adapters map `ParameterValue` variants to driver binds.
+
+The one audited exception is MySQL's cancellation path (section 5.4): `KILL QUERY`
+cannot be sent as a prepared statement, so `MySqlQueryExecutor::kill` interpolates a
+`u64` connection id read back from Warden's own `SELECT CONNECTION_ID()`. Its formatted
+form is always `[0-9]+`, so there is no injection surface by construction, whatever the
+value. `tests/adapter_rules.rs` pins `execute.rs` to exactly this one interpolation—a
+second `format!` there fails the test unless it also names `KILL QUERY`.
 
 ### 6.4 Dynamic queries
 
@@ -498,6 +563,17 @@ truncation and return `truncated: true`. **Do not rewrite arbitrary SQL merely t
 The row limit does not bound database work: a heavy aggregate with `ORDER BY` can do
 all its work first. Server timeouts and read replicas address that risk.
 
+**`warden_core::result::ResultBuilder` is the single place the row, per-value, and
+total-byte budgets are enforced, applied as each row arrives rather than after the
+fact** (section 6.6). `push_row` resolves to one of four outcomes: the row is stored
+and reading continues (`RowOutcome::Accepted`); the row-count bound is reached and the
+call returns `Ok` with `truncated: true`, storing nothing further
+(`RowOutcome::Truncated`); the byte bound is reached after at least one row is already
+stored, the same `Ok`/`truncated: true`/`Truncated`; or a single value exceeds
+`max_value_bytes`, or the first row alone exceeds `max_result_bytes`, and the call
+returns `Err` rather than truncate to a result the agent never actually received any
+of.
+
 ### 6.6 Byte limit
 
 Count bytes during normalization. When the budget is reached, stop collecting, mark
@@ -507,6 +583,10 @@ as driver correctness requires.
 **Never build an unbounded in-memory response and truncate afterward.** Consume SQLx
 rows incrementally. Version 0.x may return a bounded, buffered `ResultSet` through MCP;
 streaming and export are separate work.
+
+**On MySQL, "close the stream correctly" is `KILL QUERY`** (section 5.4), not merely
+dropping the connection: MySQL's no-cursor protocol keeps sending rows Warden has
+stopped reading, and section 6.2 records exactly when the kill fires.
 
 ## 7. Session hardening
 

@@ -12,6 +12,7 @@ use warden_policy::AuthorizedQuery;
 
 use crate::BoxFuture;
 use crate::error::ExecuteError;
+use crate::runtime::QueryPermit;
 
 /// Runs one authorized statement inside a read-only transaction.
 pub trait QueryExecutor: Send + Sync {
@@ -35,9 +36,19 @@ pub trait QueryExecutor: Send + Sync {
     /// adapter is responsible for enforcing them (SPEC section 6, invariants 14 and
     /// 15), not `ConnectionRuntime::limits()`, which describes the connection rather
     /// than this one authorized statement.
+    ///
+    /// `permit` is the connection's concurrency slot, and it is a parameter rather
+    /// than a caller's discipline. `ConnectionRuntime::executor()` hands this trait
+    /// object to anyone who asks, so without the parameter nothing stops a call that
+    /// never waited for a slot, and SPEC section 6, invariant 17 would hold only for
+    /// as long as every future call site remembered it (ADR-0032).
+    ///
+    /// It proves a permit exists; it does not prove the permit came from this
+    /// connection. ADR-0032 states that limit rather than implying more.
     fn execute_read_only<'a>(
         &'a self,
         query: &'a AuthorizedQuery,
+        permit: &'a QueryPermit,
         deadline: Instant,
         cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<ResultSet, ExecuteError>>;
@@ -51,6 +62,7 @@ mod tests {
     use std::time::Duration;
 
     use warden_core::dialect::Dialect;
+    use warden_core::limits::ExecutionLimits;
 
     use super::*;
     use crate::testing;
@@ -59,9 +71,11 @@ mod tests {
     async fn an_executor_works_behind_a_trait_object() {
         let executor: Arc<dyn QueryExecutor> = Arc::new(testing::FakeExecutor::default());
         let query = testing::authorized(Dialect::MySql);
+        let (_runtime, permit) = testing::with_permit(ExecutionLimits::default()).await;
         let result = executor
             .execute_read_only(
                 &query,
+                &permit,
                 Instant::now() + Duration::from_secs(5),
                 CancellationToken::new(),
             )
@@ -75,9 +89,11 @@ mod tests {
     async fn the_deadline_reaches_the_adapter_instead_of_being_a_dropped_future() {
         let executor = testing::FakeExecutor::taking(Duration::from_secs(30));
         let query = testing::authorized(Dialect::MySql);
+        let (_runtime, permit) = testing::with_permit(ExecutionLimits::default()).await;
         let error = executor
             .execute_read_only(
                 &query,
+                &permit,
                 Instant::now() + Duration::from_secs(5),
                 CancellationToken::new(),
             )
@@ -90,10 +106,16 @@ mod tests {
     async fn a_cancelled_token_stops_the_query_before_its_deadline() {
         let executor = testing::FakeExecutor::taking(Duration::from_secs(30));
         let query = testing::authorized(Dialect::MySql);
+        let (_runtime, permit) = testing::with_permit(ExecutionLimits::default()).await;
         let cancel = CancellationToken::new();
         cancel.cancel();
         let error = executor
-            .execute_read_only(&query, Instant::now() + Duration::from_secs(5), cancel)
+            .execute_read_only(
+                &query,
+                &permit,
+                Instant::now() + Duration::from_secs(5),
+                cancel,
+            )
             .await
             .unwrap_err();
         assert_eq!(error, ExecuteError::Cancelled);

@@ -160,6 +160,10 @@ impl ConnectionRuntime {
     }
 
     /// The read-only executor.
+    ///
+    /// This hands out the trait object unconditionally; it does not hand out a
+    /// permit. `QueryExecutor::execute_read_only` takes one as a parameter, and the
+    /// caller obtains it from [`ConnectionRuntime::acquire_query_permit`] (ADR-0032).
     #[must_use]
     pub fn executor(&self) -> &dyn QueryExecutor {
         self.executor.as_ref()
@@ -172,6 +176,10 @@ impl ConnectionRuntime {
     }
 
     /// The non-executing explainer.
+    ///
+    /// This hands out the trait object unconditionally; it does not hand out a
+    /// permit. `Explainer::explain` takes one as a parameter, and the caller obtains
+    /// it from [`ConnectionRuntime::acquire_query_permit`] (ADR-0032).
     #[must_use]
     pub fn explainer(&self) -> &dyn Explainer {
         self.explainer.as_ref()

@@ -40,6 +40,14 @@ sqlx = { version = "0.9.0", default-features = false, features = [
   "bigdecimal",
 ] }
 
+# Row streaming — docs/operations.md section 6.6 forbids buffering a whole result
+# before truncating it, `Query::fetch` returns a `BoxStream`, and sqlx re-exports no
+# way to advance one. `alloc` is all `TryStreamExt::try_next` needs; `sqlx-core`
+# already depends on this crate with a superset of these features.
+futures-util = { version = "0.3", default-features = false, features = [
+  "alloc",
+] }
+
 # MCP — docs/operations.md section 2.3.
 # rmcp 3.1.3 defaults include `base64`, but it gates only image/blob helpers in
 # `model/prompt.rs`; Warden exposes tools, not MCP prompts. `server` already implies

@@ -36,7 +36,10 @@ supersedes it; never change it silently.
 | [0029](0029-pg-catalog-is-the-only-trusted-schema.md) | `pg_catalog` is the only trusted function schema |
 | [0030](0030-tls-required-outside-development.md) | TLS is required outside development |
 | [0031](0031-dsn-names-only-the-target.md) | A DSN names only the connection target |
+| [0032](0032-permit-is-a-parameter.md) | The concurrency permit is a parameter |
+| [0033](0033-mysql-errors-by-number.md) | Classify MySQL failures by error number |
 
 ADRs 0021–0026 are new in v0.3. ADR-0002 supersedes the v0.2 MSRV definition;
 ADR-0022 supersedes the single-event audit model; ADR-0023 resolves v0.2 open
-question 13; and ADR-0024 closes the MySQL timeout gap.
+question 13; and ADR-0024 closes the MySQL timeout gap. ADR-0032 resolves open
+question 14's permit half.
