@@ -199,6 +199,14 @@ impl PostgreSqlConnectionPools {
         &self.control
     }
 
+    /// The server-side deadline pinned in this connection's startup options.
+    ///
+    /// `crate::execute` reads it so a request's local deadline can only tighten
+    /// the already-pinned server deadline (ADR-0024).
+    pub(crate) fn statement_timeout(&self) -> Duration {
+        self.statement_timeout
+    }
+
     /// Confirms the database answers, using a fixed adapter query.
     pub async fn health_check(&self, deadline: Instant) -> Result<(), ConnectError> {
         let probe = sqlx::query_scalar::<_, i32>("SELECT 1").fetch_one(self.control());

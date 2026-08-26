@@ -3109,6 +3109,7 @@ name = "warden-postgres"
 version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
+ "futures-util",
  "serde_json",
  "sha2 0.11.0",
  "sqlparser",
@@ -3118,6 +3119,7 @@ dependencies = [
  "thiserror",
  "time",
  "tokio",
+ "tokio-util",
  "warden-core",
  "warden-policy",
  "warden-ports",

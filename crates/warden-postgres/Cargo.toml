@@ -36,9 +36,15 @@ warden-ports = { workspace = true }
 # ADR-0004 records that `sqlx-core` compiles both modules anyway, and
 # `tests/architecture.rs` pins that limitation.
 sqlx = { workspace = true }
-# `time` only: this crate needs `timeout_at` for connection health checks. It starts
-# no runtime; the binary does.
-tokio = { workspace = true, features = ["time"] }
+# `time` powers deadlines and `macros` enables the executor's `tokio::select!`.
+# This crate starts no runtime; the binary does.
+tokio = { workspace = true, features = ["macros", "time"] }
+# `CancellationToken` lives in the ungated `tokio_util::sync` module, so the
+# workspace's `default-features = false` is enough, the same as `warden-ports`.
+tokio-util = { workspace = true }
+# `Query::fetch` returns a `BoxStream` and sqlx re-exports no way to advance one.
+# `TryStreamExt::try_next` consumes results one row at a time.
+futures-util = { workspace = true }
 sqlparser = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }

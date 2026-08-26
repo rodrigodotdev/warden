@@ -1,5 +1,5 @@
-//! Warden's PostgreSQL adapter: analysis and connections now, execution, inspection
-//! and explain in Milestones 8, 9 and 10.
+//! Warden's PostgreSQL adapter: analysis, connections, and execution now,
+//! inspection and explain in Milestones 9 and 10.
 //!
 //! This crate may depend on `warden-core`, `warden-policy`, `warden-ports`, `sqlx`,
 //! and `sqlparser`, but never `rmcp`.
@@ -11,7 +11,7 @@
 //! `warden-core`, `warden-policy`, and `warden-ports` types, so no `sqlparser` type
 //! can appear in a public signature (SPEC section 6, invariant 28; ADR-0007).
 //! `tests/adapter_rules.rs` enforces that mechanically rather than by review, over
-//! the four files allowed to declare a `pub` item.
+//! the five files allowed to declare a `pub` item.
 //!
 //! # The driver stops here too
 //!
@@ -23,9 +23,13 @@
 //! SQLx type crosses out of that module either.
 //!
 //! Every statement destined for `agent_pool` is built by `crate::query::agent_query`,
-//! which applies `.persistent(false)`. That flag is per query, not per pool, so
-//! `statement_cache_capacity(0)` alone would make PostgreSQL leak a named prepared
-//! statement per distinct query for the connection's lifetime (ADR-0025).
+//! which applies `.persistent(false)`. The executor makes its bound agent statement a
+//! narrow exception: SQLx needs a named statement while resolving custom result
+//! metadata, then the executor deallocates it on the same pinned connection. If that
+//! cleanup is unconfirmed, or the request future drops mid-stream, the connection is
+//! retired instead of reused. That keeps `statement_cache_capacity(0)` from retaining a
+//! named prepared statement per distinct agent query for the connection's lifetime
+//! (ADR-0025).
 //!
 //! # How analysis fails, and how it does not
 //!
@@ -50,8 +54,10 @@
 //! `warden-core` security enum never gets a wildcard at all (ADR-0021).
 
 mod analyzer;
+mod bind;
 mod connection;
 mod error;
+mod execute;
 mod fingerprint;
 mod functions;
 mod normalize;
@@ -71,3 +77,4 @@ pub use connection::{
     SearchPathError,
 };
 pub use error::ConnectError;
+pub use execute::PostgreSqlQueryExecutor;

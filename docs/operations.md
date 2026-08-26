@@ -282,6 +282,8 @@ Each named connection owns two pools (`docs/architecture.md` section 6.1).
 ```text
 agent_pool    max 5, min 0, acquire 3s
               PostgreSQL: statement_cache_capacity(0) + persistent(false)
+              (bound executor statements are temporary named statements,
+               deallocated on their pinned connection or that connection is retired)
               MySQL:      statement_cache_capacity(0)
 control_pool  max 2, min 1, acquire 3s, default cache
 idle_timeout and max_lifetime are configurable on both
@@ -313,8 +315,16 @@ leak for the connection lifetime. M0.5 measured 21 rows in
 `pg_prepared_statements` after 20 distinct queries.
 
 `.persistent(false)` forces `StatementId::UNNAMED`, which PostgreSQL does not retain
-or list in `pg_prepared_statements`. **Both settings are mandatory on PostgreSQL's
-`agent_pool`**, and the second one actually prevents the leak.
+or list in `pg_prepared_statements`. **Both settings are mandatory for generic
+PostgreSQL `agent_pool` statements**, and the second one actually prevents the leak.
+Milestone 8's bound executor statement is deliberately temporary and named: SQLx may
+issue a simple query while resolving custom result metadata, which destroys an unnamed
+prepared statement. After rollback, the executor sends `DEALLOCATE ALL` on that same
+pinned connection before it returns to `agent_pool`. The connection is armed for
+retirement before that bound statement can exist and is disarmed only after both
+operations confirm. If rollback/deallocation is unconfirmed, or the request future is
+dropped mid-stream, it retires the connection instead, so the statement cannot survive
+the request or reach another agent query.
 
 **MySQL behaves differently for a structural reason.** In `sqlx-mysql` 0.9
 (`src/connection/executor.rs:171`), the uncached path sends `StmtClose`

@@ -181,8 +181,9 @@ fn reject_ambient_inputs() -> Result<(), ConnectError> {
 ///
 /// `statement_timeout = 0` means **no limit**, so a sub-millisecond timeout that
 /// rounded down would remove the server-side deadline instead of tightening it
-/// (ADR-0024).
-fn millis(value: Duration) -> String {
+/// (ADR-0024). `crate::execute` uses the same rounding for its per-request
+/// `SET LOCAL statement_timeout`, so neither path turns a deadline into no limit.
+pub(crate) fn millis(value: Duration) -> String {
     u128::max(value.as_millis(), 1).to_string()
 }
 

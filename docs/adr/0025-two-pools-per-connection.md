@@ -21,7 +21,7 @@ Each `ConnectionRuntime` owns two pools:
 
 | Pool | Use | Statement cache |
 |---|---|---|
-| `agent_pool` | agent queries and EXPLAIN | PostgreSQL: `capacity(0)` plus `.persistent(false)`; MySQL: `capacity(0)` is sufficient |
+| `agent_pool` | agent queries and EXPLAIN | PostgreSQL: `capacity(0)` plus `.persistent(false)` for generic statements; bound executor statements are temporary named statements deallocated on their pinned connection, or that connection is retired if cleanup is unconfirmed. MySQL: `capacity(0)` is sufficient |
 | `control_pool` | health checks and schema introspection | default |
 
 ## Consequences
@@ -38,6 +38,17 @@ prevents the leak. MySQL differs: its driver unconditionally sends `StmtClose` a
 execution on the uncached path, so `capacity(0)` is enough (`Prepared_stmt_count`
 measured zero in both arrangements). PostgreSQL retained 21 rows in
 `pg_prepared_statements` after 20 queries. See `docs/operations.md` section 4.
+
+**Milestone 8 refinement:** bound PostgreSQL agent statements temporarily use a named
+statement. SQLx resolves a custom result type by issuing a simple query, and PostgreSQL
+discards the unnamed prepared statement in doing so. The executor therefore pins the
+connection, rolls back its read-only transaction, and sends `DEALLOCATE ALL` before
+returning it to `agent_pool`. The pinned connection is armed for retirement before the
+bound statement can exist and disarmed only after both confirmations. Thus a dropped
+request future, or a rollback/deallocation failure or timeout, retires the physical
+connection instead of returning unknown session state. The exception supports custom
+result normalization while preserving this ADR's no-retained-statements invariant; every
+other agent statement continues to use `.persistent(false)`.
 
 Keep the cache enabled for known static SQL and disabled for one-off agent SQL. Two
 pools allow each traffic profile to use appropriate settings.

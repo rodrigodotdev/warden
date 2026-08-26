@@ -38,6 +38,8 @@ supersedes it; never change it silently.
 | [0031](0031-dsn-names-only-the-target.md) | A DSN names only the connection target |
 | [0032](0032-permit-is-a-parameter.md) | The concurrency permit is a parameter |
 | [0033](0033-mysql-errors-by-number.md) | Classify MySQL failures by error number |
+| [0034](0034-postgresql-errors-by-sqlstate.md) | Classify PostgreSQL failures by SQLSTATE |
+| [0035](0035-postgresql-parameter-typing.md) | PostgreSQL parameter typing |
 
 ADRs 0021–0026 are new in v0.3. ADR-0002 supersedes the v0.2 MSRV definition;
 ADR-0022 supersedes the single-event audit model; ADR-0023 resolves v0.2 open

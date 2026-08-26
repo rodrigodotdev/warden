@@ -13,7 +13,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// The only files allowed to declare a `pub` item. Everything else is internal.
-const PUBLIC_FILES: &[&str] = &["lib.rs", "analyzer.rs", "connection.rs", "error.rs"];
+const PUBLIC_FILES: &[&str] = &[
+    "lib.rs",
+    "analyzer.rs",
+    "connection.rs",
+    "error.rs",
+    "execute.rs",
+];
 
 /// Type names that would carry a parser AST across the crate boundary.
 const AST_TYPES: &[&str] = &[
@@ -79,20 +85,28 @@ fn source_files() -> Vec<PathBuf> {
     found
 }
 
-/// Lines of code, with comment lines and the `#[cfg(test)]` module removed.
+/// Lines of code, with comment lines and an inline `#[cfg(test)]` module removed.
 ///
-/// The cut point is a line whose *trimmed* text is exactly `#[cfg(test)]`, not
-/// the first place that string occurs anywhere in the file. A substring match
-/// would let a doc comment that happens to mention `#[cfg(test)]` earlier in
-/// the file silently hide every real line below it — export guard included —
-/// while the tests kept passing.
+/// A test-only field or helper is still production-adjacent code that a mechanical
+/// rule must inspect, so only the attribute immediately followed by an inline test
+/// module cuts the scan. A substring match would let a doc comment that happens to
+/// mention `#[cfg(test)]` earlier in the file silently hide every real line below it
+/// — export guard included — while the tests kept passing.
 fn code_lines(path: &Path) -> Vec<(usize, String)> {
     let text = fs::read_to_string(path)
         .unwrap_or_else(|error| panic!("could not read {}: {error}", path.display()));
-    text.lines()
+    let lines: Vec<_> = text
+        .lines()
         .enumerate()
         .map(|(index, line)| (index + 1, line.trim().to_owned()))
-        .take_while(|(_, line)| line != "#[cfg(test)]")
+        .collect();
+    let test_module = lines
+        .windows(2)
+        .position(|window| window[0].1 == "#[cfg(test)]" && window[1].1.starts_with("mod "))
+        .unwrap_or(lines.len());
+    lines
+        .into_iter()
+        .take(test_module)
         .filter(|(_, line)| !line.starts_with("//"))
         .collect()
 }
@@ -351,7 +365,7 @@ fn only_the_analyzer_and_the_crate_root_export_anything() {
     assert!(
         violations.is_empty(),
         "these internal items are exported:\n{}\n\n\
-         Keeping the crate's public surface to the four reviewed files is what \
+         Keeping the crate's public surface to the five reviewed files is what \
          makes \"no parser AST and no driver handle leaves the adapter\" checkable \
          at all (ADR-0007, ADR-0005). Use `pub(crate)`.",
         violations.join("\n")
@@ -600,8 +614,8 @@ fn the_scans_are_alive() {
         "the analyzer module moved; the public-surface scan needs updating"
     );
     assert!(
-        source_files().len() >= 7,
-        "fewer modules than Milestone 5 shipped; the scans may be reading the wrong \
+        source_files().len() >= 14,
+        "fewer modules than Milestone 8 shipped; the scans may be reading the wrong \
          directory"
     );
 
@@ -644,5 +658,101 @@ fn the_scans_are_alive() {
         "a wildcard over `Expr` must not be flagged merely because the previous \
          arm's body, not its pattern, mentions a warden-core enum \
          (the false positive this scan was narrowed to avoid)"
+    );
+}
+
+/// Calls that would read a whole result into memory before any bound applied.
+const BUFFERING_FETCHES: &[&str] = &["fetch_all(", "fetch_one(", "fetch_optional("];
+
+/// Whether the control-pool cancellation statement binds its backend pid.
+///
+/// The scan follows the fluent statement through its terminating semicolon, so the
+/// SQL literal alone cannot satisfy it: a missing `.bind(backend_pid)` is a failure.
+fn cancellation_statement_binds_pid(lines: &[&str]) -> bool {
+    let mut cancel_statement = None;
+
+    for line in lines {
+        if line.contains("sqlx::query(\"SELECT pg_cancel_backend($1)\")") {
+            cancel_statement = Some(line.contains(".bind(backend_pid)"));
+            continue;
+        }
+        let Some(bound) = cancel_statement else {
+            continue;
+        };
+        let bound = bound || line.contains(".bind(backend_pid)");
+        if line.ends_with(';') {
+            return bound;
+        }
+        cancel_statement = Some(bound);
+    }
+
+    false
+}
+
+#[test]
+fn cancellation_guard_rejects_a_pidless_statement() {
+    let bound = [
+        "let statement = sqlx::query(\"SELECT pg_cancel_backend($1)\")",
+        ".bind(backend_pid)",
+        ".execute(self.pools.control());",
+    ];
+    let pidless = [
+        "let statement = sqlx::query(\"SELECT pg_cancel_backend($1)\")",
+        ".execute(self.pools.control());",
+    ];
+
+    assert!(cancellation_statement_binds_pid(&bound));
+    assert!(!cancellation_statement_binds_pid(&pidless));
+}
+
+#[test]
+fn agent_sql_is_never_read_into_memory_before_it_is_bounded() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/execute.rs");
+    let mut streams = false;
+    for (number, line) in code_lines(&path) {
+        for buffering in BUFFERING_FETCHES {
+            assert!(
+                !(line.contains(buffering) && !line.contains("pg_backend_pid")),
+                "src/execute.rs:{number} buffers a result with {buffering}"
+            );
+        }
+        streams |= line.contains(".fetch(");
+    }
+    assert!(
+        streams,
+        "src/execute.rs never calls `.fetch`, so the ban above passed on an absence"
+    );
+}
+
+#[test]
+fn execute_rs_interpolates_nothing_at_all() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/execute.rs");
+    let lines = code_lines(&path);
+    for (number, line) in &lines {
+        assert!(
+            !line.contains("format!"),
+            "src/execute.rs:{number} interpolates with format!; PostgreSQL has no \
+             audited exception to the bind-only rule"
+        );
+    }
+    let source: Vec<&str> = lines.iter().map(|(_, line)| line.as_str()).collect();
+    assert!(
+        cancellation_statement_binds_pid(&source),
+        "src/execute.rs no longer binds the cancellation pid into \
+         `pg_cancel_backend($1)`"
+    );
+}
+
+#[test]
+fn executor_closes_the_named_agent_statement_after_each_request() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/execute.rs");
+    let source = code_lines(&path)
+        .into_iter()
+        .map(|(_, line)| line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        source.contains("DEALLOCATE ALL"),
+        "src/execute.rs does not close the temporary named agent statement"
     );
 }

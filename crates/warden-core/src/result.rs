@@ -495,12 +495,27 @@ impl ResultBuilder {
         &self.columns
     }
 
+    /// Decides whether the next fetched row belongs in this result.
+    ///
+    /// Adapters call this before normalizing the `max_rows + 1` sentinel. That row
+    /// exists only to prove truncation, so its values must not turn an otherwise
+    /// valid bounded result into a normalization error. [`ResultBuilder::push_row`]
+    /// repeats the check defensively, keeping this builder authoritative even when
+    /// a caller omits the pre-normalization admission step.
+    pub fn admit_row(&mut self) -> RowOutcome {
+        if self.rows.len() >= self.limits.max_rows {
+            self.truncated = true;
+            RowOutcome::Truncated
+        } else {
+            RowOutcome::Accepted
+        }
+    }
+
     /// Adds one row, or reports that a bound stopped the result here.
     pub fn push_row(&mut self, row: Vec<ResultValue>) -> Result<RowOutcome, ResultBuildError> {
         // The `max_rows + 1`-th row is read only to learn that it exists
         // (`docs/operations.md` section 6.5) and is never stored.
-        if self.rows.len() >= self.limits.max_rows {
-            self.truncated = true;
+        if self.admit_row() == RowOutcome::Truncated {
             return Ok(RowOutcome::Truncated);
         }
         check_row(self.rows.len(), &row, &self.columns)?;
@@ -788,6 +803,49 @@ mod tests {
         assert!(result.truncated);
         assert_eq!(result.stats.rows_returned, 2);
         result.validate().unwrap();
+    }
+
+    #[test]
+    fn row_admission_truncates_before_the_sentinel_needs_normalization() {
+        let limits = ExecutionLimits {
+            max_rows: 1,
+            ..ExecutionLimits::default()
+        };
+        let mut builder = ResultBuilder::new(columns(), limits);
+
+        assert_eq!(builder.admit_row(), RowOutcome::Accepted);
+        assert_eq!(builder.push_row(row(1)).unwrap(), RowOutcome::Accepted);
+        assert_eq!(builder.admit_row(), RowOutcome::Truncated);
+
+        let result = builder.finish(Duration::ZERO);
+        assert_eq!(result.rows, vec![row(1)]);
+        assert!(result.truncated);
+    }
+
+    #[test]
+    fn push_row_defensively_rejects_an_unnormalized_sentinel() {
+        let limits = ExecutionLimits {
+            max_rows: 1,
+            ..ExecutionLimits::default()
+        };
+        let mut builder = ResultBuilder::new(columns(), limits);
+        assert_eq!(builder.push_row(row(1)).unwrap(), RowOutcome::Accepted);
+
+        // This row is deliberately ragged. Row-count truncation takes precedence,
+        // so the sentinel is neither validated nor stored.
+        assert_eq!(
+            builder
+                .push_row(vec![
+                    ResultValue::String("oversized".to_owned()),
+                    ResultValue::Null,
+                ])
+                .unwrap(),
+            RowOutcome::Truncated
+        );
+
+        let result = builder.finish(Duration::ZERO);
+        assert_eq!(result.rows, vec![row(1)]);
+        assert!(result.truncated);
     }
 
     #[test]
