@@ -244,6 +244,12 @@ async fn collect(
         // first (`docs/operations.md` section 4).
         let builder =
             builder.get_or_insert_with(|| ResultBuilder::new(normalize::columns(&row), limits));
+        // The `max_rows + 1`-th row exists only to prove truncation. Refuse it
+        // before normalization so an oversized or otherwise invalid sentinel cannot
+        // replace an already valid bounded result with an error.
+        if builder.admit_row() == RowOutcome::Truncated {
+            break;
+        }
         let values = normalize::row(&row, builder.columns(), limits.max_value_bytes)?;
         if builder.push_row(values)? == RowOutcome::Truncated {
             break;

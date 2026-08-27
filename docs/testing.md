@@ -77,9 +77,10 @@ server while a DSN that would relax them is refused, `default_transaction_read_o
 policy, statement-cache behaviour on both engines, the exact pool defaults under
 saturation, and readiness surviving a saturated agent pool. Milestone 7 adds MySQL's
 query-level rows below—read-only transactions, deadlines, cancellation, row/byte
-truncation, concurrency, and privilege rejection, each proven against a real
-container. **Milestone 8 added PostgreSQL's equivalent rows**, each proven against a
-real PostgreSQL 17 container: a read-only transaction refusing tested `INSERT`,
+truncation, an oversized `max_rows + 1` sentinel preserving the valid bounded rows,
+concurrency, and privilege rejection, each proven against a real container.
+**Milestone 8 added PostgreSQL's equivalent rows**, each proven against a real
+PostgreSQL 17 container: a read-only transaction refusing tested `INSERT`,
 `UPDATE`, `DELETE`, `CREATE TABLE`, a data-modifying CTE, `SELECT INTO`, `nextval` and
 `setval`; `SET LOCAL statement_timeout` reaching the transaction and only ever
 tightening it; the pinned `search_path` resolving the query; parameter binding,
@@ -143,9 +144,9 @@ could not identify which deadline ended the query.
 **MySQL:** connection; schema discovery; safe `SELECT`; parameter binding; read-only
 transaction; database user cannot write; Warden rejects writes before execution;
 multiple statements rejected; server timeout fires before client timeout; concurrency
-limit; row, total-byte, and per-value truncation; `EXPLAIN`; normalization; connection
-reuse after errors, timeouts, and cancellation; no session-variable leakage between
-requests.
+limit; row-sentinel precedence; row, total-byte, and per-value truncation; `EXPLAIN`;
+normalization; connection reuse after errors, timeouts, and cancellation; no
+session-variable leakage between requests.
 
 **PostgreSQL:** the same, plus `SET LOCAL statement_timeout`; effects of
 `default_transaction_read_only` at connect time; fixed `search_path`; RLS when

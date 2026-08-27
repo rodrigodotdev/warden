@@ -706,6 +706,44 @@ async fn the_row_bound_truncates_the_result() {
 }
 
 #[tokio::test]
+async fn an_oversized_row_sentinel_cannot_replace_valid_rows_with_an_error() {
+    let container = start_mysql().await;
+    let pools = Arc::new(
+        MySqlConnectionPools::connect(config(dsn(&container).await, tls()))
+            .await
+            .unwrap(),
+    );
+    wide_fixture(&pools, 3, 5).await;
+
+    let executor = Arc::new(MySqlQueryExecutor::new(Arc::clone(&pools)));
+    let limits = ExecutionLimits {
+        max_rows: 2,
+        max_value_bytes: 64,
+        ..ExecutionLimits::default()
+    };
+    let runtime = runtime(Arc::clone(&executor), limits);
+    let permit = runtime.acquire_query_permit().await.unwrap();
+
+    let query = authorized(
+        "SELECT CASE WHEN id < 2 THEN payload ELSE REPEAT('x', 4096) END AS payload \
+         FROM wide_rows ORDER BY id",
+        Vec::new(),
+        limits,
+    );
+    let result = run(&executor, &permit, &query).await.unwrap();
+
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![ResultValue::String("aaaaa".to_owned())],
+            vec![ResultValue::String("aaaaa".to_owned())],
+        ]
+    );
+    assert!(result.truncated);
+    assert_eq!(result.stats.rows_returned, 2);
+}
+
+#[tokio::test]
 async fn the_total_byte_bound_truncates_the_result() {
     let container = start_mysql().await;
     let pools = Arc::new(
