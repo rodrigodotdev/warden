@@ -113,17 +113,44 @@ otherwise, none blocks M0–M5.
     `docs/data-model.md` section 8.1, rule 6 quotes an `I64`/`U64` outside ±2^53 as a
     string so a JavaScript MCP client cannot silently round it. `ResultValue::Json`
     does not: its `Serialize` impl hands the driver's `serde_json::Value` straight to
-    `serde_json::Value::serialize`, so `{"order_id": 9007199254740993}` inside a
-    MySQL `JSON` column reaches the client as a raw JSON number and can round exactly
-    the way rule 6 exists to prevent. Byte accounting already treats a `Json` value
+    `serde_json::Value::serialize`. The workspace enables `arbitrary_precision`, so
+    Warden preserves every digit of `{"order_id": 9007199254740993}` rather than
+    changing it through `f64`, but the value still reaches a JavaScript client as a
+    raw JSON number and can suffer the rounding rule 6 exists to prevent. Byte
+    accounting already treats a `Json` value
     consistently either way — `json_value_bytes` counts an embedded large integer
     unquoted, matching what actually gets emitted — so this is a semantic gap in the
     precision guarantee, not a budget bug. Fixing it means rewriting the document
     recursively at normalization time to re-quote out-of-range integers, which is a
     `warden-core` decision affecting every adapter, not a MySQL one, so Milestone 7
-    left it unfixed and only documented it. Milestone 8's PostgreSQL `jsonb` path
-    inherits the same gap unchanged, since it reaches the client through the same
-    `ResultValue::Json` variant.
+    left it unfixed and only documented it. Milestone 8's PostgreSQL `JSON` and
+    `JSONB` paths inherit the same client-side gap, although real-server regressions
+    now prove that Warden itself preserves both integers above `u64` and
+    high-precision decimal digits before that boundary.
+
+18. **Should the adapter decode calendar array elements itself?** `warden-postgres`
+    decodes `date`, `timestamp` and `timestamptz` from their wire integers with
+    checked arithmetic, because `sqlx`'s own decoders hand the value to `time`'s
+    panicking `Add` and PostgreSQL's calendar is wider than `time`'s (SPEC section 6,
+    invariant 31). `sqlx` decodes *array* elements internally, so that guard cannot
+    reach them, and Milestone 8 therefore refuses `DATE[]`, `TIMESTAMP[]` and
+    `TIMESTAMPTZ[]` with a `::text` cast suggestion rather than risk the panic.
+    Supporting them means decoding the array's binary layout — dimension header,
+    element lengths, element bytes — inside the adapter instead of through `Decode for
+    Vec<T>`. That is real code with a real fuzzing obligation, in exchange for a column
+    type an investigation query rarely selects unformatted. Decide it against measured
+    demand, not in advance.
+
+19. **Should a PostgreSQL `time` of `24:00:00` be an error?** PostgreSQL accepts
+    `'24:00:00'::time`, and `sqlx` decodes it as `Time::MIDNIGHT + 86_400_000_000`
+    microseconds, which `time` wraps to `00:00:00`. No data is corrupted in Warden's
+    own code and nothing panics, but the agent is shown a value one day earlier than
+    the one stored, which is the kind of silent wrongness the rest of the normalization
+    rules exist to prevent. The fix is a bounds check on the wire integer before the
+    decode, the same shape as the calendar guard; Milestone 8 left it undone because it
+    is a correctness question about a rare value rather than a panic, and folding it
+    into an execution milestone would have widened the guard's scope without a
+    measurement behind it.
 
 ## 3. Future work deliberately outside v0.x
 

@@ -79,10 +79,14 @@ Possible future variants include `Decimal(String)`, `Uuid(String)`,
 
 ### 3.1 Validating numbers from JSON
 
-MCP input is JSON. Conversion to `ParameterValue` **rejects** values that cannot be
-represented exactly by the chosen variant, including integers above `i64`/`u64` and
-values such as `1e400`. Never silently wrap or truncate; a silently wrong answer is
-worse than an error in an investigation tool.
+MCP input is JSON. With serde_json's arbitrary-precision feature, conversion to
+`ParameterValue` classifies the exact number token before choosing a bind type:
+negative integers through `i64` and non-negative integers through `u64` remain exact;
+integer syntax outside those ranges is rejected rather than rounded through `f64`.
+Decimal and exponent syntax follows the existing finite-`f64` parameter contract,
+including rejection of non-finite or out-of-range forms such as `1e400` and integral
+magnitudes at or above 2^53. Never silently wrap or truncate an integer; a silently
+wrong answer is worse than an error in an investigation tool.
 
 ## 4. Dialect-native placeholders
 
@@ -304,13 +308,25 @@ pub enum ResultValue {
 6. **Emit integers outside ±2^53 as strings.** Most MCP clients use JavaScript and
    lose precision above that bound; silently returning a wrong `bigint` is unacceptable.
    **Exception:** `ResultValue::Json` serializes the driver's own `serde_json::Value`
-   document as-is, so a large integer inside a MySQL `JSON` (or, from Milestone 8, a
-   PostgreSQL `jsonb`) column still reaches the client as a raw JSON number and can
-   round. Rule 6 is enforced for `I64`/`U64`, the columnar integer types; it is not
-   applied recursively inside a document value (`docs/open-questions.md` section 2).
+   document as-is. Warden enables serde_json's `arbitrary_precision` feature so its
+   decoder and serializer preserve the server's exact digits, including integers
+   above `u64` and high-precision decimals; real PostgreSQL `JSON` and `JSONB`
+   regressions pin both cases. The value still reaches the MCP client as a raw JSON
+   number, so a JavaScript client can round it. Rule 6 is enforced for `I64`/`U64`,
+   the columnar integer types; it is not applied recursively inside a document value
+   (`docs/open-questions.md` section 2).
 7. **Bound `Array` depth**, initially at 8. This recursive type could otherwise allow a
    deeply nested PostgreSQL array to overflow the stack during normalization or
    serialization, violating the fuzzing invariant.
+
+Rules 4 and 5 cover a value whose **type** has no representation.
+`NormalizationError::UnrepresentableValue` covers the other case, which PostgreSQL
+produces and MySQL does not: a supported type holding a value the model cannot carry.
+`'infinity'::timestamptz`, any `date` or `timestamp` beyond the year 9999, and
+`'NaN'::numeric` are the reachable cases. The error names the column and the type and
+suggests the same `::text` cast, but it says the *value* has no JSON representation,
+because every other row of that column normalizes fine and telling an agent the
+column's type is unsupported would make it stop querying the column entirely.
 
 `QueryStats.bytes` is the exact length of the stored rows' JSON encoding, escaping
 included—not the driver's wire size, not an in-memory decoded size.
@@ -340,12 +356,32 @@ zero-row MySQL result carries no columns at all, because the driver exposes colu
 definitions only through a row (section 8.1's normalization rules still apply; nothing
 about a column is invented to fill the gap).
 
-**PostgreSQL:** NULL; `bool`; `int2`/`int4`/`int8`; `float4`/`float8`; `NUMERIC`
-with preserved precision; `text`/`varchar`; `bytea`; `date`; `time`;
-`timestamp`/`timestamptz`; `UUID`; `JSON`/`JSONB`; and common arrays when they can be
-decoded safely.
+**PostgreSQL:** NULL; `bool`; `int2`/`int4`/`int8`, all widened to a signed 64-bit
+integer; `float4` and `float8`, decoded at their own widths; `NUMERIC` with preserved
+precision, rendered from `BigDecimal::to_plain_string` so a large or small value keeps
+positional digits rather than becoming exponential notation; `text`/`varchar`/`char`/
+`name`; `bytea`; `date`; `time`; `timestamp`; `timestamptz`, emitted with an explicit
+`+00:00` because PostgreSQL stores it in UTC and the offset is therefore known rather
+than invented; `UUID`; `JSON` and `JSONB`; and one-dimensional arrays of any of those
+**except** `date`, `timestamp` and `timestamptz`.
 
-Extension and custom types fail safely with a cast suggestion.
+Those three array types fail safely with a cast suggestion rather than being decoded.
+`sqlx` decodes array elements internally, so the range check that keeps a `timestamp`
+beyond year 9999 or an `'infinity'` from reaching `time`'s panicking arithmetic cannot
+be applied per element, and `col::text` renders such an array correctly.
+Multi-dimensional arrays fail the same way: `sqlx` decodes one dimension only, and
+Warden reports the failure rather than flattening it. Extension types, user-defined
+enums and composites, `interval`, `timetz`, `money`, ranges and geometry all reach the
+same safe error with the `::text` cast the message names.
+
+The PostgreSQL 17 round-trip fixture rendered its tested `numeric[]` elements as
+`1.5000` and `2.2500`; Warden preserves that measured scale rather than shortening
+them to `1.50` and `2.25`.
+
+`ResultColumn::nullable` is always `None` on PostgreSQL for the same reason it is on
+MySQL — row-level column metadata does not report it — and a zero-row PostgreSQL result
+carries no columns either, because column metadata is read from the first row. Nothing
+about a column is invented to fill either gap.
 
 **Do not build a universal database type system.** The core needs only a safe,
 JSON-compatible result representation. Metadata preserves the original type name.
@@ -356,7 +392,10 @@ Precision-preserving `NUMERIC`/`DECIMAL` requires the `bigdecimal` feature. With
 SQLx has no `Decode` implementation and every such column follows the unsupported-type
 path. Use `bigdecimal`, **not** `rust_decimal`: the latter is 96-bit and would lose
 precision for large `NUMERIC` values, violating rule 1. The `uuid`, `time`, and `json`
-features are also mandatory. See `docs/operations.md` section 2.2.
+features are also mandatory. serde_json's `arbitrary_precision` feature is mandatory
+too: without it, decoding a JSON document can silently pass an integer above `u64` or
+a high-precision decimal through `f64` before Warden serializes the result. See
+`docs/operations.md` section 2.2.
 
 ## 9. Schema model
 

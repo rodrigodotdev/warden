@@ -282,8 +282,10 @@ Each named connection owns two pools (`docs/architecture.md` section 6.1).
 ```text
 agent_pool    max 5, min 0, acquire 3s
               PostgreSQL: statement_cache_capacity(0) + persistent(false)
-              (bound executor statements are temporary named statements,
-               deallocated on their pinned connection or that connection is retired)
+              (only the authorized parameter-bound agent query built by
+               `bind::statement` is temporarily named; static Warden queries,
+               including `set_config`, remain unnamed/non-persistent; the named query
+               is deallocated on its pinned connection or that connection is retired)
               MySQL:      statement_cache_capacity(0)
 control_pool  max 2, min 1, acquire 3s, default cache
 idle_timeout and max_lifetime are configurable on both
@@ -317,14 +319,16 @@ leak for the connection lifetime. M0.5 measured 21 rows in
 `.persistent(false)` forces `StatementId::UNNAMED`, which PostgreSQL does not retain
 or list in `pg_prepared_statements`. **Both settings are mandatory for generic
 PostgreSQL `agent_pool` statements**, and the second one actually prevents the leak.
-Milestone 8's bound executor statement is deliberately temporary and named: SQLx may
-issue a simple query while resolving custom result metadata, which destroys an unnamed
-prepared statement. After rollback, the executor sends `DEALLOCATE ALL` on that same
-pinned connection before it returns to `agent_pool`. The connection is armed for
-retirement before that bound statement can exist and is disarmed only after both
-operations confirm. If rollback/deallocation is unconfirmed, or the request future is
-dropped mid-stream, it retires the connection instead, so the statement cannot survive
-the request or reach another agent query.
+Milestone 8's only exception is the authorized parameter-bound agent query built by
+`bind::statement`, which is deliberately temporary and named: SQLx may issue a simple
+query while resolving custom result metadata, which destroys an unnamed prepared
+statement. Static Warden queries, including `set_config`, remain unnamed and
+non-persistent. After rollback, the executor sends `DEALLOCATE ALL` on that same pinned
+connection before it returns to `agent_pool`. The connection is armed for retirement
+before that named query can exist and is disarmed only after both operations confirm.
+If rollback/deallocation is unconfirmed, or the request future is dropped mid-stream,
+it retires the connection instead, so the statement cannot survive the request or reach
+another agent query.
 
 **MySQL behaves differently for a structural reason.** In `sqlx-mysql` 0.9
 (`src/connection/executor.rs:171`), the uncached path sends `StmtClose`
@@ -417,6 +421,16 @@ latter normalizes `5000ms` to `5s` and would make the comparison depend on forma
 `@@SESSION.MAX_EXECUTION_TIME`. Neither is part of readiness, which stays a single
 `SELECT 1` on `control_pool`.
 
+**Milestone 8 implemented that reinforcement and made it one-directional.** `SET`
+is a utility statement and cannot take a bound parameter, so
+`PostgreSqlQueryExecutor` sends `SELECT set_config('statement_timeout', $1, true)`
+instead: `is_local = true` is exactly `SET LOCAL`, and the value travels as a bind,
+which keeps the whole executor inside section 6.3's bind-only rule with no
+exception. The value is the **smaller** of the request's own
+`ExecutionLimits::server_timeout` and the connection's pinned startup value, so a
+request can only tighten the server-side deadline, never relax the one the deployment
+configured.
+
 ### 5.2 MySQL
 
 ```sql
@@ -463,6 +477,23 @@ can exceed the configured `deadline` by up to `KILL_TIMEOUT + ROLLBACK_TIMEOUT`�
 at today's constants. A caller enforcing its own aggregate request timeout needs to
 budget for that sum, not for `deadline` alone (Milestone 11).
 
+**Milestone 8 measured PostgreSQL's server deadline with real work.** A
+`SELECT count(*) FROM generate_series(1, 2000000000)` under a two-second server
+deadline ran on the same pinned backend PID used before and after the request. Its
+`pg_stat_activity` marker left the active state before the longer client deadline,
+and PostgreSQL's `57014 query_canceled` reached the executor's SQLSTATE mapping as
+`ExecuteError::Timeout`. Rollback and statement deallocation were then awaited under
+their separate aggregate cleanup budget before the same physical session answered the
+next query. `pg_sleep` instead belongs to explicit-cancellation tests; those tests
+construct a synthetic `AuthorizedQuery` because the analyzer and policy rightly deny
+the delay function (section 5.4).
+
+`deadline` bounds the query, not the call, on this adapter too. On a truncated or error
+path, cancellation, `ROLLBACK`, and — only after a confirmed rollback — `DEALLOCATE
+ALL` run sequentially under their own two-second budgets. Those paths can therefore add
+up to six seconds after `deadline`; a caller enforcing an aggregate request timeout must
+budget for that maximum.
+
 ### 5.4 Explicit cancellation
 
 `QueryExecutor::execute_read_only` accepts `deadline` and `CancellationToken` so the
@@ -484,6 +515,31 @@ column type (`0xf3`), so the client call fails to decode the response rather tha
 merely failing to kill anything. `MySqlQueryExecutor::kill` therefore sends
 `KILL QUERY <id>` as an interpolated literal—the one audited exception to section
 6.3's bind-only rule, recorded there.
+
+**Milestone 8 measured PostgreSQL's cancellation path, and it is simpler than
+MySQL's in the one way that matters.** `sqlx-postgres` 0.9.0 exposes no cancel handle
+and never sends the protocol's `CancelRequest`, so the mechanism is
+`SELECT pg_cancel_backend($1)` from another session — `control_pool`, for the same
+reason MySQL uses it: the connection running the target statement is busy and cannot
+be asked for its own identity, which costs one `SELECT pg_backend_pid()` round trip at
+the start of every call (ADR-0025).
+
+Unlike `KILL QUERY`, it **does** take a bound parameter: `pg_cancel_backend` is an
+ordinary function call inside a `SELECT`, so no interpolation is involved and
+PostgreSQL needs no exception to section 6.3.
+`crates/warden-postgres/tests/adapter_rules.rs` pins the strict form — `format!`
+anywhere in `execute.rs` fails the build.
+
+`pg_cancel_backend`, never `pg_terminate_backend`: cancelling ends the statement and
+leaves a reusable pooled session when cleanup is confirmed, while terminating discards
+a connection Warden had already paid to open. Both pools authenticate as the same role,
+which is what makes the call permitted without membership in `pg_signal_backend`.
+
+The cancellation tests execute synthetic authorized `SELECT pg_sleep(...)` statements
+only below the policy boundary. PostgreSQL corpus fixtures and Task 5's exhaustive
+analyzer/policy table separately prove that `pg_sleep` is classified as a dangerous
+delay function and denied before execution; the cancellation test proves neither that
+classification nor the server statement-timeout behavior.
 
 ## 6. Execution
 
@@ -509,6 +565,15 @@ refused, with `ER_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION` (1792). The barrier is 
 session's own state, not the connecting role's grants: the dedicated `warden_ro`
 role's own refusal (`docs/security.md` section 3) is a second, independent barrier,
 not a restatement of this one.
+
+**Milestone 8 measured this on PostgreSQL 17.** With the connecting account as the
+superuser — every privilege granted — `INSERT`, `UPDATE`, `DELETE`, `CREATE TABLE`,
+`SELECT INTO`, a data-modifying CTE, and both `nextval` and `setval` were all refused
+inside `BEGIN READ ONLY`, with SQLSTATE `25006` `read_only_sql_transaction`. The
+barrier is the session's own state, not the connecting role's grants: the dedicated
+`warden_ro` role's own refusal (`docs/security.md` section 4.2) is a second,
+independent barrier, and Milestone 8's privilege tests have to switch the session
+default off before they can observe it at all.
 
 ### 6.2 Finalization
 
@@ -537,6 +602,36 @@ own event, separate from success or failure:
   `Com_kill` increasing on both truncation paths—the row bound and the byte bound—and
   confirm that a complete, undrained result issues no kill at all.
 
+**PostgreSQL's strategy, measured in Milestone 8, is the same shape.** sqlx executes
+the portal with no row limit (`limit: 0` in its own `Execute` message), so the server
+writes the whole result whether or not Warden keeps reading, and the next use of that
+connection would otherwise block draining it.
+
+- On **success**, `ROLLBACK` runs under its own fresh budget. Only a confirmed rollback
+  followed by confirmed `DEALLOCATE ALL` disarms the connection's retirement guard;
+  otherwise the already determined result is preserved but the physical connection is
+  retired rather than reused. Only the authorized parameter-bound agent query built by
+  `bind::statement` is temporarily named, because SQLx resolves custom enum metadata
+  through a simple query that destroys an unnamed statement; static Warden statements,
+  including `set_config`, remain unnamed and non-persistent.
+- On **failure**, Warden first requests cancellation and then attempts `ROLLBACK`
+  under its own fresh two-second budget. The armed RAII owner retires the physical
+  connection unless that rollback and the subsequent `DEALLOCATE ALL` both confirm,
+  rather than returning a session that may still be in `25P02 in_failed_sql_transaction`
+  or retain a named statement. A container test pins that the next query on the same
+  pool succeeds, whether that means confirmed cleanup reused the session or retirement
+  supplied a replacement.
+- A **cancel request** is issued whenever Warden stops reading a stream the server may
+  still be writing — a truncated-but-successful result included, not only the failure
+  path. PostgreSQL offers no `Com_kill` equivalent to count, so the tests measure the
+  backend instead: a statement that would otherwise run for minutes is first observed
+  active and then leaves `pg_stat_activity`'s `active` state within the trigger's
+  absolute two-second deadline. Those activity polls run concurrently with executor
+  cleanup, so rollback and deallocation cannot be mistaken for cancellation latency;
+  the executor future is awaited separately under the six-second aggregate cleanup
+  budget. The observation deadline is far below the connection's own five-second
+  `statement_timeout`, so nothing but the cancel could have cleared the marker.
+
 ### 6.3 Parameter binding
 
 **Never** interpolate strings:
@@ -554,6 +649,13 @@ cannot be sent as a prepared statement, so `MySqlQueryExecutor::kill` interpolat
 form is always `[0-9]+`, so there is no injection surface by construction, whatever the
 value. `tests/adapter_rules.rs` pins `execute.rs` to exactly this one interpolation—a
 second `format!` there fails the test unless it also names `KILL QUERY`.
+
+**PostgreSQL has no such exception, and its guard says so.** Its cancellation binds a
+pid (`SELECT pg_cancel_backend($1)`) and its per-request deadline binds a value
+(`SELECT set_config('statement_timeout', $1, true)`), so
+`crates/warden-postgres/tests/adapter_rules.rs` enforces the strict rule: **no**
+`format!` at all in `execute.rs`. A future change that needs one needs its own review
+and its own ADR rather than an exemption inherited from the other adapter.
 
 ### 6.4 Dynamic queries
 
@@ -584,6 +686,12 @@ stored, the same `Ok`/`truncated: true`/`Truncated`; or a single value exceeds
 returns `Err` rather than truncate to a result the agent never actually received any
 of.
 
+Adapters ask the same builder to admit a fetched row **before** normalizing it. Once
+`max_rows` valid rows are stored, the next row is only a sentinel proving truncation;
+its unsupported, unrepresentable, or oversized values cannot replace those valid rows
+with an error. `push_row` repeats the row-count check defensively, so the builder
+remains authoritative even if a future adapter omits the pre-normalization check.
+
 ### 6.6 Byte limit
 
 Count bytes during normalization. When the budget is reached, stop collecting, mark
@@ -597,6 +705,9 @@ streaming and export are separate work.
 **On MySQL, "close the stream correctly" is `KILL QUERY`** (section 5.4), not merely
 dropping the connection: MySQL's no-cursor protocol keeps sending rows Warden has
 stopped reading, and section 6.2 records exactly when the kill fires.
+
+**On PostgreSQL it is `pg_cancel_backend`** (section 5.4), for the same reason and at
+the same moments section 6.2 lists.
 
 ## 7. Session hardening
 

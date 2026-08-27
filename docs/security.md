@@ -24,25 +24,25 @@ control is accepted risk and must say so explicitly.
 
 | Threat | Controls | Test |
 |---|---|---|
-| Root DML | root-statement policy; read-only transaction; `default_transaction_read_only`; no-write `GRANT` | corpus + integration + privilege test (MySQL tested: `the_transaction_refuses_a_write_even_as_root`, `the_role_refuses_every_write_warden_never_sends`) |
-| DDL | same | same |
-| Write in a CTE (`DELETE ... RETURNING`) | recursive nested-statement analysis; read-only transaction; `GRANT` | PostgreSQL corpus |
-| `SELECT INTO` creating a table | `SELECT INTO` detection; no `CREATE` privilege | PostgreSQL corpus |
+| Root DML | root-statement policy; read-only transaction; `default_transaction_read_only`; no-write `GRANT` | corpus + integration + privilege test (MySQL tested: `the_transaction_refuses_a_write_even_as_root`, `the_role_refuses_every_write_warden_never_sends`; PostgreSQL tested: `the_transaction_refuses_every_write_even_as_a_superuser`, `the_role_refuses_every_write_warden_never_sends`) |
+| DDL | same | same (PostgreSQL tested: `the_transaction_refuses_every_write_even_as_a_superuser`, `the_role_refuses_every_write_warden_never_sends`) |
+| Write in a CTE (`DELETE ... RETURNING`) | recursive nested-statement analysis; read-only transaction; `GRANT` | PostgreSQL corpus + integration (PostgreSQL tested: `the_transaction_refuses_every_write_even_as_a_superuser`) |
+| `SELECT INTO` creating a table | `SELECT INTO` detection; no `CREATE` privilege | PostgreSQL corpus + integration (PostgreSQL tested: `the_transaction_refuses_every_write_even_as_a_superuser`) |
 | `INTO OUTFILE` / `DUMPFILE` | MySQL analyzer detection; no `FILE` privilege | MySQL corpus + privilege test (MySQL tested: `file_access_is_refused_by_privileges_as_well_as_by_policy`) |
 | Function with side effects | function classification and default deny; restricted `GRANT EXECUTE` | corpus + integration |
-| Sequence mutation | `nextval`/`setval` detection; read-only transaction, which PostgreSQL rejects | corpus + PostgreSQL integration |
-| Session or user-variable mutation | session-mutation policy; pool hooks restore state | corpus + connection-reuse test |
+| Sequence mutation | `nextval`/`setval` detection; read-only transaction, which PostgreSQL rejects | corpus + PostgreSQL integration (PostgreSQL tested: `the_transaction_refuses_every_write_even_as_a_superuser`, `the_role_refuses_every_write_warden_never_sends`) |
+| Session or user-variable mutation | session-mutation policy; pool hooks restore state | corpus + connection-reuse test (PostgreSQL tested: `no_session_state_leaks_between_requests`) |
 | Advisory lock | function classification | corpus |
 | Multiple statements | analyzer requires exactly one; prepared-statement path | corpus + integration |
 | Giant join or Cartesian product | server and client timeouts; row and byte limits; replica | integration + load |
-| `SLEEP` / `pg_sleep` / `BENCHMARK` | function classification; server timeout | corpus + integration |
+| `SLEEP` / `pg_sleep` / `BENCHMARK` | function classification and default deny; server timeout | corpus + integration (PostgreSQL classification/denial tested: `the_analyzer_and_policy_engine_deny_every_statement_before_it_is_ever_sent`; synthetic-authorized `cancellation_reaches_the_server` tests cancellation below policy, not classification or the server deadline) |
 | Expensive regex | server timeout; concurrency limit | load |
 | Recursive query | server timeout; row limit | integration |
-| Excessive concurrency | per-connection semaphore; `max_queue_wait`; pool limit | concurrency test |
-| Massive result | `max_rows`, `max_value_bytes`, `max_result_bytes`; incremental streaming | integration (MySQL tested: `a_row_truncated_result_is_ok_and_kills_the_orphaned_query`, `a_byte_truncated_result_is_ok_and_kills_the_orphaned_query`, `a_complete_result_fires_no_kill`) |
+| Excessive concurrency | per-connection semaphore; `max_queue_wait`; pool limit | concurrency test (PostgreSQL tested: `concurrency_is_bounded_on_a_real_executor`) |
+| Massive result | `max_rows`, `max_value_bytes`, `max_result_bytes`; incremental streaming | integration (MySQL tested: `a_row_truncated_result_is_ok_and_kills_the_orphaned_query`, `a_byte_truncated_result_is_ok_and_kills_the_orphaned_query`, `a_complete_result_fires_no_kill`; PostgreSQL tested: `an_unrepresentable_row_sentinel_cannot_replace_valid_rows_with_an_error`, `a_truncated_result_is_ok_and_cancels_the_orphaned_query`, `a_byte_truncated_result_cancels_the_orphaned_query_too`, `a_mid_stream_value_too_large_cancels_the_orphaned_query`, `a_complete_result_leaves_the_connection_immediately_reusable`) |
 | Deeply nested SQL causing stack overflow | sqlparser `recursive-protection`; explicit `with_recursion_limit`; input-size limit | fuzz |
-| Read from a forbidden table | role's **`GRANT SELECT`** is the real boundary; allowlist reduces attack surface | privilege test |
-| Read through a view that bypasses the allowlist | role `GRANT`; allowlist explicitly is not a boundary | privilege test + documentation |
+| Read from a forbidden table | role's **`GRANT SELECT`** is the real boundary; allowlist reduces attack surface | privilege test (PostgreSQL tested: `the_grant_is_the_read_boundary_and_the_allowlist_is_not`) |
+| Read through a view that bypasses the allowlist | role `GRANT`; allowlist explicitly is not a boundary | privilege test + documentation (PostgreSQL tested: `the_grant_is_the_read_boundary_and_the_allowlist_is_not`, whose second half reads the denied table through a granted view) |
 | Ambiguous name resolution (`search_path`, default database) | set `search_path` and database at connect time | integration |
 | File-reading function | function classification; no `FILE` privilege | corpus + privilege test |
 | Broad schema enumeration | bounded response; object policy on schema tools | E2E |
@@ -84,6 +84,17 @@ SELECT on approved tables and views
 Avoid schema `CREATE`, table writes, sequence mutation, `EXECUTE` on unsafe functions,
 administrative roles, and superuser. Row Level Security can provide an additional
 layer.
+
+PostgreSQL grants `CONNECT` and `TEMPORARY` to `PUBLIC` by default. Revoke both, then
+grant only the configured role its explicit `CONNECT`; do not leave temporary-table
+creation as a write escape outside schema grants. Milestone 8 measured `42501`
+`insufficient_privilege` for a temporary-table create after that revoke. The fixture
+also proves `42501` for `nextval`, `setval`, and its explicitly revoked
+`pg_sleep(double precision)` privilege. That is deliberately **not** a claim that all
+unsafe PostgreSQL functions have been revoked: deployments must audit and revoke their
+own unsafe-function set while preserving safe reporting functions. RLS restricts rows
+within a granted table; grants remain the boundary for whether the role can read that
+table or a granted view at all.
 
 ## 5. Real read-scope boundary
 
@@ -571,11 +582,11 @@ isolated.
 - [ ] PostgreSQL sequence mutation is tested
 - [ ] PostgreSQL locking tests exist
 - [ ] `EXPLAIN` cannot select `ANALYZE`
-- [x] Real-database timeouts cover client and server (MySQL only; PostgreSQL is M8)
-- [x] Semaphore and `max_queue_wait` are tested (MySQL only; PostgreSQL is M8)
-- [x] Per-value and total-byte limits are tested (MySQL only; PostgreSQL is M8)
-- [x] Pool reuse after cancellation is tested (MySQL only; PostgreSQL is M8)
-- [x] Database-role write rejection is tested (MySQL only; PostgreSQL is M8)
+- [x] Real-database timeouts cover client and server
+- [x] Semaphore and `max_queue_wait` are tested
+- [x] Per-value and total-byte limits are tested
+- [x] Pool reuse after cancellation is tested
+- [x] Database-role write rejection is tested
 - [ ] MCP error sanitization is tested
 - [ ] Fail-closed audit attempts are tested
 - [ ] HTTP authorization is tested before publishing remote-production guidance

@@ -123,8 +123,8 @@ At this point, MySQL read queries work without MCP.
 ## M8 — PostgreSQL execution
 
 Match M7 and add `SET LOCAL statement_timeout` as reinforcement, `UUID`, `JSONB`,
-precision-preserving `NUMERIC`, depth-limited arrays, and safe failures with cast
-suggestions for custom types.
+precision-preserving `NUMERIC`, digit-preserving `JSON`/`JSONB` decoding,
+depth-limited arrays, and safe failures with cast suggestions for custom types.
 
 ---
 
@@ -203,7 +203,7 @@ that the supposedly generic core was secretly shaped around MySQL.
 - [x] Workspace compiles on the declared toolchain
 - [x] Every crate forbids `unsafe` and inherits workspace lints
 - [x] MySQL and PostgreSQL analyzers exist
-- [ ] Both adapters execute safe read-only queries
+- [x] Both adapters execute safe read-only queries
 - [x] SQLx's `any` feature is disabled and `AnyPool` is unreachable (`tests/architecture.rs`)
 - [x] Both adapters use concrete pools
 - [x] `sqlparser` appears only inside adapter crates
@@ -214,12 +214,12 @@ that the supposedly generic core was secretly shaped around MySQL.
 - [x] Unknown functions are denied by default
 - [x] MySQL file access and output are denied
 - [x] PostgreSQL sequence mutation is denied
-- [x] Dedicated test roles demonstrably cannot write (MySQL; PostgreSQL is M8)
-- [x] Read-only transactions are verified (MySQL; PostgreSQL is M8)
-- [x] Every query has client-side **and** server-side deadlines (MySQL; PostgreSQL is M8)
-- [x] Rows, bytes per value, and total bytes are bounded (MySQL; PostgreSQL is M8)
-- [x] Queue wait is bounded with `server_busy` (MySQL; PostgreSQL is M8)
-- [x] Concurrency per connection is bounded (MySQL; PostgreSQL is M8)
+- [x] Dedicated test roles demonstrably cannot write
+- [x] Read-only transactions are verified
+- [x] Every query has client-side **and** server-side deadlines
+- [x] Rows, bytes per value, and total bytes are bounded
+- [x] Queue wait is bounded with `server_busy`
+- [x] Concurrency per connection is bounded
 - [ ] Schema search and description work on both engines with object policy
 - [ ] Non-executing `EXPLAIN` works on both engines with reparse verification
 - [ ] MCP over stdio exposes generic tools with annotations and output schemas
