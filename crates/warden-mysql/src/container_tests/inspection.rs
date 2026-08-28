@@ -426,15 +426,25 @@ async fn a_second_call_is_served_from_the_cache() {
     let pools = Arc::new(connect(&container, "shop").await);
     fixture(&pools).await;
     let inspector = MySqlSchemaInspector::new(Arc::clone(&pools), name());
-    let engine = engine(&PolicySettings::default());
+    let permissive_engine = engine(&PolicySettings::default());
+    let denied_engine = engine(&PolicySettings {
+        objects: ObjectRules {
+            schemas: Some(vec!["vault".to_owned()]),
+            ..ObjectRules::default()
+        },
+        ..PolicySettings::default()
+    });
     let connection = metadata("shop");
     let context = context();
-    let request = SchemaDescribeRequest::new(name(), vec!["shop.orders".parse().unwrap()]).unwrap();
+    let request = SchemaDescribeRequest::new(name(), vec!["orders".parse().unwrap()]).unwrap();
 
     let first = inspector
         .describe_schema(
             &request,
-            ObjectFilter::new(&engine, PolicyContext::new(&context, &connection)),
+            ObjectFilter::new(
+                &permissive_engine,
+                PolicyContext::new(&context, &connection),
+            ),
             super::deadline(),
             CancellationToken::new(),
         )
@@ -451,7 +461,10 @@ async fn a_second_call_is_served_from_the_cache() {
     let second = inspector
         .describe_schema(
             &request,
-            ObjectFilter::new(&engine, PolicyContext::new(&context, &connection)),
+            ObjectFilter::new(
+                &permissive_engine,
+                PolicyContext::new(&context, &connection),
+            ),
             super::deadline(),
             CancellationToken::new(),
         )
@@ -465,6 +478,45 @@ async fn a_second_call_is_served_from_the_cache() {
             .iter()
             .all(|column| column.name != "cache_probe")
     );
+
+    // A cache hit cannot bypass live resolution and its resolved-object policy
+    // check. The written selector is unqualified, so only that second check knows it
+    // resolved into the now-denied `shop` schema.
+    let error = inspector
+        .describe_schema(
+            &request,
+            ObjectFilter::new(&denied_engine, PolicyContext::new(&context, &connection)),
+            super::deadline(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap_err();
+    let SchemaError::Rejected(rejection) = error else {
+        panic!("expected the cached resolved object to be rejected");
+    };
+    assert_eq!(rejection.primary_code(), DenyCode::ObjectNotAllowed);
+
+    // The cache also cannot replace live database visibility. Renaming keeps the
+    // relation itself intact while making the cached selector unresolvable.
+    sqlx::query(AssertSqlSafe(
+        "RENAME TABLE shop.orders TO shop.orders_hidden".to_owned(),
+    ))
+    .execute(pools.control())
+    .await
+    .unwrap();
+    let no_longer_visible = inspector
+        .describe_schema(
+            &request,
+            ObjectFilter::new(
+                &permissive_engine,
+                PolicyContext::new(&context, &connection),
+            ),
+            super::deadline(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert!(no_longer_visible.schemas.is_empty());
     pools.close().await;
 }
 
@@ -574,16 +626,29 @@ async fn the_catalog_statements_never_touch_the_agent_pool() {
     let connection = metadata("shop");
     let context = context();
     let filter = ObjectFilter::new(&engine, PolicyContext::new(&context, &connection));
-    let request = SchemaDescribeRequest::new(name(), vec!["orders".parse().unwrap()]).unwrap();
+    let search_request = SchemaSearchRequest::new(name(), "orders", 10).unwrap();
+    let describe_request =
+        SchemaDescribeRequest::new(name(), vec!["orders".parse().unwrap()]).unwrap();
 
     {
         let mut held = Vec::new();
         for _ in 0..AGENT_POOL_MAX_CONNECTIONS {
             held.push(pools.agent().acquire().await.unwrap());
         }
+        let found = inspector
+            .search_schema(
+                &search_request,
+                filter,
+                super::deadline(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(found.matches[0].table, "orders");
+
         let described = inspector
             .describe_schema(
-                &request,
+                &describe_request,
                 filter,
                 super::deadline(),
                 CancellationToken::new(),
