@@ -1,24 +1,26 @@
-//! Warden's PostgreSQL adapter: analysis, connections, and execution now,
-//! inspection and explain in Milestones 9 and 10.
+//! Warden's PostgreSQL adapter: analysis, connections, execution, and inspection
+//! now; explain in Milestone 10.
 //!
 //! This crate may depend on `warden-core`, `warden-policy`, `warden-ports`, `sqlx`,
 //! and `sqlparser`, but never `rmcp`.
 //!
 //! # The AST stops here
 //!
-//! Every module below is private, and the crate exports the analyzer, the
-//! connection types, the search path, and their errors. Their signatures name only
-//! `warden-core`, `warden-policy`, and `warden-ports` types, so no `sqlparser` type
-//! can appear in a public signature (SPEC section 6, invariant 28; ADR-0007).
+//! Every module below is private, and the crate exports the analyzer, executor,
+//! inspector, connection types, search path, and their errors. Their signatures name
+//! only `warden-core`, `warden-policy`, and `warden-ports` types, so no `sqlparser`
+//! type can appear in a public signature (SPEC section 6, invariant 28; ADR-0007).
 //! `tests/adapter_rules.rs` enforces that mechanically rather than by review, over
-//! the five files allowed to declare a `pub` item.
+//! the six files allowed to declare a `pub` item.
 //!
 //! # The driver stops here too
 //!
 //! [`PostgreSqlConnectionPools`] owns two concrete `PgPool` values (ADR-0005,
 //! ADR-0025) and hands out neither: the accessors are `pub(crate)`, so the crate's
-//! public surface names no SQLx type at all. `tests/adapter_rules.rs` enforces that
-//! the same way it enforces the AST rule.
+//! public surface names no SQLx type at all. The composition root builds a pools
+//! value, passes it to the executor and inspector, and never depends on `sqlx`
+//! itself. `tests/adapter_rules.rs` enforces that the same way it enforces the AST
+//! rule.
 //! Normalization reads driver values and produces only `warden-core` types, so no
 //! SQLx type crosses out of that module either.
 //!
@@ -30,6 +32,9 @@
 //! retired instead of reused. That keeps `statement_cache_capacity(0)` from retaining a
 //! named prepared statement per distinct agent query for the connection's lifetime
 //! (ADR-0025).
+//! Catalog queries are different: they use static `sqlx::query` statements on
+//! `control_pool`, keeping its default statement cache for the small fixed catalog
+//! query set.
 //!
 //! # How analysis fails, and how it does not
 //!
@@ -55,11 +60,13 @@
 
 mod analyzer;
 mod bind;
+mod catalog;
 mod connection;
 mod error;
 mod execute;
 mod fingerprint;
 mod functions;
+mod inspector;
 mod normalize;
 mod options;
 mod parse;
@@ -78,3 +85,4 @@ pub use connection::{
 };
 pub use error::ConnectError;
 pub use execute::PostgreSqlQueryExecutor;
+pub use inspector::PostgreSqlSchemaInspector;

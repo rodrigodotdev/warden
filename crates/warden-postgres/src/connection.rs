@@ -257,6 +257,20 @@ impl PostgreSqlConnectionPools {
     }
 }
 
+#[cfg(test)]
+impl PostgreSqlConnectionPools {
+    /// Builds two lazy pools for adapter unit tests without opening a socket.
+    pub(crate) fn lazy_for_tests() -> Self {
+        let options = sqlx::postgres::PgConnectOptions::new();
+        Self {
+            agent: sqlx::postgres::PgPoolOptions::new().connect_lazy_with(options.clone()),
+            control: sqlx::postgres::PgPoolOptions::new().connect_lazy_with(options),
+            statement_timeout: Duration::ZERO,
+            search_path: SearchPath("public".to_owned()),
+        }
+    }
+}
+
 /// Splits a search path into schema names, ignoring server-inserted spacing.
 fn normalized_path(value: &str) -> Vec<&str> {
     value
