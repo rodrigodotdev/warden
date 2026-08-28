@@ -60,6 +60,20 @@ impl MySqlSchemaInspector {
         }
     }
 
+    /// Builds an inspector with an explicit cache for expiry tests.
+    #[cfg(all(test, feature = "docker"))]
+    pub(crate) fn with_cache_for_tests(
+        pools: Arc<MySqlConnectionPools>,
+        connection: ConnectionName,
+        cache: SchemaCache,
+    ) -> Self {
+        Self {
+            pools,
+            connection,
+            cache,
+        }
+    }
+
     async fn search(
         &self,
         request: &SchemaSearchRequest,

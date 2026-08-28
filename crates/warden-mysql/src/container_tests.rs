@@ -12,6 +12,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod execution;
+mod inspection;
 mod privileges;
 
 use std::path::{Path, PathBuf};
