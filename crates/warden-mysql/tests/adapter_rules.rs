@@ -20,6 +20,7 @@ const PUBLIC_FILES: &[&str] = &[
     "connection.rs",
     "error.rs",
     "execute.rs",
+    "inspector.rs",
 ];
 
 /// Type names that would carry a parser AST across the crate boundary.

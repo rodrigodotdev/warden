@@ -162,6 +162,19 @@ impl MySqlConnectionPools {
 }
 
 #[cfg(test)]
+impl MySqlConnectionPools {
+    /// Builds two lazy pools for adapter unit tests without opening a socket.
+    pub(crate) fn lazy_for_tests() -> Self {
+        let options = sqlx::mysql::MySqlConnectOptions::new();
+        Self {
+            agent: sqlx::mysql::MySqlPoolOptions::new().connect_lazy_with(options.clone()),
+            control: sqlx::mysql::MySqlPoolOptions::new().connect_lazy_with(options),
+            statement_timeout: Duration::ZERO,
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
