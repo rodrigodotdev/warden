@@ -97,8 +97,8 @@ SELECT con.conname AS constraint_name, \
   JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace \
   JOIN pg_catalog.pg_class AS fc ON fc.oid = con.confrelid \
   JOIN pg_catalog.pg_namespace AS fn ON fn.oid = fc.relnamespace \
-  JOIN LATERAL pg_catalog.unnest(con.conkey, con.confkey) WITH ORDINALITY \
-       AS k(att, fatt, ord) ON true \
+  JOIN LATERAL ROWS FROM (pg_catalog.unnest(con.conkey), pg_catalog.unnest(con.confkey)) \
+       WITH ORDINALITY AS k(att, fatt, ord) ON true \
   JOIN pg_catalog.pg_attribute AS a ON a.attrelid = c.oid AND a.attnum = k.att \
   JOIN pg_catalog.pg_attribute AS fa ON fa.attrelid = fc.oid AND fa.attnum = k.fatt \
  WHERE n.nspname = $1 AND c.relname = $2 AND con.contype = 'f' \

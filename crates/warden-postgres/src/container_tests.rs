@@ -11,6 +11,7 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
 mod execution;
+mod inspection;
 mod privileges;
 
 use std::time::Duration;
