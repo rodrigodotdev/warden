@@ -8,6 +8,9 @@
 //! in Milestone 9 because column defaults and comments can contain secrets
 //! (`docs/security.md` section 8).
 
+pub mod cache;
+pub mod search;
+
 use std::fmt;
 use std::str::FromStr;
 
@@ -16,6 +19,31 @@ use crate::error::{PublicError, PublicErrorCode};
 
 /// The largest number of tables one `describe_schema` call may name.
 pub const MAX_DESCRIBE_TABLES: usize = 20;
+
+/// The largest number of catalog rows one search-index query may read.
+///
+/// The index is one row per column, so this bounds a join, not a relation count. A
+/// catalog larger than this yields a `CatalogIndex` marked `truncated`, which the
+/// search response then repeats, rather than a silently partial answer.
+pub const MAX_CATALOG_ROWS: usize = 20_000;
+
+/// The largest number of column names kept per relation in the search index.
+pub const MAX_INDEXED_COLUMNS: usize = 64;
+
+/// The largest number of matches one `search_schema` response may carry.
+///
+/// A ceiling above the request's own `limit`: a broad search must never return the
+/// whole catalog (`docs/mcp.md` section 2), whatever limit the caller asked for.
+pub const MAX_SEARCH_RESULTS: usize = 50;
+
+/// The largest number of columns one described relation may carry.
+pub const MAX_DESCRIBED_COLUMNS: usize = 512;
+
+/// The largest number of indexes one described relation may carry.
+pub const MAX_DESCRIBED_INDEXES: usize = 128;
+
+/// The largest number of foreign keys one described relation may carry.
+pub const MAX_DESCRIBED_FOREIGN_KEYS: usize = 128;
 
 /// The largest number of terms one `search_schema` call may carry.
 pub const MAX_SEARCH_TERMS: usize = 10;
@@ -216,6 +244,13 @@ impl SchemaSearchRequest {
                 what: "result limit",
             });
         }
+        if limit > MAX_SEARCH_RESULTS {
+            return Err(SchemaRequestError::TooMany {
+                what: "result limit",
+                actual: limit,
+                max: MAX_SEARCH_RESULTS,
+            });
+        }
         Ok(Self {
             connection,
             terms,
@@ -358,6 +393,14 @@ pub struct Table {
     pub foreign_keys: Vec<ForeignKey>,
     /// Indexes on this relation.
     pub indexes: Vec<IndexDescription>,
+    /// Whether any of this relation's metadata was left out.
+    ///
+    /// Set when a bound above cut a list, and when the engine described a key part
+    /// that has no column name — a functional index on MySQL, an expression index on
+    /// PostgreSQL. Warden omits such a part rather than inventing a name for it
+    /// (`docs/architecture.md` section 11), and says so here, because an agent that
+    /// believed it had seen every column would write a wrong query.
+    pub truncated: bool,
 }
 
 /// One schema and the relations the role may see.
@@ -459,6 +502,19 @@ mod tests {
     }
 
     #[test]
+    fn a_search_limit_above_the_ceiling_is_refused() {
+        assert_eq!(
+            SchemaSearchRequest::new(connection(), "orders", MAX_SEARCH_RESULTS + 1).unwrap_err(),
+            SchemaRequestError::TooMany {
+                what: "result limit",
+                actual: MAX_SEARCH_RESULTS + 1,
+                max: MAX_SEARCH_RESULTS,
+            }
+        );
+        assert!(SchemaSearchRequest::new(connection(), "orders", MAX_SEARCH_RESULTS).is_ok());
+    }
+
+    #[test]
     fn ranking_order_is_the_declaration_order() {
         let mut reasons = vec![
             MatchReason::Description,
@@ -501,6 +557,7 @@ mod tests {
                     primary_key: vec!["id".to_owned()],
                     foreign_keys: Vec::new(),
                     indexes: Vec::new(),
+                    truncated: false,
                 }],
             }],
         };

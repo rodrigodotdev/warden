@@ -411,8 +411,16 @@ pub struct Table {
     pub primary_key: Vec<String>,
     pub foreign_keys: Vec<ForeignKey>,
     pub indexes: Vec<IndexDescription>,
+    pub truncated: bool,
 }
 ```
+
+`Table.truncated` says that some of the relation's metadata was left out: a bound cut
+a list, or the engine reported a key part with no column name (a MySQL functional
+index, a PostgreSQL expression index), which Warden omits rather than naming
+something the catalog did not name. Response bounds are `MAX_DESCRIBED_COLUMNS` 512,
+`MAX_DESCRIBED_INDEXES` 128 and `MAX_DESCRIBED_FOREIGN_KEYS` 128 per relation, on top
+of the 20-table cap per call.
 
 Never include connection data. Redaction from `docs/security.md` section 8 also
 applies here because column defaults and comments may contain secrets.
@@ -431,11 +439,28 @@ and map its output intentionally. Arbitrary agent `SHOW` never passes through `q
 table prefix, table substring, column match, schema match, and configured human
 description. Embeddings are unnecessary in v0.x.
 
+Ranking is dialect-independent and lives in `warden_core::schema::search`:
+`CatalogIndex::search` filters through the request's object rules, sorts by
+`MatchReason` — whose declaration order **is** the ranking — then by schema and name,
+and truncates at the request's `limit`, itself capped at `MAX_SEARCH_RESULTS` (50).
+The index behind it is a bounded projection of the catalog: at most
+`MAX_CATALOG_ROWS` (20 000) catalog rows and `MAX_INDEXED_COLUMNS` (64) column names
+per relation. A search over a partial index reports `truncated: true` even when the
+limit was not reached, because a partial catalog must not look complete.
+
+`MatchReason::Description` has no producer in v0.x: it ranks a configured human
+description, and configured descriptions are future schema-intelligence work.
+
 ### 9.2 Cache
 
-```text
-RwLock<HashMap<CacheKey, CacheEntry>>   suggested TTL: 5 minutes
-```
+`warden_core::schema::cache::SchemaCache` is that map: `RwLock<HashMap<CacheKey,
+Expiring>>`, a five-minute TTL, a 512-entry ceiling, and keys that name the
+connection — `Catalog(connection)` for the search index, `Table { connection,
+schema, table }` for a description. It takes the current time as a parameter rather
+than reading a clock, so expiry is testable without sleeping and `warden-core` needs
+no runtime dependency. A full cache first drops expired entries and then refuses to
+grow; serving from the database is slower, and unbounded growth is worse.
 
-The key includes connection identity. Do not add Redis or a cache framework in the
-first release.
+**Cached metadata is unfiltered.** Object rules are per-request (ADR-0036), so
+caching a filtered answer would freeze one request's identity into another's. The
+adapter applies the filter after every read, hit or miss.

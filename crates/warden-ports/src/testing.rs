@@ -392,6 +392,7 @@ impl SchemaInspector for FakeInspector {
                         primary_key: vec!["id".to_owned()],
                         foreign_keys: Vec::new(),
                         indexes: Vec::new(),
+                        truncated: false,
                     }],
                 }],
             })
