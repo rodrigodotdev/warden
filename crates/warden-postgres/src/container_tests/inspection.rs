@@ -27,7 +27,7 @@ use warden_policy::{
 use warden_ports::SchemaInspector;
 use warden_ports::error::SchemaError;
 
-use super::{config, dsn, setting, start_postgres};
+use super::{config, dsn, start_postgres};
 use crate::connection::{PostgreSqlConnectionConfig, PostgreSqlConnectionPools, SearchPath};
 use crate::inspector::PostgreSqlSchemaInspector;
 
@@ -125,10 +125,14 @@ async fn fixture(pools: &PostgreSqlConnectionPools) {
     }
     transaction.commit().await.unwrap();
 
+    let default_read_only: String =
+        sqlx::query_scalar("SELECT current_setting('default_transaction_read_only')")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap();
     assert_eq!(
-        setting(pools.control(), "default_transaction_read_only").await,
-        "on",
-        "the scoped fixture transaction weakened its control-pool session"
+        default_read_only, "on",
+        "the scoped fixture transaction weakened the same physical control-pool session"
     );
 }
 
