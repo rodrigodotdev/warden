@@ -32,8 +32,9 @@ otherwise, none blocks M0–M5.
    explicit casts?** Enums are the most likely candidate. Measure against real
    databases.
 
-5. **Should the schema cache remain a simple map or become a dedicated crate?** Only
-   after profiling; do not anticipate.
+5. **Should the schema cache remain a simple map or become a dedicated crate?** The
+   cache is a `HashMap` behind an `RwLock` with a five-minute TTL and a 512-entry
+   ceiling, and stays one until profiling says otherwise.
 
 6. **Should normalized SQL enter audits after literal-redaction fuzzing?** It may
    materially improve auditability but risks creating a second sensitive-data store.
@@ -56,6 +57,8 @@ otherwise, none blocks M0–M5.
 
 11. **Should PostgreSQL RLS state appear in schema metadata?** Exposure helps the
     agent understand partial results but also reveals security-policy structure.
+    PostgreSQL RLS state is still not exposed in schema metadata; Milestone 9 did not
+    change that.
 
 12. **Which license?** This blocks the `deny.toml` license allowlist. Apache-2.0
     provides a patent grant and is common for security infrastructure; AGPL prevents

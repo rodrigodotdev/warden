@@ -45,7 +45,8 @@ control is accepted risk and must say so explicitly.
 | Read through a view that bypasses the allowlist | role `GRANT`; allowlist explicitly is not a boundary | privilege test + documentation (PostgreSQL tested: `the_grant_is_the_read_boundary_and_the_allowlist_is_not`, whose second half reads the denied table through a granted view) |
 | Ambiguous name resolution (`search_path`, default database) | set `search_path` and database at connect time | integration |
 | File-reading function | function classification; no `FILE` privilege | corpus + privilege test |
-| Broad schema enumeration | bounded response; object policy on schema tools | E2E |
+| Broad schema enumeration | bounded response; object policy on schema tools at the source (ADR-0036) | integration (MySQL tested: `search_never_returns_more_than_the_requested_limit`, `a_denied_table_is_invisible_to_search_and_refused_by_describe`; PostgreSQL tested: the same two plus `an_unqualified_selector_cannot_reach_a_denied_schema`) |
+| Describing a relation the role cannot read | catalog queries filter on `has_table_privilege`/`has_schema_privilege`; MySQL's `information_schema` hides unprivileged objects itself | PostgreSQL integration (tested: `a_relation_the_role_cannot_select_is_invisible`) |
 | DSN in a tool response | non-serializable secret types; MCP models have no DSN field | unit + E2E |
 | Credential in log, trace, or error | sanitized error mapping; trace-field allowlist; panic hook without payload | unit + E2E |
 | Raw SQL in an operator log through the driver | `ConnectOptions::disable_statement_logging` on every connect options value | unit |
@@ -189,8 +190,16 @@ pub trait ObjectAccessPolicy: Send + Sync {
 ```
 
 Apply it to **every** object-touching tool: `query`, `explain`, `search_schema`, and
-`describe_schema`. `SchemaInspector` receives the allowed set and filters at the
-source; it never returns the entire catalog for the service to filter later.
+`describe_schema`.
+
+**Shipped in Milestone 9 (ADR-0036).** `SchemaInspector::search_schema` and
+`describe_schema` take `filter: ObjectFilter<'a>`, a `Copy` view over
+`PolicyEngine::check_object` and one request's `PolicyContext`. `search_schema`
+drops a refused relation before the response limit is applied, so a denied table
+cannot displace an allowed one or be counted; `describe_schema` returns
+`SchemaError::Rejected`, and checks twice — once on the name the agent wrote and once
+on the name the default database or `search_path` resolved it to, which is what stops
+an unqualified selector from reaching a denied schema.
 
 Otherwise, a denied table remains describable and the agent can learn the entire data
 model.
@@ -412,6 +421,12 @@ material does **not** present redaction as an exfiltration control.
 
 Redaction also applies to `describe_schema` output because column defaults and comments
 can contain secrets.
+
+Milestone 9 returns `ColumnDescription::default` and `comment` unredacted: the
+redaction matcher is `warden-service` work in Milestone 11, and shipping a second
+matcher inside two adapters would create the divergence the single matcher exists to
+prevent. Until then, do not configure Warden against a database whose column defaults
+or comments contain secrets.
 
 ## 9. Injection through returned data
 

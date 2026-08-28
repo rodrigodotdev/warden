@@ -220,7 +220,7 @@ that the supposedly generic core was secretly shaped around MySQL.
 - [x] Rows, bytes per value, and total bytes are bounded
 - [x] Queue wait is bounded with `server_busy`
 - [x] Concurrency per connection is bounded
-- [ ] Schema search and description work on both engines with object policy
+- [x] Schema search and description work on both engines with object policy
 - [ ] Non-executing `EXPLAIN` works on both engines with reparse verification
 - [ ] MCP over stdio exposes generic tools with annotations and output schemas
 - [ ] Tool schemas do not vary by database and are snapshotted in CI

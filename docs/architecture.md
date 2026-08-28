@@ -181,10 +181,20 @@ pub trait QueryExecutor: Send + Sync {
 }
 
 pub trait SchemaInspector: Send + Sync {
-    fn search_schema<'a>(&'a self, r: &'a SchemaSearchRequest, deadline: Instant,
-        cancel: CancellationToken) -> BoxFuture<'a, Result<SchemaSearchResult, SchemaError>>;
-    fn describe_schema<'a>(&'a self, r: &'a SchemaDescribeRequest, deadline: Instant,
-        cancel: CancellationToken) -> BoxFuture<'a, Result<SchemaDescription, SchemaError>>;
+    fn search_schema<'a>(
+        &'a self,
+        request: &'a SchemaSearchRequest,
+        filter: ObjectFilter<'a>,
+        deadline: Instant,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'a, Result<SchemaSearchResult, SchemaError>>;
+    fn describe_schema<'a>(
+        &'a self,
+        request: &'a SchemaDescribeRequest,
+        filter: ObjectFilter<'a>,
+        deadline: Instant,
+        cancel: CancellationToken,
+    ) -> BoxFuture<'a, Result<SchemaDescription, SchemaError>>;
 }
 
 pub trait Explainer: Send + Sync {
@@ -206,6 +216,11 @@ planner constant-folds `IMMUTABLE` functions, so planning is execution and every
 policy that applies to `query` applies here (`docs/mcp.md` section 3.1; SPEC section
 6, invariant 12). `ExplainRequest` remains the MCP-facing input the query service
 converts.
+
+`SchemaInspector`'s two methods take `filter: ObjectFilter<'a>` so the object rules
+apply inside the adapter rather than after it (ADR-0036); they take no `QueryPermit`,
+because a catalog read runs on `control_pool` and is not the query SPEC section 6,
+invariant 17 bounds.
 
 `AuditSink` takes no deadline: a sink has no server-side work to cancel, so the caller
 bounds the write with `tokio::time::timeout`. ADR-0022 still requires the attempt

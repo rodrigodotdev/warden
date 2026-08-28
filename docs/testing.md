@@ -15,6 +15,12 @@ execution-limit validation, error mapping, policy-input construction, security-s
 constructors, schema-search ranking, rejection of unrepresentable JSON numbers, and
 array-depth limits.
 
+Section 1's unit rows now include schema-search ranking, which
+`warden_core::schema::search` covers without a database, and cache expiry, which takes
+the current time as a parameter rather than sleeping.
+`MatchReason::Description` remains unproduced because configured human descriptions
+are deferred schema-intelligence work.
+
 ## 2. Policy
 
 Use synthetic `QueryAnalysis`. Test each policy separately **and** composed in the
@@ -96,6 +102,32 @@ explicit cancellation reaching the server; connection reuse after a timeout, a
 cancellation and a database error; no session state surviving a request; the
 concurrency bound; and RLS restricting what the role can read.
 
+**Milestone 9 added the schema rows on both engines.** MySQL, against a real 8.4
+container: a described table's columns, types, nullability, defaults, comments,
+composite primary key, foreign key and indexes; an unqualified selector resolving
+through the default database; a view keeping its kind; a relation the role cannot see
+being skipped rather than reported; deterministic ranking; the response limit and its
+`truncated` flag; a denied table invisible to search and refused by describe; an
+unqualified selector refused after it resolves into a denied schema; a cache hit
+answering with pre-mutation metadata while the table remains resolvable and an expired
+entry refetching; the deadline and the cancellation token each stopping a catalog
+read; and a describe answering while `agent_pool` is saturated, which is what
+ADR-0025's second pool is for.
+
+PostgreSQL, against a real 17 container: the same rows, plus a materialized view
+keeping its own kind, an expression index reported as a partial description rather
+than as an invented column name, a quoted mixed-case relation that a lowercase deny
+rule does not reach, a relation whose `SELECT` was revoked being invisible to both
+tools, and no session state surviving a catalog read.
+
+The mixed-case PostgreSQL distinction is proven by search over resolved catalog
+identifiers. Plain-text describe remains fail-closed because `TableSelector` carries
+no quoting marker.
+
+PostgreSQL foreign-key metadata uses
+`ROWS FROM (pg_catalog.unnest(con.conkey), pg_catalog.unnest(con.confkey)) WITH
+ORDINALITY` for valid positional pairing.
+
 PostgreSQL's official container image serves no TLS certificate chain. Its M6 test
 therefore proves that required TLS refuses a cleartext downgrade, while MySQL's private
 CA tests cover certificate verification; a TLS-serving PostgreSQL fixture remains M15
@@ -169,6 +201,8 @@ This validates defense in depth instead of assuming it.
 Start Warden over stdio and test initialization, tool discovery,
 `list_connections`, `search_schema`, `describe_schema`, `query`, `explain`, denied
 query responses, sanitized errors, **protocol-only stdout**, and tool-schema snapshots.
+
+MCP E2E coverage of `search_schema` and `describe_schema` remains Milestone 12 work.
 
 Once Streamable HTTP exists, test protocol negotiation, authorization, unauthenticated
 request rejection, principal propagation, concurrent requests, shutdown, malformed
