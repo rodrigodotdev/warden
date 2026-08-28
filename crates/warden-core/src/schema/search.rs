@@ -121,7 +121,7 @@ fn term_reason(relation: &IndexedRelation, term: &str) -> Option<MatchReason> {
     if relation.name.eq_ignore_ascii_case(term) {
         return Some(MatchReason::ExactTable);
     }
-    if table_matches_prefix(&relation.name, term) {
+    if starts_with_ignore_ascii_case(&relation.name, term) {
         return Some(MatchReason::TablePrefix);
     }
     if contains_ignore_ascii_case(&relation.name, term) {
@@ -130,7 +130,7 @@ fn term_reason(relation: &IndexedRelation, term: &str) -> Option<MatchReason> {
     if relation
         .columns
         .iter()
-        .any(|column| column_matches_term(column, term))
+        .any(|column| contains_ignore_ascii_case(column, term))
     {
         return Some(MatchReason::ColumnMatch);
     }
@@ -138,20 +138,6 @@ fn term_reason(relation: &IndexedRelation, term: &str) -> Option<MatchReason> {
         return Some(MatchReason::SchemaName);
     }
     None
-}
-
-fn column_matches_term(column: &str, term: &str) -> bool {
-    contains_ignore_ascii_case(column, term)
-        || term
-            .strip_suffix('s')
-            .is_some_and(|singular| contains_ignore_ascii_case(column, singular))
-}
-
-fn table_matches_prefix(table: &str, term: &str) -> bool {
-    starts_with_ignore_ascii_case(table, term)
-        || term
-            .strip_suffix('s')
-            .is_some_and(|singular| starts_with_ignore_ascii_case(table, singular))
 }
 
 fn starts_with_ignore_ascii_case(haystack: &str, needle: &str) -> bool {
@@ -207,7 +193,7 @@ mod tests {
 
     #[test]
     fn ranking_follows_the_documented_order() {
-        let found = index().search(&terms(&["orders"]), 10, |_| true);
+        let found = index().search(&terms(&["orders", "order"]), 10, |_| true);
         let reasons: Vec<_> = found
             .matches
             .iter()
@@ -235,6 +221,31 @@ mod tests {
     fn matching_ignores_ascii_case_in_both_directions() {
         let found = index().search(&terms(&["ORDERS"]), 10, |_| true);
         assert_eq!(found.matches[0].table, "orders");
+    }
+
+    #[test]
+    fn a_single_letter_s_is_not_a_match_all_term() {
+        let found = index().search(&terms(&["s"]), 10, |_| true);
+        let names: Vec<_> = found.matches.iter().map(|m| m.table.as_str()).collect();
+        assert_eq!(names, ["customers", "order_items", "orders"]);
+    }
+
+    #[test]
+    fn input_case_produces_the_same_complete_results() {
+        let lower = index().search(&terms(&["orders", "order"]), 10, |_| true);
+        let upper = index().search(&terms(&["ORDERS", "ORDER"]), 10, |_| true);
+        let lower_pairs: Vec<_> = lower
+            .matches
+            .iter()
+            .map(|m| (m.table.as_str(), m.reason))
+            .collect();
+        let upper_pairs: Vec<_> = upper
+            .matches
+            .iter()
+            .map(|m| (m.table.as_str(), m.reason))
+            .collect();
+        assert_eq!(lower_pairs, upper_pairs);
+        assert_eq!(lower.truncated, upper.truncated);
     }
 
     #[test]
