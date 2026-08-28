@@ -324,7 +324,7 @@ mod stub {
     use warden_core::schema::{
         SchemaDescribeRequest, SchemaDescription, SchemaSearchRequest, SchemaSearchResult,
     };
-    use warden_policy::AuthorizedQuery;
+    use warden_policy::{AuthorizedQuery, ObjectFilter};
     use warden_ports::error::{ExplainError, SchemaError};
     use warden_ports::{BoxFuture, Explainer, QueryPermit, SchemaInspector};
 
@@ -336,6 +336,7 @@ mod stub {
         fn search_schema<'a>(
             &'a self,
             _request: &'a SchemaSearchRequest,
+            _filter: ObjectFilter<'a>,
             _deadline: Instant,
             _cancel: CancellationToken,
         ) -> BoxFuture<'a, Result<SchemaSearchResult, SchemaError>> {
@@ -345,6 +346,7 @@ mod stub {
         fn describe_schema<'a>(
             &'a self,
             _request: &'a SchemaDescribeRequest,
+            _filter: ObjectFilter<'a>,
             _deadline: Instant,
             _cancel: CancellationToken,
         ) -> BoxFuture<'a, Result<SchemaDescription, SchemaError>> {

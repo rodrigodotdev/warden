@@ -62,7 +62,8 @@ otherwise, none blocks M0–M5.
     closed-source SaaS resale. This is a product decision.
 
 13. **Can `SchemaInspector` filter objects at the source without changing its
-    signature?** No. `docs/security.md` §5.2 requires the inspector to receive the
+    signature?** No — **resolved in Milestone 9 by ADR-0036.** `docs/security.md`
+    §5.2 requires the inspector to receive the
     allowed set and filter at the source rather than return the whole catalog for a
     service to filter afterward, but `search_schema`/`describe_schema`
     (`crates/warden-ports/src/inspector.rs`) take only a request, a deadline, and a
@@ -75,10 +76,10 @@ otherwise, none blocks M0–M5.
     `SchemaError::Rejected` unproducible by any adapter; `search_schema` cannot be
     salvaged that way at all, since a denied match the adapter already found would
     consume an allowed match's slot under the request's `limit` before anything could
-    filter it back out. The fix is a signature change — add `context: &'a
-    RequestContext` or an explicit allowed-set parameter to both methods — and
-    Milestone 9 is expected to make it, so it lands there as an accepted change
-    rather than a surprise.
+    filter it back out. The signature now takes `filter: ObjectFilter<'a>`, a `Copy`
+    view over `PolicyEngine::check_object` and one request's `PolicyContext`;
+    `search_schema` drops a refused relation before the limit is applied and
+    `describe_schema` returns `SchemaError::Rejected`.
 
 14. **Does anything besides convention stop an adapter from bypassing the audit
     attempt?** No. ADR-0022 requires the attempt to be recorded before the

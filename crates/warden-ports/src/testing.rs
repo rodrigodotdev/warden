@@ -21,7 +21,9 @@ use std::time::Duration;
 use time::OffsetDateTime;
 use tokio::time::{Instant, sleep, sleep_until};
 use tokio_util::sync::CancellationToken;
-use warden_core::analysis::{QueryAnalysis, QueryAnalysisParts, StatementKind};
+use warden_core::analysis::{
+    ObjectKind, ObjectRef, QueryAnalysis, QueryAnalysisParts, SqlIdentifier, StatementKind,
+};
 use warden_core::connection::{Capabilities, ConnectionMetadata, Environment};
 use warden_core::context::RequestContext;
 use warden_core::dialect::Dialect;
@@ -34,7 +36,8 @@ use warden_core::schema::{
     SchemaSearchRequest, SchemaSearchResult, Table, TableKind,
 };
 use warden_policy::{
-    AnalyzedQuery, AuthorizedQuery, DenyReason, PolicyEngine, PolicyRejection, PolicySettings,
+    AnalyzedQuery, AuthorizedQuery, DenyReason, ObjectFilter, ObjectRules, PolicyContext,
+    PolicyEngine, PolicyRejection, PolicySettings,
 };
 
 use crate::BoxFuture;
@@ -122,6 +125,39 @@ pub(crate) fn analyzed(dialect: Dialect) -> AnalyzedQuery {
 /// The real engine with the hardened default settings.
 pub(crate) fn engine() -> PolicyEngine {
     PolicyEngine::with_defaults(&PolicySettings::default()).unwrap()
+}
+
+/// An engine whose object rules refuse one table.
+pub(crate) fn denying_engine() -> PolicyEngine {
+    let settings = PolicySettings {
+        objects: ObjectRules {
+            deny_tables: vec!["app.secrets".to_owned()],
+            ..ObjectRules::default()
+        },
+        ..PolicySettings::default()
+    };
+    PolicyEngine::with_defaults(&settings).expect("the default rule set builds")
+}
+
+/// A schema-qualified table reference, as an adapter would build one.
+pub(crate) fn table(schema: Option<&str>, name: &str) -> ObjectRef {
+    ObjectRef {
+        catalog: None,
+        schema: schema.map(SqlIdentifier::unquoted),
+        name: SqlIdentifier::unquoted(name),
+        kind: ObjectKind::Table,
+    }
+}
+
+/// A filter over the default engine and the fixture connection.
+///
+/// Held by the caller rather than returned by value: `ObjectFilter` borrows both.
+pub(crate) fn object_filter<'a>(
+    engine: &'a PolicyEngine,
+    connection: &'a ConnectionMetadata,
+    context: &'a RequestContext,
+) -> ObjectFilter<'a> {
+    ObjectFilter::new(engine, PolicyContext::new(context, connection))
 }
 
 /// A real authorization, produced by the real engine.
@@ -312,6 +348,7 @@ impl SchemaInspector for FakeInspector {
     fn search_schema<'a>(
         &'a self,
         _request: &'a SchemaSearchRequest,
+        _filter: ObjectFilter<'a>,
         deadline: Instant,
         cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<SchemaSearchResult, SchemaError>> {
@@ -332,6 +369,7 @@ impl SchemaInspector for FakeInspector {
     fn describe_schema<'a>(
         &'a self,
         _request: &'a SchemaDescribeRequest,
+        _filter: ObjectFilter<'a>,
         deadline: Instant,
         cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<SchemaDescription, SchemaError>> {

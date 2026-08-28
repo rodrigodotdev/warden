@@ -31,6 +31,7 @@
 
 pub mod decision;
 pub mod engine;
+pub mod filter;
 pub mod folding;
 pub mod input;
 pub mod policies;
@@ -43,6 +44,7 @@ mod testing;
 
 pub use decision::{DenyCode, DenyReason, PolicyDecision, PolicyRejection};
 pub use engine::{PolicyEngine, PolicyEngineError};
+pub use filter::ObjectFilter;
 pub use input::{PolicyContext, PolicyInput};
 pub use policy::{ObjectAccessPolicy, Policy};
 pub use settings::{ObjectRules, PolicySettings, Relaxations};

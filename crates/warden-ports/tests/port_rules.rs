@@ -26,7 +26,7 @@ use warden_core::result::ResultSet;
 use warden_core::schema::{
     SchemaDescribeRequest, SchemaDescription, SchemaSearchRequest, SchemaSearchResult,
 };
-use warden_policy::{AnalyzedQuery, AuthorizedQuery};
+use warden_policy::{AnalyzedQuery, AuthorizedQuery, ObjectFilter};
 use warden_ports::{
     AnalyzeError, AuditAttempt, AuditError, AuditOutcomeEvent, AuditSink, BoxFuture,
     ConnectionError, ConnectionRegistry, ConnectionRuntime, ExecuteError, ExplainError, Explainer,
@@ -97,6 +97,24 @@ fn trait_body<'a>(source: &'a str, name: &str) -> Vec<&'a str> {
         }
     }
     panic!("no `pub trait {name}` block found");
+}
+
+/// One trait method's declaration, excluding its body and neighboring methods.
+fn trait_method_declaration(name: &str, method: &str) -> String {
+    let file = PORTS
+        .iter()
+        .find(|(_, trait_name, methods)| *trait_name == name && methods.contains(&method))
+        .map(|(file, _, _)| *file)
+        .unwrap_or_else(|| panic!("no port declaration for {name}::{method}"));
+    let declaration = trait_body(&read(file), name).join(" ");
+    let start = declaration
+        .find(&format!("fn {method}"))
+        .unwrap_or_else(|| panic!("{name} does not declare {method}"));
+    let method_declaration = &declaration[start..];
+    let end = method_declaration
+        .find(';')
+        .unwrap_or_else(|| panic!("{name}::{method} has no terminating semicolon"));
+    method_declaration[..=end].to_owned()
 }
 
 #[test]
@@ -197,19 +215,33 @@ fn every_port_that_runs_a_query_takes_a_concurrency_permit() {
     // The two ports that run work on the server. `SchemaInspector` is deliberately
     // absent: it runs Warden's own static SQL on `control_pool`, which the
     // connection's query bound does not govern (ADR-0025).
-    for (file, name, method) in [
+    for (_, name, method) in [
         ("executor.rs", "QueryExecutor", "execute_read_only"),
         ("explainer.rs", "Explainer", "explain"),
     ] {
-        let declaration = trait_body(&read(file), name).join(" ");
-        assert!(
-            declaration.contains(&format!("fn {method}")),
-            "{name} does not declare {method}"
-        );
+        let declaration = trait_method_declaration(name, method);
         assert!(
             declaration.contains("permit: &'a QueryPermit"),
             "{name}::{method} takes no permit, so SPEC section 6, invariant 17 is a \
              convention again (ADR-0032)"
+        );
+    }
+}
+
+/// The schema tools reach the object rules, and reach them as a parameter.
+///
+/// `docs/security.md` section 5.2 requires the inspector to filter at the source.
+/// Before ADR-0036 the port could not: it received a request, a deadline and a
+/// token, so `SchemaError::Rejected` had no producer. This scan is what keeps a
+/// future refactor from quietly removing the parameter again.
+#[test]
+fn the_schema_inspector_receives_the_object_rules() {
+    for method in ["search_schema", "describe_schema"] {
+        let declaration = trait_method_declaration("SchemaInspector", method);
+        assert!(
+            declaration.contains("filter: ObjectFilter<'a>"),
+            "SchemaInspector::{method} takes no object filter, so a denied table \
+             stays describable (docs/security.md section 5.2)"
         );
     }
 }
@@ -305,6 +337,7 @@ impl SchemaInspector for Stub {
     fn search_schema<'a>(
         &'a self,
         _request: &'a SchemaSearchRequest,
+        _filter: ObjectFilter<'a>,
         _deadline: Instant,
         _cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<SchemaSearchResult, SchemaError>> {
@@ -314,6 +347,7 @@ impl SchemaInspector for Stub {
     fn describe_schema<'a>(
         &'a self,
         _request: &'a SchemaDescribeRequest,
+        _filter: ObjectFilter<'a>,
         _deadline: Instant,
         _cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<SchemaDescription, SchemaError>> {
