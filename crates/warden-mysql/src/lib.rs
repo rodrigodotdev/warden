@@ -12,7 +12,7 @@
 //! no `sqlparser` type can appear in a public signature (SPEC section 6, invariant
 //! 28; ADR-0007).
 //! `tests/adapter_rules.rs` enforces that mechanically rather than by review, over
-//! the six files allowed to declare a `pub` item.
+//! the seven files allowed to declare a `pub` item.
 //!
 //! # The driver stops here too
 //!
