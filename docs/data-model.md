@@ -429,9 +429,11 @@ at most `MAX_SCHEMA_VALUE_BYTES` (64 KiB) at a valid UTF-8 boundary, and their
 accumulated retained payload is at most `MAX_SCHEMA_DESCRIPTION_BYTES` (256 KiB)
 per cached table and again per complete `describe_schema` response. Exhausting
 either budget sets the affected `Table.truncated`; identifiers and serialization
-overhead are not part of this text-byte count. Both adapters also cap the catalog
-expression by characters in static SQL before decoding, then enforce the exact byte
-bound in core. Never include connection data. The Milestone 11 redaction matcher
+overhead are not part of this text-byte count. Both adapters ask static catalog SQL
+for one sentinel character beyond the byte limit before decoding, then enforce the
+exact byte bound in core. The sentinel distinguishes an ASCII value cut at exactly
+64 KiB from a complete value of that length. Never include connection data. The
+Milestone 11 redaction matcher
 will also apply here because defaults and comments may contain secrets.
 
 Schema discovery is a product capability, not an implementation detail. The agent
@@ -454,10 +456,12 @@ Ranking is dialect-independent and lives in `warden_core::schema::search`:
 and truncates at the request's `limit`, itself capped at `MAX_SEARCH_RESULTS` (50).
 The index behind it is a bounded projection of the catalog: at most
 `MAX_CATALOG_ROWS` (20 000) catalog rows and `MAX_INDEXED_COLUMNS` (64) column names
-per relation. Hitting either the global row cap or any relation's column cap marks
-the index partial. A search over a partial index reports `truncated: true` even when
-the response limit was not reached or a term matched only an omitted column, because
-a partial catalog must not look complete.
+per relation. Hitting the global row cap marks every search partial. A relation's
+column cap marks only that `IndexedRelation`; it contributes `truncated: true` after
+the request's object policy permits that relation. A denied wide relation therefore
+cannot reveal its existence through the truncation bit, while a permitted relation
+reports partiality even when the response limit was not reached or a term matched
+only an omitted column.
 
 `MatchReason::Description` has no producer in v0.x: it ranks a configured human
 description, and configured descriptions are future schema-intelligence work.

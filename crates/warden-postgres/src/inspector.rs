@@ -27,8 +27,8 @@ use warden_core::schema::cache::SchemaCache;
 use warden_core::schema::search::CatalogIndex;
 use warden_core::schema::{
     MAX_CATALOG_ROWS, MAX_DESCRIBED_COLUMNS, MAX_DESCRIBED_FOREIGN_KEYS, MAX_DESCRIBED_INDEXES,
-    MAX_SCHEMA_VALUE_BYTES, Schema, SchemaDescribeRequest, SchemaDescription, SchemaMetadataBudget,
-    SchemaSearchRequest, SchemaSearchResult, Table, TableSelector,
+    MAX_SCHEMA_VALUE_FETCH_CHARACTERS, Schema, SchemaDescribeRequest, SchemaDescription,
+    SchemaMetadataBudget, SchemaSearchRequest, SchemaSearchResult, Table, TableSelector,
 };
 use warden_policy::ObjectFilter;
 use warden_ports::error::SchemaError;
@@ -108,11 +108,8 @@ impl PostgreSqlSchemaInspector {
                         })
                     })
                     .collect::<Result<Vec<_>, SchemaError>>()?;
-                let (relations, indexed_columns_bounded) = catalog::group_index(rows);
-                let index = Arc::new(CatalogIndex::new(
-                    relations,
-                    bounded || indexed_columns_bounded,
-                ));
+                let relations = catalog::group_index(rows);
+                let index = Arc::new(CatalogIndex::new(relations, bounded));
                 self.cache
                     .store_catalog(&self.connection, Arc::clone(&index), now);
                 index
@@ -216,7 +213,7 @@ impl PostgreSqlSchemaInspector {
                 .bind(schema)
                 .bind(name)
                 .bind(MAX_DESCRIBED_COLUMNS as i64)
-                .bind(MAX_SCHEMA_VALUE_BYTES as i32)
+                .bind(MAX_SCHEMA_VALUE_FETCH_CHARACTERS as i32)
                 .fetch_all(self.pools.control()),
             deadline,
             cancel,

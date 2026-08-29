@@ -20,7 +20,8 @@ use warden_core::dialect::Dialect;
 use warden_core::pool::AGENT_POOL_MAX_CONNECTIONS;
 use warden_core::schema::cache::{SCHEMA_CACHE_CAPACITY, SchemaCache};
 use warden_core::schema::{
-    MAX_INDEXED_COLUMNS, MatchReason, SchemaDescribeRequest, SchemaSearchRequest, TableKind,
+    MAX_INDEXED_COLUMNS, MAX_SCHEMA_VALUE_BYTES, MatchReason, SchemaDescribeRequest,
+    SchemaSearchRequest, TableKind,
 };
 use warden_core::secret::Dsn;
 use warden_policy::{
@@ -256,6 +257,67 @@ async fn a_described_table_carries_its_columns_keys_and_indexes() {
     assert!(table.truncated);
     assert!(table.indexes.iter().all(|index| !index.columns.is_empty()));
 
+    close(root, pools).await;
+}
+
+#[tokio::test]
+async fn oversized_default_is_bounded_and_truncated_on_cold_and_warm_cache_reads() {
+    let container = start_postgres().await;
+    let (root, pools) = connect(&container, &["app", "public"]).await;
+    let oversized = "a".repeat(MAX_SCHEMA_VALUE_BYTES + 1);
+    mutate(
+        &root,
+        &format!("CREATE TABLE app.oversized_metadata (value TEXT DEFAULT '{oversized}')"),
+    )
+    .await;
+    mutate(
+        &root,
+        &format!("GRANT SELECT ON app.oversized_metadata TO {ROLE}"),
+    )
+    .await;
+    let inspector = PostgreSqlSchemaInspector::new(Arc::clone(&pools), name());
+    let engine = engine(&PolicySettings::default());
+    let connection = metadata();
+    let context = context();
+    let request =
+        SchemaDescribeRequest::new(name(), vec!["app.oversized_metadata".parse().unwrap()])
+            .unwrap();
+
+    let cold = inspector
+        .describe_schema(
+            &request,
+            filter(&engine, &context, &connection),
+            super::deadline(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let warm = inspector
+        .describe_schema(
+            &request,
+            filter(&engine, &context, &connection),
+            super::deadline(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let cold_table = &cold.schemas[0].tables[0];
+    let warm_table = &warm.schemas[0].tables[0];
+
+    assert_eq!(
+        (
+            cold_table.columns[0].default.as_ref().map(String::len),
+            cold_table.truncated,
+            warm_table.columns[0].default.as_ref().map(String::len),
+            warm_table.truncated,
+        ),
+        (
+            Some(MAX_SCHEMA_VALUE_BYTES),
+            true,
+            Some(MAX_SCHEMA_VALUE_BYTES),
+            true,
+        )
+    );
     close(root, pools).await;
 }
 
@@ -646,27 +708,61 @@ async fn search_never_returns_more_than_the_requested_limit() {
 }
 
 #[tokio::test]
-async fn search_reports_truncation_when_only_an_omitted_column_matches() {
+async fn wide_relation_truncation_is_filtered_on_cold_and_warm_cache_reads() {
     let container = start_postgres().await;
     let (root, pools) = connect(&container, &["app", "public"]).await;
     let inspector = PostgreSqlSchemaInspector::new(Arc::clone(&pools), name());
-    let engine = engine(&PolicySettings::default());
+    let denied_engine = engine(&PolicySettings {
+        objects: ObjectRules {
+            deny_tables: vec!["app.wide_catalog".to_owned()],
+            ..ObjectRules::default()
+        },
+        ..PolicySettings::default()
+    });
+    let permissive_engine = engine(&PolicySettings::default());
     let connection = metadata();
     let context = context();
     let request = SchemaSearchRequest::new(name(), "omitted_tail_marker", 10).unwrap();
 
-    let found = inspector
+    let cold_denied = inspector
         .search_schema(
             &request,
-            filter(&engine, &context, &connection),
+            filter(&denied_engine, &context, &connection),
+            super::deadline(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let warm_denied = inspector
+        .search_schema(
+            &request,
+            filter(&denied_engine, &context, &connection),
+            super::deadline(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let warm_permitted = inspector
+        .search_schema(
+            &request,
+            filter(&permissive_engine, &context, &connection),
             super::deadline(),
             CancellationToken::new(),
         )
         .await
         .unwrap();
 
-    assert!(found.matches.is_empty());
-    assert!(found.truncated);
+    assert_eq!(
+        (
+            cold_denied.matches.is_empty(),
+            cold_denied.truncated,
+            warm_denied.matches.is_empty(),
+            warm_denied.truncated,
+        ),
+        (true, false, true, false)
+    );
+    assert!(warm_permitted.matches.is_empty());
+    assert!(warm_permitted.truncated);
     close(root, pools).await;
 }
 

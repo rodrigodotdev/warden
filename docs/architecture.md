@@ -224,6 +224,9 @@ invariant 17 bounds. The cache holds policy-unfiltered metadata; each response f
 both described relations and their foreign-key targets, then applies the shared core
 text budget to its own copy. MySQL relies on `information_schema` visibility, while
 PostgreSQL catalog SQL also requires privileges on both the FK source and target.
+Search-index column partiality stays on its relation and is folded into a response
+only after that relation passes the same per-request object filter; the global
+catalog row bound remains connection-wide.
 
 `AuditSink` takes no deadline: a sink has no server-side work to cancel, so the caller
 bounds the write with `tokio::time::timeout`. ADR-0022 still requires the attempt

@@ -55,8 +55,9 @@ SELECT n.nspname AS table_schema, c.relname AS table_name, c.relkind::text AS re
 
 /// The three detail statements deliberately do not repeat the privilege predicates:
 /// [`RESOLVE_SQL`] already cleared their exact `(schema, table)` pair.
-/// `left` caps characters before driver decoding; core applies the exact UTF-8 byte
-/// and accumulated response bounds after decoding.
+/// `left` fetches one sentinel character beyond the byte limit before driver
+/// decoding; core applies the exact UTF-8 byte and accumulated response bounds and
+/// uses that sentinel to report truncation.
 pub(crate) const COLUMNS_SQL: &str = "\
 SELECT a.attname AS column_name, \
        pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type, \
@@ -160,10 +161,9 @@ pub(crate) struct IndexRow {
     pub(crate) column: Option<String>,
 }
 
-/// Groups ordered index rows into relations and reports a bounded column list.
-pub(crate) fn group_index(rows: Vec<IndexRow>) -> (Vec<IndexedRelation>, bool) {
+/// Groups ordered index rows and bounds each relation's column list independently.
+pub(crate) fn group_index(rows: Vec<IndexRow>) -> Vec<IndexedRelation> {
     let mut relations: Vec<IndexedRelation> = Vec::new();
-    let mut truncated = false;
     for row in rows {
         let Some(kind) = table_kind(&row.relkind) else {
             continue;
@@ -174,7 +174,7 @@ pub(crate) fn group_index(rows: Vec<IndexRow>) -> (Vec<IndexedRelation>, bool) {
                     if last.columns.len() < MAX_INDEXED_COLUMNS {
                         last.columns.push(column);
                     } else {
-                        truncated = true;
+                        last.truncated = true;
                     }
                 }
             }
@@ -183,10 +183,11 @@ pub(crate) fn group_index(rows: Vec<IndexRow>) -> (Vec<IndexedRelation>, bool) {
                 name: row.table,
                 kind,
                 columns: row.column.into_iter().collect(),
+                truncated: false,
             }),
         }
     }
-    (relations, truncated)
+    relations
 }
 
 /// One decoded row of [`INDEXES_SQL`].
@@ -295,7 +296,7 @@ mod tests {
 
     #[test]
     fn index_rows_group_by_adjacent_schema_and_table() {
-        let (relations, truncated) = group_index(vec![
+        let relations = group_index(vec![
             IndexRow {
                 schema: "app".to_owned(),
                 table: "orders".to_owned(),
@@ -324,21 +325,22 @@ mod tests {
                     name: "orders".to_owned(),
                     kind: TableKind::Table,
                     columns: vec!["id".to_owned(), "customer_id".to_owned()],
+                    truncated: false,
                 },
                 IndexedRelation {
                     schema: "app".to_owned(),
                     name: "order_summary".to_owned(),
                     kind: TableKind::View,
                     columns: vec!["total".to_owned()],
+                    truncated: false,
                 },
             ]
         );
-        assert!(!truncated);
     }
 
     #[test]
     fn a_relation_without_visible_columns_stays_in_the_catalog() {
-        let (relations, truncated) = group_index(vec![IndexRow {
+        let relations = group_index(vec![IndexRow {
             schema: "app".to_owned(),
             table: "empty".to_owned(),
             relkind: "r".to_owned(),
@@ -352,9 +354,9 @@ mod tests {
                 name: "empty".to_owned(),
                 kind: TableKind::Table,
                 columns: Vec::new(),
+                truncated: false,
             }]
         );
-        assert!(!truncated);
     }
 
     #[test]
@@ -368,15 +370,15 @@ mod tests {
             })
             .collect();
 
-        let (relations, truncated) = group_index(rows);
+        let relations = group_index(rows);
 
         assert_eq!(relations[0].columns.len(), MAX_INDEXED_COLUMNS);
-        assert!(truncated);
+        assert!(relations[0].truncated);
     }
 
     #[test]
     fn index_rows_drop_an_unmapped_relation_kind() {
-        let (relations, truncated) = group_index(vec![IndexRow {
+        let relations = group_index(vec![IndexRow {
             schema: "app".to_owned(),
             table: "index_backed".to_owned(),
             relkind: "i".to_owned(),
@@ -384,7 +386,6 @@ mod tests {
         }]);
 
         assert!(relations.is_empty());
-        assert!(!truncated);
     }
 
     #[test]

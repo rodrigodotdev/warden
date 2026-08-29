@@ -26,6 +26,8 @@ pub struct IndexedRelation {
     pub kind: TableKind,
     /// Its column names, bounded by [`super::MAX_INDEXED_COLUMNS`].
     pub columns: Vec<String>,
+    /// Whether columns were omitted from this relation's searchable projection.
+    pub truncated: bool,
 }
 
 /// A connection's searchable catalog, as one bounded snapshot.
@@ -41,7 +43,7 @@ pub struct CatalogIndex {
 }
 
 impl CatalogIndex {
-    /// Builds an index. `truncated` says the catalog query hit its own row bound.
+    /// Builds an index. `truncated` says the catalog query hit its global row bound.
     #[must_use]
     pub fn new(relations: Vec<IndexedRelation>, truncated: bool) -> Self {
         Self {
@@ -67,8 +69,9 @@ impl CatalogIndex {
     ///
     /// `permits` runs **before** the limit, so a relation the object rules refuse
     /// cannot displace one they allow (ADR-0036). The result is `truncated` when the
-    /// limit cut the list or when the index itself was already partial — a partial
-    /// catalog must never look complete.
+    /// limit cut the list, the global catalog bound was hit, or an allowed relation
+    /// has omitted columns. A denied relation's partiality is policy-sensitive
+    /// metadata and cannot affect the response.
     #[must_use]
     pub fn search(
         &self,
@@ -76,12 +79,17 @@ impl CatalogIndex {
         limit: usize,
         permits: impl Fn(&IndexedRelation) -> bool,
     ) -> SchemaSearchResult {
-        let mut ranked: Vec<(MatchReason, &IndexedRelation)> = self
-            .relations
-            .iter()
-            .filter(|relation| permits(relation))
-            .filter_map(|relation| best_reason(relation, terms).map(|reason| (reason, relation)))
-            .collect();
+        let mut permitted_relation_truncated = false;
+        let mut ranked: Vec<(MatchReason, &IndexedRelation)> = Vec::new();
+        for relation in &self.relations {
+            if !permits(relation) {
+                continue;
+            }
+            permitted_relation_truncated |= relation.truncated;
+            if let Some(reason) = best_reason(relation, terms) {
+                ranked.push((reason, relation));
+            }
+        }
         ranked.sort_by(|(left_reason, left), (right_reason, right)| {
             left_reason
                 .cmp(right_reason)
@@ -89,7 +97,7 @@ impl CatalogIndex {
                 .then_with(|| left.name.cmp(&right.name))
         });
 
-        let truncated = self.truncated || ranked.len() > limit;
+        let truncated = self.truncated || permitted_relation_truncated || ranked.len() > limit;
         let matches = ranked
             .into_iter()
             .take(limit)
@@ -172,6 +180,7 @@ mod tests {
             name: name.to_owned(),
             kind: TableKind::Table,
             columns: columns.iter().map(|c| (*c).to_owned()).collect(),
+            truncated: false,
         }
     }
 
@@ -273,6 +282,30 @@ mod tests {
             found.truncated,
             "a partial catalog cannot claim completeness"
         );
+    }
+
+    #[test]
+    fn a_denied_relations_column_truncation_does_not_affect_the_result() {
+        let mut denied = relation("app", "wide", &["visible"]);
+        denied.truncated = true;
+        let index = CatalogIndex::new(vec![denied, relation("app", "orders", &["id"])], false);
+
+        let found = index.search(&terms(&["orders"]), 10, |relation| relation.name != "wide");
+
+        assert_eq!(found.matches.len(), 1);
+        assert!(!found.truncated);
+    }
+
+    #[test]
+    fn an_allowed_relations_column_truncation_marks_the_result_partial() {
+        let mut allowed = relation("app", "wide", &["visible"]);
+        allowed.truncated = true;
+        let index = CatalogIndex::new(vec![allowed], false);
+
+        let found = index.search(&terms(&["omitted"]), 10, |_| true);
+
+        assert!(found.matches.is_empty());
+        assert!(found.truncated);
     }
 
     #[test]

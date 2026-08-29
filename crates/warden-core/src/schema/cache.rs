@@ -218,6 +218,7 @@ mod tests {
                 name: name.to_owned(),
                 kind: TableKind::Table,
                 columns: Vec::new(),
+                truncated: false,
             }],
             false,
         ))

@@ -52,6 +52,14 @@ pub const MAX_DESCRIBED_FOREIGN_KEYS: usize = 128;
 /// value default while remaining a separate invariant for schema responses.
 pub const MAX_SCHEMA_VALUE_BYTES: usize = 64 * 1024;
 
+/// Characters fetched for one default or comment before exact byte bounding.
+///
+/// SQL `LEFT` counts characters rather than UTF-8 bytes, so adapters fetch one
+/// sentinel character beyond [`MAX_SCHEMA_VALUE_BYTES`]. The saturating addition
+/// makes the compile-time arithmetic safe; this fixed 64-KiB limit always retains
+/// the sentinel.
+pub const MAX_SCHEMA_VALUE_FETCH_CHARACTERS: usize = MAX_SCHEMA_VALUE_BYTES.saturating_add(1);
+
 /// The largest accumulated bytes of defaults and comments in one description.
 ///
 /// The bound applies to each cached table and again across every table copied into
@@ -648,6 +656,19 @@ mod tests {
     fn metadata_budget_truncates_one_utf8_value_on_a_character_boundary() {
         let mut budget = SchemaMetadataBudget::default();
         let oversized = "🙂".repeat(MAX_SCHEMA_VALUE_BYTES / "🙂".len() + 1);
+
+        let bounded = budget
+            .bound(Some(oversized))
+            .expect("a non-empty prefix fits");
+
+        assert_eq!(bounded.len(), MAX_SCHEMA_VALUE_BYTES);
+        assert!(budget.truncated());
+    }
+
+    #[test]
+    fn metadata_budget_cuts_an_ascii_sentinel_and_reports_truncation() {
+        let mut budget = SchemaMetadataBudget::default();
+        let oversized = "a".repeat(MAX_SCHEMA_VALUE_FETCH_CHARACTERS);
 
         let bounded = budget
             .bound(Some(oversized))

@@ -48,8 +48,9 @@ SELECT TABLE_SCHEMA AS table_schema, TABLE_NAME AS table_name, \
    AND TABLE_TYPE IN ('BASE TABLE', 'VIEW') \
  LIMIT 1";
 
-/// The `LEFT` calls cap characters before driver decoding; core applies the exact
-/// UTF-8 byte and accumulated response bounds after decoding.
+/// The `LEFT` calls fetch one sentinel character beyond the byte limit before
+/// driver decoding; core applies the exact UTF-8 byte and accumulated response
+/// bounds and uses that sentinel to report truncation.
 pub(crate) const COLUMNS_SQL: &str = "SELECT COLUMN_NAME AS column_name, \
             COLUMN_TYPE AS column_type, \
             IS_NULLABLE AS is_nullable, \
@@ -106,10 +107,9 @@ pub(crate) struct IndexRow {
     pub(crate) column: String,
 }
 
-/// Groups ordered index rows into relations and reports a bounded column list.
-pub(crate) fn group_index(rows: Vec<IndexRow>) -> (Vec<IndexedRelation>, bool) {
+/// Groups ordered index rows and bounds each relation's column list independently.
+pub(crate) fn group_index(rows: Vec<IndexRow>) -> Vec<IndexedRelation> {
     let mut relations: Vec<IndexedRelation> = Vec::new();
-    let mut truncated = false;
     for row in rows {
         let Some(kind) = table_kind(&row.table_type) else {
             continue;
@@ -119,7 +119,7 @@ pub(crate) fn group_index(rows: Vec<IndexRow>) -> (Vec<IndexedRelation>, bool) {
                 if last.columns.len() < MAX_INDEXED_COLUMNS {
                     last.columns.push(row.column);
                 } else {
-                    truncated = true;
+                    last.truncated = true;
                 }
             }
             _ => relations.push(IndexedRelation {
@@ -127,10 +127,11 @@ pub(crate) fn group_index(rows: Vec<IndexRow>) -> (Vec<IndexedRelation>, bool) {
                 name: row.table,
                 kind,
                 columns: vec![row.column],
+                truncated: false,
             }),
         }
     }
-    (relations, truncated)
+    relations
 }
 
 /// One decoded row of [`INDEXES_SQL`].
@@ -229,7 +230,7 @@ mod tests {
     use warden_core::schema::search::IndexedRelation;
     use warden_core::schema::{
         ForeignKey, IndexDescription, MAX_INDEXED_COLUMNS, MAX_SCHEMA_DESCRIPTION_BYTES,
-        MAX_SCHEMA_VALUE_BYTES, SchemaMetadataBudget, TableKind,
+        MAX_SCHEMA_VALUE_BYTES, MAX_SCHEMA_VALUE_FETCH_CHARACTERS, SchemaMetadataBudget, TableKind,
     };
 
     use super::{
@@ -239,7 +240,7 @@ mod tests {
 
     #[test]
     fn index_rows_group_by_adjacent_schema_and_table() {
-        let (relations, truncated) = group_index(vec![
+        let relations = group_index(vec![
             IndexRow {
                 schema: "app".to_owned(),
                 table: "orders".to_owned(),
@@ -268,16 +269,17 @@ mod tests {
                     name: "orders".to_owned(),
                     kind: TableKind::Table,
                     columns: vec!["id".to_owned(), "customer_id".to_owned()],
+                    truncated: false,
                 },
                 IndexedRelation {
                     schema: "app".to_owned(),
                     name: "order_summary".to_owned(),
                     kind: TableKind::View,
                     columns: vec!["total".to_owned()],
+                    truncated: false,
                 },
             ]
         );
-        assert!(!truncated);
     }
 
     #[test]
@@ -291,15 +293,15 @@ mod tests {
             })
             .collect();
 
-        let (relations, truncated) = group_index(rows);
+        let relations = group_index(rows);
 
         assert_eq!(relations[0].columns.len(), MAX_INDEXED_COLUMNS);
-        assert!(truncated);
+        assert!(relations[0].truncated);
     }
 
     #[test]
     fn index_rows_drop_a_system_view() {
-        let (relations, truncated) = group_index(vec![IndexRow {
+        let relations = group_index(vec![IndexRow {
             schema: "app".to_owned(),
             table: "future_system_view".to_owned(),
             table_type: "SYSTEM VIEW".to_owned(),
@@ -307,7 +309,6 @@ mod tests {
         }]);
 
         assert!(relations.is_empty());
-        assert!(!truncated);
     }
 
     #[test]
@@ -445,6 +446,26 @@ mod tests {
         );
         assert!(default_budget.truncated());
         assert!(comment_budget.truncated());
+    }
+
+    #[test]
+    fn an_ascii_fetch_sentinel_is_cut_and_marks_the_mapper_budget() {
+        let mut budget = SchemaMetadataBudget::default();
+
+        let mapped = column(
+            "with_default".to_owned(),
+            "longtext".to_owned(),
+            "YES",
+            Some("a".repeat(MAX_SCHEMA_VALUE_FETCH_CHARACTERS)),
+            None,
+            &mut budget,
+        );
+
+        assert_eq!(
+            mapped.default.as_deref().map(str::len),
+            Some(MAX_SCHEMA_VALUE_BYTES)
+        );
+        assert!(budget.truncated());
     }
 
     #[test]
