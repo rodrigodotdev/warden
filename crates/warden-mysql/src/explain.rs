@@ -118,20 +118,41 @@ impl MySqlExplainer {
 
         let outcome = collect(&mut transaction, &verified, query, deadline, cancel).await;
 
-        if outcome.is_err() {
-            // A timeout or a cancellation leaves the server still planning a
-            // statement nobody is waiting for. Best effort: the kill's own failure
-            // is never reported in place of the failure the agent needs.
-            self.kill(connection_id).await;
+        match outcome {
+            Ok(plan) => {
+                // Rollback, not commit: a read-only transaction has nothing to
+                // commit. Its own outcome is discarded rather than propagated, on
+                // its own short budget, for the same reason `execute.rs` discards
+                // it on its own success path — a slow `ROLLBACK` must not replace a
+                // valid plan with a timeout. Awaiting it here is safe precisely
+                // because `outcome` is `Ok`: the statement already finished, so
+                // there is nothing still running on the connection for `ROLLBACK`
+                // to wait behind.
+                let rollback_deadline = Instant::now() + ROLLBACK_TIMEOUT;
+                let _rollback_outcome = bounded(rollback_deadline, transaction.rollback()).await;
+                Ok(plan)
+            }
+            Err(error) => {
+                // A timeout or a cancellation leaves the server still planning a
+                // statement nobody is waiting for, so the kill is unconditional on
+                // every failure here, not only `Timeout`/`Cancelled`. Best effort:
+                // its own failure is never reported in place of `error`, which is
+                // the failure the agent actually needs.
+                self.kill(connection_id).await;
+                // Dropping queues a ROLLBACK without awaiting it, exactly as
+                // `execute.rs`'s own error path does and for the same reason:
+                // awaiting one on a connection whose statement may still be
+                // running would hang, holding the caller's `QueryPermit` for up to
+                // `KILL_TIMEOUT` plus `ROLLBACK_TIMEOUT` behind a plan nobody is
+                // waiting for. `test_before_acquire` — sqlx's own default, which
+                // `pool.rs` never overrides — discards anything unusable before
+                // the pool hands it out again. The kill above runs first so the
+                // connection cannot return to the pool, and its id be reused,
+                // before `KILL QUERY` lands.
+                drop(transaction);
+                Err(error)
+            }
         }
-
-        // Rollback, not commit: a read-only transaction has nothing to commit. Its
-        // outcome is discarded rather than propagated, on its own short budget, for
-        // the same reason `execute.rs` discards it — a slow `ROLLBACK` must not
-        // replace a valid plan with a timeout.
-        let rollback_deadline = Instant::now() + ROLLBACK_TIMEOUT;
-        let _rollback_outcome = bounded(rollback_deadline, transaction.rollback()).await;
-        outcome
     }
 
     /// Asks the server to stop planning on `connection_id`.
@@ -271,7 +292,15 @@ mod tests {
 
     #[tokio::test]
     async fn an_explainer_builds_over_a_connection_without_touching_it() {
+        // `lazy_for_tests` opens no socket, so a fresh pool's own connection count
+        // is zero before anything runs on it. That count is the observable witness
+        // for "without touching it": if `MySqlExplainer::new` acquired or opened a
+        // connection merely to construct itself, this would no longer be zero.
         let pools = Arc::new(MySqlConnectionPools::lazy_for_tests());
-        let _explainer = MySqlExplainer::new(pools);
+        assert_eq!(pools.agent().size(), 0);
+
+        let _explainer = MySqlExplainer::new(Arc::clone(&pools));
+
+        assert_eq!(pools.agent().size(), 0);
     }
 }

@@ -380,7 +380,7 @@ fn only_the_analyzer_and_the_crate_root_export_anything() {
     assert!(
         violations.is_empty(),
         "these internal items are exported:\n{}\n\n\
-         Keeping the crate's public surface to the four reviewed files is what \
+         Keeping the crate's public surface to the seven reviewed files is what \
          makes \"no parser AST and no driver handle leaves the adapter\" checkable \
          at all (ADR-0007, ADR-0005). Use `pub(crate)`.",
         violations.join("\n")
