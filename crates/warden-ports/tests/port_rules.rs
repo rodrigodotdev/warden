@@ -306,6 +306,28 @@ fn a_startup_only_error_implements_no_public_error() {
     );
 }
 
+/// The explainer takes an authorized statement, not a raw request.
+///
+/// `docs/mcp.md` section 3.1: PostgreSQL's planner constant-folds `IMMUTABLE`
+/// functions, so a malicious immutable function runs during planning and every
+/// policy that applies to `query` applies here. A signature taking `ExplainRequest`
+/// would make the plan path an execution path outside the pipeline
+/// (SPEC section 6, invariant 12; ADR-0017).
+#[test]
+fn the_explainer_plans_only_an_authorized_statement() {
+    let declaration = trait_method_declaration("Explainer", "explain");
+    assert!(
+        declaration.contains("query: &'a AuthorizedQuery"),
+        "Explainer::explain does not take an AuthorizedQuery, so planning would \
+         bypass the policy engine (docs/mcp.md section 3.1)"
+    );
+    assert!(
+        !declaration.contains("ExplainRequest"),
+        "ExplainRequest is the MCP-facing input Milestone 12 converts; the port \
+         takes authorized state"
+    );
+}
+
 /// One type implementing every port, used only to prove dyn compatibility.
 ///
 /// Each method is unreachable in this test; none of them is ever called.

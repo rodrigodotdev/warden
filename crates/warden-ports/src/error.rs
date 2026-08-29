@@ -20,6 +20,7 @@
 
 use warden_core::connection::ConnectionName;
 use warden_core::error::{PublicError, PublicErrorCode};
+use warden_core::explain::PlanError;
 use warden_core::result::{NormalizationError, ResultBuildError};
 use warden_policy::{DenyCode, DenyReason, PolicyRejection};
 
@@ -194,6 +195,15 @@ pub enum ExplainError {
         /// What the adapter could not interpret, for a deliberate diagnostic path.
         detail: String,
     },
+    /// The engine's plan document is larger than one response may carry.
+    ///
+    /// Refused rather than truncated (`docs/data-model.md` section 10): a shortened
+    /// plan document is not a smaller plan.
+    #[error("the plan exceeded its byte budget")]
+    PlanTooLarge {
+        /// The configured budget in bytes.
+        limit: usize,
+    },
     /// Planning exceeded its deadline.
     #[error("planning exceeded its deadline")]
     Timeout,
@@ -211,11 +221,26 @@ pub enum ExplainError {
 impl PublicError for ExplainError {
     fn public_code(&self) -> PublicErrorCode {
         match self {
-            Self::PrefixVerificationFailed | Self::MalformedPlan { .. } | Self::Database { .. } => {
-                PublicErrorCode::ExplainError
-            }
+            Self::PrefixVerificationFailed
+            | Self::MalformedPlan { .. }
+            | Self::PlanTooLarge { .. }
+            | Self::Database { .. } => PublicErrorCode::ExplainError,
             Self::Timeout => PublicErrorCode::QueryTimeout,
             Self::Cancelled => PublicErrorCode::QueryCancelled,
+        }
+    }
+}
+
+/// A plan the core refused becomes the explain failure the model sees.
+///
+/// `actual` is dropped deliberately. `docs/security.md` section 10 gives the agent a
+/// fixed `explain_error`, and the exact size of a document it never received is a
+/// fact about the data rather than something it can act on — the same reason
+/// `ExecuteError::ResultTooLarge` keeps only the budget.
+impl From<PlanError> for ExplainError {
+    fn from(error: PlanError) -> Self {
+        match error {
+            PlanError::TooLarge { limit, .. } => Self::PlanTooLarge { limit },
         }
     }
 }
@@ -361,6 +386,7 @@ mod tests {
                 detail: LEAKY.to_owned(),
             }
             .public_code(),
+            ExplainError::PlanTooLarge { limit: 1 }.public_code(),
             ExplainError::Timeout.public_code(),
             ExplainError::Cancelled.public_code(),
             ExplainError::Database {
@@ -391,6 +417,7 @@ mod tests {
                 PublicErrorCode::QueryTimeout,
                 PublicErrorCode::QueryCancelled,
                 PublicErrorCode::SchemaLookupError,
+                PublicErrorCode::ExplainError,
                 PublicErrorCode::ExplainError,
                 PublicErrorCode::ExplainError,
                 PublicErrorCode::QueryTimeout,
@@ -535,5 +562,24 @@ mod tests {
             error.to_string(),
             "connection production-db is postgresql but its analyzer parses mysql"
         );
+    }
+
+    #[test]
+    fn an_oversized_plan_maps_to_the_explain_code_without_naming_its_size() {
+        let error = ExplainError::from(warden_core::explain::PlanError::TooLarge {
+            actual: 900_000,
+            limit: warden_core::explain::MAX_PLAN_BYTES,
+        });
+        assert_eq!(
+            error,
+            ExplainError::PlanTooLarge {
+                limit: warden_core::explain::MAX_PLAN_BYTES
+            }
+        );
+        assert_eq!(error.public_code(), PublicErrorCode::ExplainError);
+        // `actual` is the engine's document size, which is a fact about the data the
+        // agent asked for. The public text says only that a budget was exceeded, the
+        // same distinction `ExecuteError::ResultTooLarge` draws.
+        assert!(!error.to_string().contains("900000"), "{error}");
     }
 }
