@@ -650,6 +650,16 @@ form is always `[0-9]+`, so there is no injection surface by construction, whate
 value. `tests/adapter_rules.rs` pins `execute.rs` to exactly this one interpolation—a
 second `format!` there fails the test unless it also names `KILL QUERY`.
 
+**The second audited exception is the `explain` prefix, and it is a different kind of
+exception.** `crates/warden-mysql/src/plan.rs` interpolates the analyzed statement
+after `EXPLAIN FORMAT=JSON `. That is not an injection risk defused by a type — it is
+SPEC section 6, invariant 19's own carve-out, the one design point where the string
+sent differs from the string analyzed. Its compensating control is the reparse in the
+same file (`docs/mcp.md` section 3.2, ADR-0037), not the interpolation's shape.
+`tests/adapter_rules.rs` pins `plan.rs` to that single `format!` and pins the prefix
+constant's exact text, and pins `explain.rs` to the same `KILL QUERY` exemption
+`execute.rs` has and nothing more.
+
 **PostgreSQL has no such exception, and its guard says so.** Its cancellation binds a
 pid (`SELECT pg_cancel_backend($1)`) and its per-request deadline binds a value
 (`SELECT set_config('statement_timeout', $1, true)`), so

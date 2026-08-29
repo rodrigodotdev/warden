@@ -9,6 +9,12 @@
 //! `sqlx::raw_sql`, the multi-statement API, stays banned by `clippy.toml`, and
 //! nothing here interpolates a value into the statement: parameters are bound
 //! (`docs/operations.md` section 6.3).
+//!
+//! `crate::explain` calls this with the prefixed string rather than the analyzed
+//! one — the single exception SPEC section 6, invariant 19 allows — and only after
+//! `crate::plan::VerifiedExplain` has reparsed it and matched it against the
+//! analyzed statement (ADR-0037). The parameters are the same bound parameters
+//! either way.
 
 use sqlx::mysql::{MySql, MySqlArguments};
 use sqlx::query::Query;

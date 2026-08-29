@@ -20,6 +20,7 @@ const PUBLIC_FILES: &[&str] = &[
     "connection.rs",
     "error.rs",
     "execute.rs",
+    "explain.rs",
     "inspector.rs",
 ];
 
@@ -763,5 +764,92 @@ fn the_scans_are_alive() {
         "a wildcard over `Expr` must not be flagged merely because the previous \
          arm's body, not its pattern, mentions a warden-core enum \
          (the false positive this scan was narrowed to avoid)"
+    );
+}
+
+#[test]
+fn the_only_format_in_explain_rs_builds_a_kill_query() {
+    // `src/explain.rs` inherits `execute.rs`'s single audited exception and nothing
+    // more: `KILL QUERY {connection_id}` with a `u64`, whose formatted form is
+    // always `[0-9]+`. A second `format!` here needs its own review rather than the
+    // exemption (`docs/operations.md` section 6.3).
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/explain.rs");
+    let mut found = false;
+    for (number, line) in code_lines(&path) {
+        if line.contains("format!") {
+            assert!(
+                line.contains("KILL QUERY"),
+                "src/explain.rs:{number} interpolates with format! outside the \
+                 audited KILL QUERY exception"
+            );
+            found = true;
+        }
+    }
+    assert!(
+        found,
+        "src/explain.rs no longer interpolates a KILL QUERY, so this guard passed \
+         on an absence"
+    );
+}
+
+#[test]
+fn the_only_format_in_plan_rs_builds_the_non_executing_prefix() {
+    // The other side of the same rule. `plan.rs` interpolates agent SQL after a
+    // prefix, which *is* SPEC section 6, invariant 19's exception; the compensating
+    // control is the reparse in the same file. A second, unrelated `format!` here
+    // would be a new exception rather than this one.
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/plan.rs");
+    let lines = code_lines(&path);
+    let mut found = false;
+    for (number, line) in &lines {
+        if line.contains("format!") {
+            assert!(
+                line.contains("EXPLAIN_PREFIX"),
+                "src/plan.rs:{number} interpolates with format! outside the \
+                 verified EXPLAIN prefix"
+            );
+            found = true;
+        }
+    }
+    assert!(found, "src/plan.rs builds no prefixed string at all");
+
+    assert!(
+        lines
+            .iter()
+            .any(|(_, line)| line.as_str()
+                == r#"const EXPLAIN_PREFIX: &str = "EXPLAIN FORMAT=JSON ";"#),
+        "the non-executing prefix is not declared verbatim; `EXPLAIN ANALYZE` runs \
+         the statement (SPEC section 6, invariant 11, ADR-0017), so this constant \
+         changes only through a failing test"
+    );
+    assert!(
+        lines.iter().any(|(_, line)| line.contains("fn verify(")),
+        "src/plan.rs declares no verification, so the prefix would reach the server \
+         unchecked (docs/mcp.md section 3.2)"
+    );
+}
+
+#[test]
+fn a_plan_is_read_as_one_row_and_bounded_before_it_is_returned() {
+    // `EXPLAIN FORMAT=JSON` is one row of one column, so `fetch_one` is right here
+    // and `docs/operations.md` section 6.6's streaming rule does not apply. Pinning
+    // the absence of `fetch_all` and `.fetch(` keeps that from widening into an
+    // unbounded read, and pinning the `validate()` call keeps the byte budget of
+    // `docs/data-model.md` section 10 from being dropped in a refactor.
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/explain.rs");
+    let lines = code_lines(&path);
+    for (number, line) in &lines {
+        assert!(
+            !line.contains("fetch_all(") && !line.contains(".fetch("),
+            "src/explain.rs:{number} reads a plan as a stream or a vector"
+        );
+    }
+    assert!(
+        lines.iter().any(|(_, line)| line.contains("fetch_one(")),
+        "src/explain.rs never fetches anything, so the ban above passed on an absence"
+    );
+    assert!(
+        lines.iter().any(|(_, line)| line.contains(".validate()")),
+        "src/explain.rs returns a plan without bounding it"
     );
 }
