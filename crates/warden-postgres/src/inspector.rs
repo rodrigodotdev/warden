@@ -27,8 +27,8 @@ use warden_core::schema::cache::SchemaCache;
 use warden_core::schema::search::CatalogIndex;
 use warden_core::schema::{
     MAX_CATALOG_ROWS, MAX_DESCRIBED_COLUMNS, MAX_DESCRIBED_FOREIGN_KEYS, MAX_DESCRIBED_INDEXES,
-    Schema, SchemaDescribeRequest, SchemaDescription, SchemaSearchRequest, SchemaSearchResult,
-    Table, TableSelector,
+    MAX_SCHEMA_VALUE_BYTES, Schema, SchemaDescribeRequest, SchemaDescription, SchemaMetadataBudget,
+    SchemaSearchRequest, SchemaSearchResult, Table, TableSelector,
 };
 use warden_policy::ObjectFilter;
 use warden_ports::error::SchemaError;
@@ -108,7 +108,11 @@ impl PostgreSqlSchemaInspector {
                         })
                     })
                     .collect::<Result<Vec<_>, SchemaError>>()?;
-                let index = Arc::new(CatalogIndex::new(catalog::group_index(rows), bounded));
+                let (relations, indexed_columns_bounded) = catalog::group_index(rows);
+                let index = Arc::new(CatalogIndex::new(
+                    relations,
+                    bounded || indexed_columns_bounded,
+                ));
                 self.cache
                     .store_catalog(&self.connection, Arc::clone(&index), now);
                 index
@@ -129,6 +133,7 @@ impl PostgreSqlSchemaInspector {
     ) -> Result<SchemaDescription, SchemaError> {
         let now = StdInstant::now();
         let mut schemas: Vec<Schema> = Vec::new();
+        let mut response_metadata_budget = SchemaMetadataBudget::default();
 
         for selector in request.tables() {
             filter.check(&selector_ref(selector))?;
@@ -151,13 +156,15 @@ impl PostgreSqlSchemaInspector {
                     described
                 }
             };
+            let mut table = filter_foreign_keys(table.as_ref(), filter);
+            response_metadata_budget.bound_table(&mut table);
 
             if let Some(group) = schemas.iter_mut().find(|group| group.name == schema) {
-                group.tables.push(table.as_ref().clone());
+                group.tables.push(table);
             } else {
                 schemas.push(Schema {
                     name: schema,
-                    tables: vec![table.as_ref().clone()],
+                    tables: vec![table],
                 });
             }
         }
@@ -209,12 +216,14 @@ impl PostgreSqlSchemaInspector {
                 .bind(schema)
                 .bind(name)
                 .bind(MAX_DESCRIBED_COLUMNS as i64)
+                .bind(MAX_SCHEMA_VALUE_BYTES as i32)
                 .fetch_all(self.pools.control()),
             deadline,
             cancel,
         )
         .await?;
         let columns_bounded = column_rows.len() == MAX_DESCRIBED_COLUMNS;
+        let mut metadata_budget = SchemaMetadataBudget::default();
         let columns = column_rows
             .into_iter()
             .map(|row| {
@@ -224,6 +233,7 @@ impl PostgreSqlSchemaInspector {
                     row.try_get("is_nullable").map_err(database_error)?,
                     row.try_get("column_default").map_err(database_error)?,
                     row.try_get("column_comment").map_err(database_error)?,
+                    &mut metadata_budget,
                 ))
             })
             .collect::<Result<Vec<_>, SchemaError>>()?;
@@ -264,19 +274,22 @@ impl PostgreSqlSchemaInspector {
         )
         .await?;
         let foreign_keys_bounded = foreign_key_rows.len() == MAX_DESCRIBED_FOREIGN_KEYS;
-        let foreign_key_rows = foreign_key_rows
-            .into_iter()
-            .map(|row| {
-                Ok(catalog::ForeignKeyRow {
-                    constraint: row.try_get("constraint_name").map_err(database_error)?,
-                    column: row.try_get("column_name").map_err(database_error)?,
-                    referenced_schema: row.try_get("referenced_schema").map_err(database_error)?,
-                    referenced_table: row.try_get("referenced_table").map_err(database_error)?,
-                    referenced_column: row.try_get("referenced_column").map_err(database_error)?,
-                })
-            })
-            .collect::<Result<Vec<_>, SchemaError>>()?;
-        let foreign_keys = catalog::group_foreign_keys(foreign_key_rows);
+        let mut hidden_foreign_key_target = false;
+        let mut decoded_foreign_key_rows = Vec::with_capacity(foreign_key_rows.len());
+        for row in foreign_key_rows {
+            if row.try_get("metadata_truncated").map_err(database_error)? {
+                hidden_foreign_key_target = true;
+                continue;
+            }
+            decoded_foreign_key_rows.push(catalog::ForeignKeyRow {
+                constraint: row.try_get("constraint_name").map_err(database_error)?,
+                column: row.try_get("column_name").map_err(database_error)?,
+                referenced_schema: row.try_get("referenced_schema").map_err(database_error)?,
+                referenced_table: row.try_get("referenced_table").map_err(database_error)?,
+                referenced_column: row.try_get("referenced_column").map_err(database_error)?,
+            });
+        }
+        let foreign_keys = catalog::group_foreign_keys(decoded_foreign_key_rows);
 
         Ok(Table {
             schema: schema.to_owned(),
@@ -286,7 +299,11 @@ impl PostgreSqlSchemaInspector {
             primary_key,
             foreign_keys,
             indexes,
-            truncated: columns_bounded || indexes_truncated || foreign_keys_bounded,
+            truncated: columns_bounded
+                || indexes_truncated
+                || foreign_keys_bounded
+                || hidden_foreign_key_target
+                || metadata_budget.truncated(),
         })
     }
 }
@@ -372,19 +389,34 @@ fn selector_ref(selector: &TableSelector) -> ObjectRef {
     }
 }
 
+/// Builds one response copy while keeping policy-specific omissions out of cache.
+fn filter_foreign_keys(table: &Table, filter: ObjectFilter<'_>) -> Table {
+    let mut response = table.clone();
+    response.foreign_keys.retain(|foreign_key| {
+        filter.permits(&object_ref(
+            &foreign_key.referenced_schema,
+            &foreign_key.referenced_table,
+        ))
+    });
+    response.truncated |= response.foreign_keys.len() != table.foreign_keys.len();
+    response
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use std::sync::Arc;
 
-    use warden_core::connection::ConnectionName;
+    use warden_core::connection::{ConnectionMetadata, ConnectionName, Environment};
+    use warden_core::context::RequestContext;
     use warden_core::dialect::Dialect;
-    use warden_core::schema::TableSelector;
+    use warden_core::schema::{ForeignKey, Table, TableKind, TableSelector};
     use warden_policy::folding::rule_matches;
+    use warden_policy::{ObjectFilter, ObjectRules, PolicyContext, PolicyEngine, PolicySettings};
     use warden_ports::SchemaInspector;
 
-    use super::{PostgreSqlSchemaInspector, object_ref, selector_ref};
+    use super::{PostgreSqlSchemaInspector, filter_foreign_keys, object_ref, selector_ref};
     use crate::connection::PostgreSqlConnectionPools;
 
     #[test]
@@ -438,5 +470,67 @@ mod tests {
         let object = object_ref("app", "Users");
         assert!(!rule_matches(Dialect::PostgreSql, "users", &object.name));
         assert!(rule_matches(Dialect::PostgreSql, "Users", &object.name));
+    }
+
+    #[test]
+    fn a_denied_foreign_key_target_is_omitted_without_mutating_cached_metadata() {
+        let raw = table_with_foreign_key();
+        let settings = PolicySettings {
+            objects: ObjectRules {
+                deny_tables: vec!["app.target".to_owned()],
+                ..ObjectRules::default()
+            },
+            ..PolicySettings::default()
+        };
+        let engine = PolicyEngine::with_defaults(&settings).expect("valid policy");
+        let connection = metadata();
+        let context = context();
+        let filter = ObjectFilter::new(&engine, PolicyContext::new(&context, &connection));
+
+        let response = filter_foreign_keys(&raw, filter);
+
+        assert!(response.foreign_keys.is_empty());
+        assert!(response.truncated);
+        assert_eq!(
+            raw.foreign_keys.len(),
+            1,
+            "cached metadata stays unfiltered"
+        );
+    }
+
+    fn metadata() -> ConnectionMetadata {
+        ConnectionMetadata {
+            name: "production-postgres".parse().expect("valid connection"),
+            dialect: Dialect::PostgreSql,
+            environment: Environment::Development,
+            database: "postgres".to_owned(),
+        }
+    }
+
+    fn context() -> RequestContext {
+        RequestContext::new(
+            "req-1".parse().expect("valid request id"),
+            "alice@example.com".parse().expect("valid principal"),
+            "test".parse().expect("valid client"),
+        )
+    }
+
+    fn table_with_foreign_key() -> Table {
+        Table {
+            schema: "app".to_owned(),
+            name: "source".to_owned(),
+            kind: TableKind::Table,
+            columns: Vec::new(),
+            primary_key: Vec::new(),
+            foreign_keys: vec![ForeignKey {
+                name: Some("source_target".to_owned()),
+                columns: vec!["target_id".to_owned()],
+                referenced_schema: "app".to_owned(),
+                referenced_table: "target".to_owned(),
+                referenced_columns: vec!["id".to_owned()],
+            }],
+            indexes: Vec::new(),
+            truncated: false,
+        }
     }
 }

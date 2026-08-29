@@ -45,8 +45,9 @@ control is accepted risk and must say so explicitly.
 | Read through a view that bypasses the allowlist | role `GRANT`; allowlist explicitly is not a boundary | privilege test + documentation (PostgreSQL tested: `the_grant_is_the_read_boundary_and_the_allowlist_is_not`, whose second half reads the denied table through a granted view) |
 | Ambiguous name resolution (`search_path`, default database) | set `search_path` and database at connect time | integration |
 | File-reading function | function classification; no `FILE` privilege | corpus + privilege test |
-| Broad schema enumeration | bounded response; object policy on schema tools at the source (ADR-0036) | integration (MySQL tested: `search_never_returns_more_than_the_requested_limit`, `a_denied_table_is_invisible_to_search_and_refused_by_describe`; PostgreSQL tested: the same two plus `an_unqualified_selector_cannot_reach_a_denied_schema`) |
-| Describing a relation the role cannot read | catalog queries filter on `has_table_privilege`/`has_schema_privilege`; MySQL's `information_schema` hides unprivileged objects itself | PostgreSQL integration (tested: `a_relation_the_role_cannot_select_is_invisible`) |
+| Broad schema enumeration | bounded response; object policy on schema tools at the source (ADR-0036); partial search index is explicit | integration (MySQL tested: `search_never_returns_more_than_the_requested_limit`, `a_denied_table_is_invisible_to_search_and_refused_by_describe`, `search_reports_truncation_when_only_an_omitted_column_matches`; PostgreSQL tested: the same rows plus `an_unqualified_selector_cannot_reach_a_denied_schema`) |
+| Describing a relation or FK target the role cannot read | catalog queries filter on `has_table_privilege`/`has_schema_privilege`; MySQL's `information_schema` hides unprivileged objects itself; FK targets also pass per-request object rules | integration (MySQL tested: `foreign_key_target_policy_is_reapplied_on_cold_and_warm_cache_reads`; PostgreSQL tested: the same plus `a_relation_the_role_cannot_select_is_invisible`, `a_foreign_key_to_a_target_without_select_is_omitted_as_truncated`) |
+| Oversized catalog default or comment | 64 KiB per UTF-8 value and 256 KiB accumulated per cached table and description response; static SQL character pre-cap; `Table.truncated` | unit on both adapters + core budget tests |
 | DSN in a tool response | non-serializable secret types; MCP models have no DSN field | unit + E2E |
 | Credential in log, trace, or error | sanitized error mapping; trace-field allowlist; panic hook without payload | unit + E2E |
 | Raw SQL in an operator log through the driver | `ConnectOptions::disable_statement_logging` on every connect options value | unit |
@@ -199,7 +200,12 @@ drops a refused relation before the response limit is applied, so a denied table
 cannot displace an allowed one or be counted; `describe_schema` returns
 `SchemaError::Rejected`, and checks twice — once on the name the agent wrote and once
 on the name the default database or `search_path` resolved it to, which is what stops
-an unqualified selector from reaching a denied schema.
+an unqualified selector from reaching a denied schema. Each returned foreign key is
+also checked against its referenced relation on every response, including cache
+hits. A refused target is omitted silently and sets `Table.truncated`; rejecting the
+source would confirm that the hidden target exists. PostgreSQL additionally requires
+`USAGE` on the referenced schema and `SELECT` on the referenced table in its static
+foreign-key catalog SQL.
 
 Otherwise, a denied table remains describable and the agent can learn the entire data
 model.
@@ -419,14 +425,16 @@ Redaction protects against accidental exposure and minimizes output. If an agent
 never access a secret column, use database privileges or a view that omits it. Public
 material does **not** present redaction as an exfiltration control.
 
-Redaction also applies to `describe_schema` output because column defaults and comments
-can contain secrets.
+Redaction must also apply to `describe_schema` output because column defaults and
+comments can contain secrets.
 
 Milestone 9 returns `ColumnDescription::default` and `comment` unredacted: the
 redaction matcher is `warden-service` work in Milestone 11, and shipping a second
 matcher inside two adapters would create the divergence the single matcher exists to
 prevent. Until then, do not configure Warden against a database whose column defaults
-or comments contain secrets.
+or comments contain secrets. Milestone 9 does bound their volume: 64 KiB per value
+and 256 KiB accumulated across one description response, with UTF-8-safe truncation.
+Bounding is not redaction and does not make a retained secret safe.
 
 ## 9. Injection through returned data
 

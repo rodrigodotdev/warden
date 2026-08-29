@@ -19,7 +19,9 @@ use warden_core::context::RequestContext;
 use warden_core::dialect::Dialect;
 use warden_core::pool::AGENT_POOL_MAX_CONNECTIONS;
 use warden_core::schema::cache::{SCHEMA_CACHE_CAPACITY, SchemaCache};
-use warden_core::schema::{MatchReason, SchemaDescribeRequest, SchemaSearchRequest, TableKind};
+use warden_core::schema::{
+    MAX_INDEXED_COLUMNS, MatchReason, SchemaDescribeRequest, SchemaSearchRequest, TableKind,
+};
 use warden_core::secret::Dsn;
 use warden_policy::{
     DenyCode, ObjectFilter, ObjectRules, PolicyContext, PolicyEngine, PolicySettings,
@@ -76,6 +78,14 @@ async fn role_dsn(container: &ContainerAsync<Postgres>) -> Dsn {
 async fn fixture(pools: &PostgreSqlConnectionPools) {
     let mut connection = pools.control().acquire().await.unwrap();
     let mut transaction = connection.begin_with("BEGIN READ WRITE").await.unwrap();
+    let mut wide_columns: Vec<String> = (0..MAX_INDEXED_COLUMNS)
+        .map(|index| format!("column_{index} BIGINT"))
+        .collect();
+    wide_columns.push("omitted_tail_marker BIGINT".to_owned());
+    let wide_table = format!(
+        "CREATE TABLE app.wide_catalog ({})",
+        wide_columns.join(", ")
+    );
 
     for statement in [
         format!(
@@ -96,6 +106,11 @@ async fn fixture(pools: &PostgreSqlConnectionPools) {
              status TEXT NOT NULL DEFAULT 'new',
              notes TEXT,
              PRIMARY KEY (tenant_id, id)
+        )"
+        .to_owned(),
+        "CREATE TABLE app.fk_source (
+             id BIGINT PRIMARY KEY,
+             target_id BIGINT REFERENCES app.customers(id)
          )"
         .to_owned(),
         "COMMENT ON COLUMN app.orders.notes IS 'free-form operator notes'".to_owned(),
@@ -113,6 +128,7 @@ async fn fixture(pools: &PostgreSqlConnectionPools) {
         "CREATE TABLE app.\"Orders\" (id BIGINT PRIMARY KEY)".to_owned(),
         "CREATE TABLE app.invisible (id BIGINT PRIMARY KEY)".to_owned(),
         "CREATE TABLE vault.secrets (id BIGINT PRIMARY KEY, token TEXT NOT NULL)".to_owned(),
+        wide_table,
         format!("GRANT CONNECT ON DATABASE postgres TO {ROLE}"),
         format!("GRANT USAGE ON SCHEMA app, vault TO {ROLE}"),
         format!("GRANT SELECT ON ALL TABLES IN SCHEMA app, vault TO {ROLE}"),
@@ -240,6 +256,95 @@ async fn a_described_table_carries_its_columns_keys_and_indexes() {
     assert!(table.truncated);
     assert!(table.indexes.iter().all(|index| !index.columns.is_empty()));
 
+    close(root, pools).await;
+}
+
+#[tokio::test]
+async fn foreign_key_target_policy_is_reapplied_on_cold_and_warm_cache_reads() {
+    let container = start_postgres().await;
+    let (root, pools) = connect(&container, &["app", "public"]).await;
+    let inspector = PostgreSqlSchemaInspector::new(Arc::clone(&pools), name());
+    let denied_engine = engine(&PolicySettings {
+        objects: ObjectRules {
+            deny_tables: vec!["app.customers".to_owned()],
+            ..ObjectRules::default()
+        },
+        ..PolicySettings::default()
+    });
+    let permissive_engine = engine(&PolicySettings::default());
+    let connection = metadata();
+    let context = context();
+    let request =
+        SchemaDescribeRequest::new(name(), vec!["app.fk_source".parse().unwrap()]).unwrap();
+
+    let cold_denied = inspector
+        .describe_schema(
+            &request,
+            filter(&denied_engine, &context, &connection),
+            super::deadline(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let cold_table = &cold_denied.schemas[0].tables[0];
+    assert!(cold_table.foreign_keys.is_empty());
+    assert!(cold_table.truncated);
+
+    let warm_permitted = inspector
+        .describe_schema(
+            &request,
+            filter(&permissive_engine, &context, &connection),
+            super::deadline(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(warm_permitted.schemas[0].tables[0].foreign_keys.len(), 1);
+
+    let warm_denied = inspector
+        .describe_schema(
+            &request,
+            filter(&denied_engine, &context, &connection),
+            super::deadline(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let warm_table = &warm_denied.schemas[0].tables[0];
+    assert!(warm_table.foreign_keys.is_empty());
+    assert!(warm_table.truncated);
+    close(root, pools).await;
+}
+
+#[tokio::test]
+async fn a_foreign_key_to_a_target_without_select_is_omitted_as_truncated() {
+    let container = start_postgres().await;
+    let (root, pools) = connect(&container, &["app", "public"]).await;
+    mutate(
+        &root,
+        &format!("REVOKE SELECT ON app.customers FROM {ROLE}"),
+    )
+    .await;
+    let inspector = PostgreSqlSchemaInspector::new(Arc::clone(&pools), name());
+    let engine = engine(&PolicySettings::default());
+    let connection = metadata();
+    let context = context();
+    let request =
+        SchemaDescribeRequest::new(name(), vec!["app.fk_source".parse().unwrap()]).unwrap();
+
+    let described = inspector
+        .describe_schema(
+            &request,
+            filter(&engine, &context, &connection),
+            super::deadline(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    let table = &described.schemas[0].tables[0];
+    assert!(table.foreign_keys.is_empty());
+    assert!(table.truncated);
     close(root, pools).await;
 }
 
@@ -536,6 +641,31 @@ async fn search_never_returns_more_than_the_requested_limit() {
         .unwrap();
 
     assert_eq!(found.matches.len(), 1);
+    assert!(found.truncated);
+    close(root, pools).await;
+}
+
+#[tokio::test]
+async fn search_reports_truncation_when_only_an_omitted_column_matches() {
+    let container = start_postgres().await;
+    let (root, pools) = connect(&container, &["app", "public"]).await;
+    let inspector = PostgreSqlSchemaInspector::new(Arc::clone(&pools), name());
+    let engine = engine(&PolicySettings::default());
+    let connection = metadata();
+    let context = context();
+    let request = SchemaSearchRequest::new(name(), "omitted_tail_marker", 10).unwrap();
+
+    let found = inspector
+        .search_schema(
+            &request,
+            filter(&engine, &context, &connection),
+            super::deadline(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert!(found.matches.is_empty());
     assert!(found.truncated);
     close(root, pools).await;
 }

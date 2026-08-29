@@ -4,9 +4,10 @@
 //! agent must be able to learn tables, columns, keys, indexes, and types before it
 //! writes a query (`docs/data-model.md` section 9).
 //!
-//! Nothing here can hold connection data. Redaction still applies to these values
-//! in Milestone 9 because column defaults and comments can contain secrets
-//! (`docs/security.md` section 8).
+//! Nothing here can hold connection data. Column defaults and comments remain
+//! unredacted until Milestone 11, but Milestone 9 bounds them before caching and
+//! serialization because database-controlled text cannot be allowed to grow without
+//! limit (`docs/security.md` section 8).
 
 pub mod cache;
 pub mod search;
@@ -44,6 +45,19 @@ pub const MAX_DESCRIBED_INDEXES: usize = 128;
 
 /// The largest number of foreign keys one described relation may carry.
 pub const MAX_DESCRIBED_FOREIGN_KEYS: usize = 128;
+
+/// The largest UTF-8 byte length retained for one column default or comment.
+///
+/// Catalog text is database-controlled data. This mirrors the ordinary query
+/// value default while remaining a separate invariant for schema responses.
+pub const MAX_SCHEMA_VALUE_BYTES: usize = 64 * 1024;
+
+/// The largest accumulated bytes of defaults and comments in one description.
+///
+/// The bound applies to each cached table and again across every table copied into
+/// one `describe_schema` response. It counts UTF-8 payload bytes, not identifiers
+/// or serialization overhead.
+pub const MAX_SCHEMA_DESCRIPTION_BYTES: usize = 256 * 1024;
 
 /// The largest number of terms one `search_schema` call may carry.
 pub const MAX_SEARCH_TERMS: usize = 10;
@@ -342,9 +356,9 @@ pub struct ColumnDescription {
     pub database_type: String,
     /// Whether the column accepts `NULL`.
     pub nullable: bool,
-    /// The column default, when one exists and survives redaction.
+    /// The bounded column default, when one exists.
     pub default: Option<String>,
-    /// The column comment, when one exists and survives redaction.
+    /// The bounded column comment, when one exists.
     pub comment: Option<String>,
 }
 
@@ -395,11 +409,10 @@ pub struct Table {
     pub indexes: Vec<IndexDescription>,
     /// Whether any of this relation's metadata was left out.
     ///
-    /// Set when a bound above cut a list, and when the engine described a key part
-    /// that has no column name — a functional index on MySQL, an expression index on
-    /// PostgreSQL. Warden omits such a part rather than inventing a name for it
-    /// (`docs/architecture.md` section 11), and says so here, because an agent that
-    /// believed it had seen every column would write a wrong query.
+    /// Set when a bound cuts a list or catalog text, when an engine reports a key
+    /// part without a column name, and when a foreign-key target is hidden by policy
+    /// or database privileges. Warden omits unavailable metadata rather than
+    /// inventing or exposing it, and says the result is partial.
     pub truncated: bool,
 }
 
@@ -417,6 +430,69 @@ pub struct Schema {
 pub struct SchemaDescription {
     /// The described schemas.
     pub schemas: Vec<Schema>,
+}
+
+/// Deterministically bounds adversarial text from a database catalog.
+///
+/// Values are cut at both [`MAX_SCHEMA_VALUE_BYTES`] and the remaining description
+/// budget. Cuts preserve UTF-8 boundaries; an input whose first scalar does not fit
+/// is omitted rather than replaced with invalid or invented text.
+#[derive(Debug, Clone)]
+pub struct SchemaMetadataBudget {
+    remaining: usize,
+    truncations: usize,
+}
+
+impl SchemaMetadataBudget {
+    /// Builds a budget for one cached table or one complete response.
+    #[must_use]
+    pub fn new(max_bytes: usize) -> Self {
+        Self {
+            remaining: max_bytes,
+            truncations: 0,
+        }
+    }
+
+    /// Bounds one optional catalog value, consuming only retained UTF-8 bytes.
+    pub fn bound(&mut self, value: Option<String>) -> Option<String> {
+        let mut value = value?;
+        let allowed = self.remaining.min(MAX_SCHEMA_VALUE_BYTES);
+        if value.len() <= allowed {
+            self.remaining -= value.len();
+            return Some(value);
+        }
+
+        self.truncations += 1;
+        let mut end = allowed;
+        while !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        value.truncate(end);
+        self.remaining -= value.len();
+        (!value.is_empty()).then_some(value)
+    }
+
+    /// Applies the remaining budget to every default and comment in one table.
+    pub fn bound_table(&mut self, table: &mut Table) {
+        let truncations_before = self.truncations;
+        for column in &mut table.columns {
+            column.default = self.bound(column.default.take());
+            column.comment = self.bound(column.comment.take());
+        }
+        table.truncated |= self.truncations != truncations_before;
+    }
+
+    /// Whether this budget omitted or cut any catalog value.
+    #[must_use]
+    pub fn truncated(&self) -> bool {
+        self.truncations != 0
+    }
+}
+
+impl Default for SchemaMetadataBudget {
+    fn default() -> Self {
+        Self::new(MAX_SCHEMA_DESCRIPTION_BYTES)
+    }
 }
 
 #[cfg(test)]
@@ -566,5 +642,55 @@ mod tests {
         for forbidden in ["dsn", "password", "host", "user"] {
             assert!(!json.contains(forbidden), "{json}");
         }
+    }
+
+    #[test]
+    fn metadata_budget_truncates_one_utf8_value_on_a_character_boundary() {
+        let mut budget = SchemaMetadataBudget::default();
+        let oversized = "🙂".repeat(MAX_SCHEMA_VALUE_BYTES / "🙂".len() + 1);
+
+        let bounded = budget
+            .bound(Some(oversized))
+            .expect("a non-empty prefix fits");
+
+        assert_eq!(bounded.len(), MAX_SCHEMA_VALUE_BYTES);
+        assert!(budget.truncated());
+    }
+
+    #[test]
+    fn metadata_budget_marks_a_table_when_accumulated_text_is_omitted() {
+        let mut table = Table {
+            schema: "app".to_owned(),
+            name: "wide_metadata".to_owned(),
+            kind: TableKind::Table,
+            columns: (0..3)
+                .map(|index| ColumnDescription {
+                    name: format!("column_{index}"),
+                    database_type: "text".to_owned(),
+                    nullable: true,
+                    default: Some("d".repeat(MAX_SCHEMA_VALUE_BYTES)),
+                    comment: Some("c".repeat(MAX_SCHEMA_VALUE_BYTES)),
+                })
+                .collect(),
+            primary_key: Vec::new(),
+            foreign_keys: Vec::new(),
+            indexes: Vec::new(),
+            truncated: false,
+        };
+        let mut budget = SchemaMetadataBudget::default();
+
+        budget.bound_table(&mut table);
+
+        let retained_bytes: usize = table
+            .columns
+            .iter()
+            .flat_map(|column| [column.default.as_ref(), column.comment.as_ref()])
+            .flatten()
+            .map(String::len)
+            .sum();
+        assert_eq!(retained_bytes, MAX_SCHEMA_DESCRIPTION_BYTES);
+        assert!(table.truncated);
+        assert!(table.columns[2].default.is_none());
+        assert!(table.columns[2].comment.is_none());
     }
 }

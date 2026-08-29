@@ -5,15 +5,17 @@
 //! through the policy pipeline. There is no `format!` in this file and no reachable
 //! way to add one — every variable part is a `$n` parameter.
 //!
-//! Every statement filters on `pg_catalog.has_table_privilege(c.oid, 'SELECT')` and
-//! `has_schema_privilege(n.oid, 'USAGE')`. Unlike MySQL's `information_schema`,
-//! PostgreSQL's catalog is world-readable: without those predicates an agent could
-//! enumerate relations its role can never read. With them, discovery is bounded by
-//! the same `GRANT` that bounds reading, which is the boundary ADR-0023 names.
+//! Search and resolution filter on `pg_catalog.has_table_privilege(c.oid, 'SELECT')`
+//! and `has_schema_privilege(n.oid, 'USAGE')`. Detail statements consume only an
+//! exact pair resolution already cleared, while foreign keys repeat those checks for
+//! `fc`/`fn`, the referenced table and schema. Unlike MySQL's `information_schema`,
+//! PostgreSQL's catalog is world-readable, so these predicates bind discovery to the
+//! same `GRANT` that bounds reading (ADR-0023).
 
 use warden_core::schema::search::IndexedRelation;
 use warden_core::schema::{
-    ColumnDescription, ForeignKey, IndexDescription, MAX_INDEXED_COLUMNS, TableKind,
+    ColumnDescription, ForeignKey, IndexDescription, MAX_INDEXED_COLUMNS, SchemaMetadataBudget,
+    TableKind,
 };
 
 /// One row per visible relation column, ordered so grouping is linear.
@@ -53,12 +55,14 @@ SELECT n.nspname AS table_schema, c.relname AS table_name, c.relkind::text AS re
 
 /// The three detail statements deliberately do not repeat the privilege predicates:
 /// [`RESOLVE_SQL`] already cleared their exact `(schema, table)` pair.
+/// `left` caps characters before driver decoding; core applies the exact UTF-8 byte
+/// and accumulated response bounds after decoding.
 pub(crate) const COLUMNS_SQL: &str = "\
 SELECT a.attname AS column_name, \
        pg_catalog.format_type(a.atttypid, a.atttypmod) AS data_type, \
        NOT a.attnotnull AS is_nullable, \
-       pg_catalog.pg_get_expr(d.adbin, d.adrelid) AS column_default, \
-       pg_catalog.col_description(c.oid, a.attnum) AS column_comment \
+       pg_catalog.left(pg_catalog.pg_get_expr(d.adbin, d.adrelid), $4::integer) AS column_default, \
+       pg_catalog.left(pg_catalog.col_description(c.oid, a.attnum), $4::integer) AS column_comment \
   FROM pg_catalog.pg_class AS c \
   JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace \
   JOIN pg_catalog.pg_attribute AS a ON a.attrelid = c.oid \
@@ -86,23 +90,51 @@ SELECT ic.relname AS index_name, \
  ORDER BY ic.relname, k.ord \
  LIMIT $3";
 
+/// Returns visible FK parts plus a name-free sentinel when any target is hidden.
+///
+/// The sentinel lets the response report partiality without disclosing which
+/// constraint or target the role cannot see.
 pub(crate) const FOREIGN_KEYS_SQL: &str = "\
-SELECT con.conname AS constraint_name, \
-       a.attname AS column_name, \
-       fn.nspname AS referenced_schema, \
-       fc.relname AS referenced_table, \
-       fa.attname AS referenced_column \
-  FROM pg_catalog.pg_constraint AS con \
-  JOIN pg_catalog.pg_class AS c ON c.oid = con.conrelid \
-  JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace \
-  JOIN pg_catalog.pg_class AS fc ON fc.oid = con.confrelid \
-  JOIN pg_catalog.pg_namespace AS fn ON fn.oid = fc.relnamespace \
-  JOIN LATERAL ROWS FROM (pg_catalog.unnest(con.conkey), pg_catalog.unnest(con.confkey)) \
-       WITH ORDINALITY AS k(att, fatt, ord) ON true \
-  JOIN pg_catalog.pg_attribute AS a ON a.attrelid = c.oid AND a.attnum = k.att \
-  JOIN pg_catalog.pg_attribute AS fa ON fa.attrelid = fc.oid AND fa.attnum = k.fatt \
- WHERE n.nspname = $1 AND c.relname = $2 AND con.contype = 'f' \
- ORDER BY con.conname, k.ord \
+WITH visible_foreign_keys AS ( \
+    SELECT con.conname AS constraint_name, \
+           k.ord AS position, \
+           a.attname AS column_name, \
+           fn.nspname AS referenced_schema, \
+           fc.relname AS referenced_table, \
+           fa.attname AS referenced_column \
+      FROM pg_catalog.pg_constraint AS con \
+      JOIN pg_catalog.pg_class AS c ON c.oid = con.conrelid \
+      JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace \
+      JOIN pg_catalog.pg_class AS fc ON fc.oid = con.confrelid \
+      JOIN pg_catalog.pg_namespace AS fn ON fn.oid = fc.relnamespace \
+      JOIN LATERAL ROWS FROM (pg_catalog.unnest(con.conkey), pg_catalog.unnest(con.confkey)) \
+           WITH ORDINALITY AS k(att, fatt, ord) ON true \
+      JOIN pg_catalog.pg_attribute AS a ON a.attrelid = c.oid AND a.attnum = k.att \
+      JOIN pg_catalog.pg_attribute AS fa ON fa.attrelid = fc.oid AND fa.attnum = k.fatt \
+     WHERE n.nspname = $1 AND c.relname = $2 AND con.contype = 'f' \
+       AND pg_catalog.has_schema_privilege(fn.oid, 'USAGE') \
+       AND pg_catalog.has_table_privilege(fc.oid, 'SELECT') \
+), hidden_target AS ( \
+    SELECT EXISTS ( \
+        SELECT 1 \
+          FROM pg_catalog.pg_constraint AS con \
+          JOIN pg_catalog.pg_class AS c ON c.oid = con.conrelid \
+          JOIN pg_catalog.pg_namespace AS n ON n.oid = c.relnamespace \
+          JOIN pg_catalog.pg_class AS fc ON fc.oid = con.confrelid \
+          JOIN pg_catalog.pg_namespace AS fn ON fn.oid = fc.relnamespace \
+         WHERE n.nspname = $1 AND c.relname = $2 AND con.contype = 'f' \
+           AND NOT (pg_catalog.has_schema_privilege(fn.oid, 'USAGE') \
+                    AND pg_catalog.has_table_privilege(fc.oid, 'SELECT')) \
+    ) AS omitted \
+) \
+SELECT constraint_name, position, column_name, referenced_schema, referenced_table, \
+       referenced_column, false AS metadata_truncated \
+  FROM visible_foreign_keys \
+UNION ALL \
+SELECT NULL, NULL, NULL, NULL, NULL, NULL, true AS metadata_truncated \
+  FROM hidden_target \
+ WHERE omitted \
+ ORDER BY metadata_truncated DESC, constraint_name, position \
  LIMIT $3";
 
 /// `relkind` to the core model.
@@ -128,19 +160,22 @@ pub(crate) struct IndexRow {
     pub(crate) column: Option<String>,
 }
 
-/// Groups ordered index rows into relations, bounding the column list.
-pub(crate) fn group_index(rows: Vec<IndexRow>) -> Vec<IndexedRelation> {
+/// Groups ordered index rows into relations and reports a bounded column list.
+pub(crate) fn group_index(rows: Vec<IndexRow>) -> (Vec<IndexedRelation>, bool) {
     let mut relations: Vec<IndexedRelation> = Vec::new();
+    let mut truncated = false;
     for row in rows {
         let Some(kind) = table_kind(&row.relkind) else {
             continue;
         };
         match relations.last_mut() {
             Some(last) if last.schema == row.schema && last.name == row.table => {
-                if let Some(column) = row.column
-                    && last.columns.len() < MAX_INDEXED_COLUMNS
-                {
-                    last.columns.push(column);
+                if let Some(column) = row.column {
+                    if last.columns.len() < MAX_INDEXED_COLUMNS {
+                        last.columns.push(column);
+                    } else {
+                        truncated = true;
+                    }
                 }
             }
             _ => relations.push(IndexedRelation {
@@ -151,7 +186,7 @@ pub(crate) fn group_index(rows: Vec<IndexRow>) -> Vec<IndexedRelation> {
             }),
         }
     }
-    relations
+    (relations, truncated)
 }
 
 /// One decoded row of [`INDEXES_SQL`].
@@ -233,13 +268,14 @@ pub(crate) fn column(
     is_nullable: bool,
     default: Option<String>,
     comment: Option<String>,
+    budget: &mut SchemaMetadataBudget,
 ) -> ColumnDescription {
     ColumnDescription {
         name,
         database_type: column_type,
         nullable: is_nullable,
-        default,
-        comment: comment.filter(|value| !value.is_empty()),
+        default: budget.bound(default),
+        comment: budget.bound(comment.filter(|value| !value.is_empty())),
     }
 }
 
@@ -252,11 +288,14 @@ mod tests {
         IndexRow, RESOLVE_SQL, column, group_foreign_keys, group_index, group_indexes, table_kind,
     };
     use warden_core::schema::search::IndexedRelation;
-    use warden_core::schema::{ForeignKey, IndexDescription, MAX_INDEXED_COLUMNS};
+    use warden_core::schema::{
+        ForeignKey, IndexDescription, MAX_INDEXED_COLUMNS, MAX_SCHEMA_DESCRIPTION_BYTES,
+        MAX_SCHEMA_VALUE_BYTES, SchemaMetadataBudget,
+    };
 
     #[test]
     fn index_rows_group_by_adjacent_schema_and_table() {
-        let relations = group_index(vec![
+        let (relations, truncated) = group_index(vec![
             IndexRow {
                 schema: "app".to_owned(),
                 table: "orders".to_owned(),
@@ -294,11 +333,12 @@ mod tests {
                 },
             ]
         );
+        assert!(!truncated);
     }
 
     #[test]
     fn a_relation_without_visible_columns_stays_in_the_catalog() {
-        let relations = group_index(vec![IndexRow {
+        let (relations, truncated) = group_index(vec![IndexRow {
             schema: "app".to_owned(),
             table: "empty".to_owned(),
             relkind: "r".to_owned(),
@@ -314,6 +354,7 @@ mod tests {
                 columns: Vec::new(),
             }]
         );
+        assert!(!truncated);
     }
 
     #[test]
@@ -327,14 +368,15 @@ mod tests {
             })
             .collect();
 
-        let relations = group_index(rows);
+        let (relations, truncated) = group_index(rows);
 
         assert_eq!(relations[0].columns.len(), MAX_INDEXED_COLUMNS);
+        assert!(truncated);
     }
 
     #[test]
     fn index_rows_drop_an_unmapped_relation_kind() {
-        let relations = group_index(vec![IndexRow {
+        let (relations, truncated) = group_index(vec![IndexRow {
             schema: "app".to_owned(),
             table: "index_backed".to_owned(),
             relkind: "i".to_owned(),
@@ -342,6 +384,7 @@ mod tests {
         }]);
 
         assert!(relations.is_empty());
+        assert!(!truncated);
     }
 
     #[test]
@@ -427,12 +470,14 @@ mod tests {
 
     #[test]
     fn nullable_boolean_and_empty_comments_are_normalized() {
+        let mut budget = SchemaMetadataBudget::default();
         let nullable = column(
             "optional".to_owned(),
             "character varying(255)".to_owned(),
             true,
             None,
             Some(String::new()),
+            &mut budget,
         );
         let required = column(
             "required".to_owned(),
@@ -440,11 +485,72 @@ mod tests {
             false,
             None,
             None,
+            &mut budget,
         );
 
         assert!(nullable.nullable);
         assert_eq!(nullable.comment, None);
         assert!(!required.nullable);
+    }
+
+    #[test]
+    fn large_defaults_and_comments_are_cut_on_utf8_boundaries() {
+        let oversized = "🙂".repeat(MAX_SCHEMA_VALUE_BYTES / "🙂".len() + 1);
+        let mut default_budget = SchemaMetadataBudget::default();
+        let with_default = column(
+            "with_default".to_owned(),
+            "text".to_owned(),
+            true,
+            Some(oversized.clone()),
+            None,
+            &mut default_budget,
+        );
+        let mut comment_budget = SchemaMetadataBudget::default();
+        let with_comment = column(
+            "with_comment".to_owned(),
+            "text".to_owned(),
+            true,
+            None,
+            Some(oversized),
+            &mut comment_budget,
+        );
+
+        assert_eq!(
+            with_default.default.as_deref().map(str::len),
+            Some(MAX_SCHEMA_VALUE_BYTES)
+        );
+        assert_eq!(
+            with_comment.comment.as_deref().map(str::len),
+            Some(MAX_SCHEMA_VALUE_BYTES)
+        );
+        assert!(default_budget.truncated());
+        assert!(comment_budget.truncated());
+    }
+
+    #[test]
+    fn column_mapping_obeys_the_accumulated_description_budget() {
+        let mut budget = SchemaMetadataBudget::default();
+        let columns: Vec<_> = (0..3)
+            .map(|index| {
+                column(
+                    index.to_string(),
+                    "text".to_owned(),
+                    true,
+                    Some("d".repeat(MAX_SCHEMA_VALUE_BYTES)),
+                    Some("c".repeat(MAX_SCHEMA_VALUE_BYTES)),
+                    &mut budget,
+                )
+            })
+            .collect();
+
+        let retained_bytes: usize = columns
+            .iter()
+            .flat_map(|column| [column.default.as_ref(), column.comment.as_ref()])
+            .flatten()
+            .map(String::len)
+            .sum();
+        assert_eq!(retained_bytes, MAX_SCHEMA_DESCRIPTION_BYTES);
+        assert!(budget.truncated());
     }
 
     #[test]
@@ -470,5 +576,17 @@ mod tests {
         ] {
             assert!(!sql.contains('{'), "{sql}");
         }
+    }
+
+    #[test]
+    fn foreign_key_targets_require_schema_usage_and_table_select() {
+        assert!(
+            FOREIGN_KEYS_SQL.contains("has_schema_privilege(fn.oid, 'USAGE')"),
+            "{FOREIGN_KEYS_SQL}"
+        );
+        assert!(
+            FOREIGN_KEYS_SQL.contains("has_table_privilege(fc.oid, 'SELECT')"),
+            "{FOREIGN_KEYS_SQL}"
+        );
     }
 }

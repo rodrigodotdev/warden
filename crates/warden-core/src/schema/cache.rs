@@ -158,6 +158,11 @@ impl SchemaCache {
     }
 
     fn put(&self, key: CacheKey, value: CachedValue, now: Instant) {
+        let Some(expires_at) = now.checked_add(self.ttl) else {
+            // The cache is an optimization. An unrepresentable expiry must not
+            // turn a valid schema response into a request-path panic.
+            return;
+        };
         let mut entries = self.write();
         if entries.len() >= self.capacity && !entries.contains_key(&key) {
             entries.retain(|_, entry| entry.expires_at > now);
@@ -167,13 +172,7 @@ impl SchemaCache {
                 return;
             }
         }
-        entries.insert(
-            key,
-            Expiring {
-                value,
-                expires_at: now + self.ttl,
-            },
-        );
+        entries.insert(key, Expiring { value, expires_at });
     }
 
     /// A poisoned lock holds correct data: every writer here inserts or removes a
@@ -321,5 +320,17 @@ mod tests {
         assert!(!cache.is_empty());
         cache.clear();
         assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn a_ttl_that_overflows_instant_refuses_the_cache_entry_without_panicking() {
+        let cache = SchemaCache::new(Duration::MAX, 8);
+        let now = Instant::now();
+        let name = connection("production-postgres");
+
+        cache.store_catalog(&name, index("orders"), now);
+
+        assert!(cache.is_empty());
+        assert!(cache.catalog(&name, now).is_none());
     }
 }

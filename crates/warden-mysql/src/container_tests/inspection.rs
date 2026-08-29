@@ -19,7 +19,9 @@ use warden_core::context::RequestContext;
 use warden_core::dialect::Dialect;
 use warden_core::pool::AGENT_POOL_MAX_CONNECTIONS;
 use warden_core::schema::cache::{SCHEMA_CACHE_CAPACITY, SchemaCache};
-use warden_core::schema::{MatchReason, SchemaDescribeRequest, SchemaSearchRequest, TableKind};
+use warden_core::schema::{
+    MAX_INDEXED_COLUMNS, MatchReason, SchemaDescribeRequest, SchemaSearchRequest, TableKind,
+};
 use warden_policy::{
     DenyCode, ObjectFilter, ObjectRules, PolicyContext, PolicyEngine, PolicySettings,
 };
@@ -94,6 +96,12 @@ async fn fixture(pools: &MySqlConnectionPools) {
              email VARCHAR(255) NOT NULL
          )",
         "CREATE UNIQUE INDEX customers_email ON shop.customers(email)",
+        "CREATE TABLE shop.fk_source (
+             id BIGINT PRIMARY KEY,
+             target_id BIGINT,
+             CONSTRAINT fk_source_target FOREIGN KEY (target_id)
+                 REFERENCES shop.customers(id)
+         )",
         "CREATE TABLE shop.orders (
              tenant_id BIGINT NOT NULL,
              id BIGINT NOT NULL,
@@ -120,6 +128,18 @@ async fn fixture(pools: &MySqlConnectionPools) {
             .await
             .unwrap();
     }
+    let mut wide_columns: Vec<String> = (0..MAX_INDEXED_COLUMNS)
+        .map(|index| format!("column_{index} BIGINT"))
+        .collect();
+    wide_columns.push("omitted_tail_marker BIGINT".to_owned());
+    let wide_table = format!(
+        "CREATE TABLE shop.wide_catalog ({})",
+        wide_columns.join(", ")
+    );
+    sqlx::query(AssertSqlSafe(wide_table))
+        .execute(pools.control())
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -188,6 +208,67 @@ async fn a_described_table_carries_its_columns_keys_and_indexes() {
             .any(|index| index.name == "orders_created_at" && !index.unique)
     );
 
+    pools.close().await;
+}
+
+#[tokio::test]
+async fn foreign_key_target_policy_is_reapplied_on_cold_and_warm_cache_reads() {
+    let container = start_mysql().await;
+    let pools = Arc::new(connect(&container, "shop").await);
+    fixture(&pools).await;
+    let inspector = MySqlSchemaInspector::new(Arc::clone(&pools), name());
+    let denied_engine = engine(&PolicySettings {
+        objects: ObjectRules {
+            deny_tables: vec!["shop.customers".to_owned()],
+            ..ObjectRules::default()
+        },
+        ..PolicySettings::default()
+    });
+    let permissive_engine = engine(&PolicySettings::default());
+    let connection = metadata("shop");
+    let context = context();
+    let request =
+        SchemaDescribeRequest::new(name(), vec!["shop.fk_source".parse().unwrap()]).unwrap();
+
+    let cold_denied = inspector
+        .describe_schema(
+            &request,
+            ObjectFilter::new(&denied_engine, PolicyContext::new(&context, &connection)),
+            super::deadline(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let cold_table = &cold_denied.schemas[0].tables[0];
+    assert!(cold_table.foreign_keys.is_empty());
+    assert!(cold_table.truncated);
+
+    let warm_permitted = inspector
+        .describe_schema(
+            &request,
+            ObjectFilter::new(
+                &permissive_engine,
+                PolicyContext::new(&context, &connection),
+            ),
+            super::deadline(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(warm_permitted.schemas[0].tables[0].foreign_keys.len(), 1);
+
+    let warm_denied = inspector
+        .describe_schema(
+            &request,
+            ObjectFilter::new(&denied_engine, PolicyContext::new(&context, &connection)),
+            super::deadline(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+    let warm_table = &warm_denied.schemas[0].tables[0];
+    assert!(warm_table.foreign_keys.is_empty());
+    assert!(warm_table.truncated);
     pools.close().await;
 }
 
@@ -330,6 +411,32 @@ async fn search_never_returns_more_than_the_requested_limit() {
         .unwrap();
 
     assert_eq!(found.matches.len(), 1);
+    assert!(found.truncated);
+    pools.close().await;
+}
+
+#[tokio::test]
+async fn search_reports_truncation_when_only_an_omitted_column_matches() {
+    let container = start_mysql().await;
+    let pools = Arc::new(connect(&container, "shop").await);
+    fixture(&pools).await;
+    let inspector = MySqlSchemaInspector::new(Arc::clone(&pools), name());
+    let engine = engine(&PolicySettings::default());
+    let connection = metadata("shop");
+    let context = context();
+    let request = SchemaSearchRequest::new(name(), "omitted_tail_marker", 10).unwrap();
+
+    let found = inspector
+        .search_schema(
+            &request,
+            ObjectFilter::new(&engine, PolicyContext::new(&context, &connection)),
+            super::deadline(),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+
+    assert!(found.matches.is_empty());
     assert!(found.truncated);
     pools.close().await;
 }

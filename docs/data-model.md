@@ -416,14 +416,23 @@ pub struct Table {
 ```
 
 `Table.truncated` says that some of the relation's metadata was left out: a bound cut
-a list, or the engine reported a key part with no column name (a MySQL functional
-index, a PostgreSQL expression index), which Warden omits rather than naming
-something the catalog did not name. Response bounds are `MAX_DESCRIBED_COLUMNS` 512,
+a list or catalog text value; the engine reported a key part with no column name (a
+MySQL functional index or PostgreSQL expression index); or a foreign-key target was
+not visible under the request's object rules or PostgreSQL privileges. A refused FK
+target is omitted silently rather than turned into a rejection that confirms its
+existence. Response bounds are `MAX_DESCRIBED_COLUMNS` 512,
 `MAX_DESCRIBED_INDEXES` 128 and `MAX_DESCRIBED_FOREIGN_KEYS` 128 per relation, on top
 of the 20-table cap per call.
 
-Never include connection data. Redaction from `docs/security.md` section 8 also
-applies here because column defaults and comments may contain secrets.
+Column defaults and comments are bounded, not redacted in Milestone 9. Each retains
+at most `MAX_SCHEMA_VALUE_BYTES` (64 KiB) at a valid UTF-8 boundary, and their
+accumulated retained payload is at most `MAX_SCHEMA_DESCRIPTION_BYTES` (256 KiB)
+per cached table and again per complete `describe_schema` response. Exhausting
+either budget sets the affected `Table.truncated`; identifiers and serialization
+overhead are not part of this text-byte count. Both adapters also cap the catalog
+expression by characters in static SQL before decoding, then enforce the exact byte
+bound in core. Never include connection data. The Milestone 11 redaction matcher
+will also apply here because defaults and comments may contain secrets.
 
 Schema discovery is a product capability, not an implementation detail. The agent
 must learn tables, columns, primary and foreign keys, indexes, relation and view
@@ -445,8 +454,10 @@ Ranking is dialect-independent and lives in `warden_core::schema::search`:
 and truncates at the request's `limit`, itself capped at `MAX_SEARCH_RESULTS` (50).
 The index behind it is a bounded projection of the catalog: at most
 `MAX_CATALOG_ROWS` (20 000) catalog rows and `MAX_INDEXED_COLUMNS` (64) column names
-per relation. A search over a partial index reports `truncated: true` even when the
-limit was not reached, because a partial catalog must not look complete.
+per relation. Hitting either the global row cap or any relation's column cap marks
+the index partial. A search over a partial index reports `truncated: true` even when
+the response limit was not reached or a term matched only an omitted column, because
+a partial catalog must not look complete.
 
 `MatchReason::Description` has no producer in v0.x: it ranks a configured human
 description, and configured descriptions are future schema-intelligence work.
@@ -459,8 +470,12 @@ connection — `Catalog(connection)` for the search index, `Table { connection,
 schema, table }` for a description. It takes the current time as a parameter rather
 than reading a clock, so expiry is testable without sleeping and `warden-core` needs
 no runtime dependency. A full cache first drops expired entries and then refuses to
-grow; serving from the database is slower, and unbounded growth is worse.
+grow; serving from the database is slower, and unbounded growth is worse. Expiry is
+computed with `Instant::checked_add`; an unrepresentable TTL refuses the insertion
+instead of panicking on the request path.
 
 **Cached metadata is unfiltered.** Object rules are per-request (ADR-0036), so
 caching a filtered answer would freeze one request's identity into another's. The
-adapter applies the filter after every read, hit or miss.
+adapter applies the filter after every read, hit or miss, including each foreign-key
+target. A request-specific FK omission mutates only the response copy; a later
+permitted request can still receive the raw cached constraint.

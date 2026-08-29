@@ -220,7 +220,10 @@ converts.
 `SchemaInspector`'s two methods take `filter: ObjectFilter<'a>` so the object rules
 apply inside the adapter rather than after it (ADR-0036); they take no `QueryPermit`,
 because a catalog read runs on `control_pool` and is not the query SPEC section 6,
-invariant 17 bounds.
+invariant 17 bounds. The cache holds policy-unfiltered metadata; each response filters
+both described relations and their foreign-key targets, then applies the shared core
+text budget to its own copy. MySQL relies on `information_schema` visibility, while
+PostgreSQL catalog SQL also requires privileges on both the FK source and target.
 
 `AuditSink` takes no deadline: a sink has no server-side work to cancel, so the caller
 bounds the write with `tokio::time::timeout`. ADR-0022 still requires the attempt

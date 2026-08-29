@@ -13,7 +13,8 @@
 
 use warden_core::schema::search::IndexedRelation;
 use warden_core::schema::{
-    ColumnDescription, ForeignKey, IndexDescription, MAX_INDEXED_COLUMNS, TableKind,
+    ColumnDescription, ForeignKey, IndexDescription, MAX_INDEXED_COLUMNS, SchemaMetadataBudget,
+    TableKind,
 };
 
 /// One row per column of every visible relation, ordered so grouping is linear.
@@ -47,11 +48,13 @@ SELECT TABLE_SCHEMA AS table_schema, TABLE_NAME AS table_name, \
    AND TABLE_TYPE IN ('BASE TABLE', 'VIEW') \
  LIMIT 1";
 
+/// The `LEFT` calls cap characters before driver decoding; core applies the exact
+/// UTF-8 byte and accumulated response bounds after decoding.
 pub(crate) const COLUMNS_SQL: &str = "SELECT COLUMN_NAME AS column_name, \
             COLUMN_TYPE AS column_type, \
             IS_NULLABLE AS is_nullable, \
-            COLUMN_DEFAULT AS column_default, \
-            COLUMN_COMMENT AS column_comment \
+            LEFT(COLUMN_DEFAULT, ?) AS column_default, \
+            LEFT(COLUMN_COMMENT, ?) AS column_comment \
        FROM information_schema.COLUMNS \
       WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? \
       ORDER BY ORDINAL_POSITION \
@@ -103,9 +106,10 @@ pub(crate) struct IndexRow {
     pub(crate) column: String,
 }
 
-/// Groups ordered index rows into relations, bounding the column list.
-pub(crate) fn group_index(rows: Vec<IndexRow>) -> Vec<IndexedRelation> {
+/// Groups ordered index rows into relations and reports a bounded column list.
+pub(crate) fn group_index(rows: Vec<IndexRow>) -> (Vec<IndexedRelation>, bool) {
     let mut relations: Vec<IndexedRelation> = Vec::new();
+    let mut truncated = false;
     for row in rows {
         let Some(kind) = table_kind(&row.table_type) else {
             continue;
@@ -114,6 +118,8 @@ pub(crate) fn group_index(rows: Vec<IndexRow>) -> Vec<IndexedRelation> {
             Some(last) if last.schema == row.schema && last.name == row.table => {
                 if last.columns.len() < MAX_INDEXED_COLUMNS {
                     last.columns.push(row.column);
+                } else {
+                    truncated = true;
                 }
             }
             _ => relations.push(IndexedRelation {
@@ -124,7 +130,7 @@ pub(crate) fn group_index(rows: Vec<IndexRow>) -> Vec<IndexedRelation> {
             }),
         }
     }
-    relations
+    (relations, truncated)
 }
 
 /// One decoded row of [`INDEXES_SQL`].
@@ -205,13 +211,14 @@ pub(crate) fn column(
     is_nullable: &str,
     default: Option<String>,
     comment: Option<String>,
+    budget: &mut SchemaMetadataBudget,
 ) -> ColumnDescription {
     ColumnDescription {
         name,
         database_type: column_type,
         nullable: is_nullable.eq_ignore_ascii_case("YES"),
-        default,
-        comment: comment.filter(|value| !value.is_empty()),
+        default: budget.bound(default),
+        comment: budget.bound(comment.filter(|value| !value.is_empty())),
     }
 }
 
@@ -220,7 +227,10 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use warden_core::schema::search::IndexedRelation;
-    use warden_core::schema::{ForeignKey, IndexDescription, MAX_INDEXED_COLUMNS, TableKind};
+    use warden_core::schema::{
+        ForeignKey, IndexDescription, MAX_INDEXED_COLUMNS, MAX_SCHEMA_DESCRIPTION_BYTES,
+        MAX_SCHEMA_VALUE_BYTES, SchemaMetadataBudget, TableKind,
+    };
 
     use super::{
         COLUMNS_SQL, FOREIGN_KEYS_SQL, ForeignKeyRow, INDEX_SQL, INDEXES_SQL, IndexPartRow,
@@ -229,7 +239,7 @@ mod tests {
 
     #[test]
     fn index_rows_group_by_adjacent_schema_and_table() {
-        let relations = group_index(vec![
+        let (relations, truncated) = group_index(vec![
             IndexRow {
                 schema: "app".to_owned(),
                 table: "orders".to_owned(),
@@ -267,6 +277,7 @@ mod tests {
                 },
             ]
         );
+        assert!(!truncated);
     }
 
     #[test]
@@ -280,14 +291,15 @@ mod tests {
             })
             .collect();
 
-        let relations = group_index(rows);
+        let (relations, truncated) = group_index(rows);
 
         assert_eq!(relations[0].columns.len(), MAX_INDEXED_COLUMNS);
+        assert!(truncated);
     }
 
     #[test]
     fn index_rows_drop_a_system_view() {
-        let relations = group_index(vec![IndexRow {
+        let (relations, truncated) = group_index(vec![IndexRow {
             schema: "app".to_owned(),
             table: "future_system_view".to_owned(),
             table_type: "SYSTEM VIEW".to_owned(),
@@ -295,6 +307,7 @@ mod tests {
         }]);
 
         assert!(relations.is_empty());
+        assert!(!truncated);
     }
 
     #[test]
@@ -377,18 +390,87 @@ mod tests {
 
     #[test]
     fn nullable_text_is_parsed_case_insensitively() {
+        let mut budget = SchemaMetadataBudget::default();
         let nullable = column(
             "optional".to_owned(),
             "varchar(255)".to_owned(),
             "yes",
             None,
             Some(String::new()),
+            &mut budget,
         );
-        let required = column("required".to_owned(), "int".to_owned(), "NO", None, None);
+        let required = column(
+            "required".to_owned(),
+            "int".to_owned(),
+            "NO",
+            None,
+            None,
+            &mut budget,
+        );
 
         assert!(nullable.nullable);
         assert_eq!(nullable.comment, None);
         assert!(!required.nullable);
+    }
+
+    #[test]
+    fn large_defaults_and_comments_are_cut_on_utf8_boundaries() {
+        let oversized = "🙂".repeat(MAX_SCHEMA_VALUE_BYTES / "🙂".len() + 1);
+        let mut default_budget = SchemaMetadataBudget::default();
+        let with_default = column(
+            "with_default".to_owned(),
+            "text".to_owned(),
+            "YES",
+            Some(oversized.clone()),
+            None,
+            &mut default_budget,
+        );
+        let mut comment_budget = SchemaMetadataBudget::default();
+        let with_comment = column(
+            "with_comment".to_owned(),
+            "text".to_owned(),
+            "YES",
+            None,
+            Some(oversized),
+            &mut comment_budget,
+        );
+
+        assert_eq!(
+            with_default.default.as_deref().map(str::len),
+            Some(MAX_SCHEMA_VALUE_BYTES)
+        );
+        assert_eq!(
+            with_comment.comment.as_deref().map(str::len),
+            Some(MAX_SCHEMA_VALUE_BYTES)
+        );
+        assert!(default_budget.truncated());
+        assert!(comment_budget.truncated());
+    }
+
+    #[test]
+    fn column_mapping_obeys_the_accumulated_description_budget() {
+        let mut budget = SchemaMetadataBudget::default();
+        let columns: Vec<_> = (0..3)
+            .map(|index| {
+                column(
+                    index.to_string(),
+                    "text".to_owned(),
+                    "YES",
+                    Some("d".repeat(MAX_SCHEMA_VALUE_BYTES)),
+                    Some("c".repeat(MAX_SCHEMA_VALUE_BYTES)),
+                    &mut budget,
+                )
+            })
+            .collect();
+
+        let retained_bytes: usize = columns
+            .iter()
+            .flat_map(|column| [column.default.as_ref(), column.comment.as_ref()])
+            .flatten()
+            .map(String::len)
+            .sum();
+        assert_eq!(retained_bytes, MAX_SCHEMA_DESCRIPTION_BYTES);
+        assert!(budget.truncated());
     }
 
     #[test]
