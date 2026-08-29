@@ -350,7 +350,7 @@ fn json_string_bytes(text: &str) -> usize {
 }
 
 /// The encoded length of a JSON document, walked iteratively.
-fn json_value_bytes(document: &serde_json::Value) -> usize {
+pub(crate) fn json_value_bytes(document: &serde_json::Value) -> usize {
     let mut total = 0usize;
     let mut stack = vec![document];
     while let Some(value) = stack.pop() {

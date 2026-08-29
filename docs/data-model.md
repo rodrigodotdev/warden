@@ -483,3 +483,46 @@ caching a filtered answer would freeze one request's identity into another's. Th
 adapter applies the filter after every read, hit or miss, including each foreign-key
 target. A request-specific FK omission mutates only the response copy; a later
 permitted request can still receive the raw cached constraint.
+
+## 10. Plan model
+
+```rust
+pub struct QueryPlan {
+    pub dialect: Dialect,
+    pub summary: PlanSummary,
+    pub plan: serde_json::Value,
+}
+
+pub struct PlanSummary {
+    pub estimated_rows: Option<u64>,
+}
+```
+
+`plan` is the engine's own document, passed through unchanged: `EXPLAIN FORMAT=JSON`
+on MySQL and `EXPLAIN (FORMAT JSON)` on PostgreSQL, whose answer is a one-element
+array carrying the root node under `Plan`. Engine-specific detail belongs there
+rather than in `summary`, so a field one engine reports never forces an invented
+value for the other (`docs/architecture.md` section 11).
+
+`summary` carries no cost. MySQL and PostgreSQL cost units are not comparable, and a
+universal metric would be a fabricated number.
+
+**`estimated_rows` is PostgreSQL-only in 0.x.** It is the root node's `Plan Rows`.
+MySQL's document states `rows_examined_per_scan` and `rows_produced_per_join` per
+table and per join step and no statement-level figure, so the MySQL summary omits
+the field. A rule that filled it only for single-table plans would leave an agent
+unable to tell "no estimate" from "complex plan"; see `docs/open-questions.md`
+item 20.
+
+**Plans are bounded, not truncated.** `MAX_PLAN_BYTES` is 256 KiB — the same figure
+and the same reasoning as `max_result_bytes` in section 7, because the consumer is
+the same context window. `QueryPlan::validate` refuses a larger document with
+`PlanError::TooLarge`, which the adapter reports as `explain_error`. There is no
+truncating variant: half a JSON document is not a smaller plan, it is a wrong one,
+and an agent reading a shortened plan would read it as complete. `QueryPlan::plan_bytes`
+computes the exact serialized length through the same counter `ResultValue::json_bytes`
+uses, iteratively, so a deep document cannot overflow the stack.
+
+The plan document is database-controlled text and enters model context; the
+Milestone 11 redaction matcher applies here for the same reason it applies to column
+defaults and comments.

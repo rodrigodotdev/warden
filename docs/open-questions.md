@@ -221,3 +221,17 @@ the same ground using the real SPEC boundaries.
 `tests/architecture.rs` forces this decision through `EXPECTED_MEMBERS`: removing the
 crate without removing the list entry breaks the test. Also remove the `test:docker`
 mise task unless it already points to adapter integration tests.
+
+20. **Should MySQL's `PlanSummary` carry a row estimate?** Milestone 10 leaves
+    `estimated_rows` empty on MySQL. `EXPLAIN FORMAT=JSON` reports
+    `rows_examined_per_scan` and `rows_produced_per_join` per table and per join
+    step under `query_block`, and states no figure for the statement as a whole:
+    a single-table plan has one obvious candidate, a nested loop has one per step,
+    and `UNION`, `ordering_operation`, `grouping_operation` and
+    `materialized_from_subquery` each change the shape again. Filling the field only
+    where the shape is obvious would leave an agent unable to distinguish "this
+    engine reports no estimate" from "this plan was too complex to summarize", which
+    is worse than a consistently empty field. Deciding otherwise means walking the
+    document per shape, with a fuzzing obligation over database-controlled JSON, in
+    exchange for a number the full document already contains. Decide it against
+    measured demand.
