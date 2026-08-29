@@ -2,7 +2,7 @@
 //!
 //! Both adapters read different catalogs and produce the same shape, so the ranking
 //! lives here once. `docs/data-model.md` section 9.1 fixes the order, and
-//! [`MatchReason`](super::MatchReason) already encodes it in its declaration order:
+//! [`MatchReason`] already encodes it in its declaration order:
 //! the derived `Ord` **is** the ranking, so this module sorts rather than scores.
 //!
 //! Matching is ASCII case-insensitive on both engines. That is a search convenience,
