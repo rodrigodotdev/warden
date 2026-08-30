@@ -233,6 +233,7 @@ mod tests {
         let rows = vec![vec![
             ResultValue::I64(1),
             ResultValue::String("hunter2".to_owned()),
+            ResultValue::String("note: \"quoted\"\n".to_owned()),
         ]];
         ResultSet {
             columns: vec![
@@ -243,6 +244,11 @@ mod tests {
                 },
                 ResultColumn {
                     name: "Password".to_owned(),
+                    database_type: "TEXT".to_owned(),
+                    nullable: None,
+                },
+                ResultColumn {
+                    name: "note".to_owned(),
                     database_type: "TEXT".to_owned(),
                     nullable: None,
                 },
@@ -276,7 +282,7 @@ mod tests {
     fn redacting_recomputes_the_byte_figure_the_agent_actually_receives() {
         let mut set = result();
         redactor(&["*.password"], RedactionStrategy::Null).redact_result(&mut set);
-        let expected: usize = set.rows.iter().map(|row| row_json_bytes(row)).sum();
+        let expected = serde_json::to_string(&set.rows[0]).unwrap().len();
         assert_eq!(set.stats.bytes, expected);
     }
 

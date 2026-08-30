@@ -537,7 +537,6 @@ impl ResultBuilder {
         }
         check_row(self.rows.len(), &row, &self.columns)?;
 
-        let mut row_bytes = 2 + row.len().saturating_sub(1);
         for (value, column) in row.iter().zip(&self.columns) {
             let value_bytes = value.json_bytes();
             if value_bytes > self.limits.max_value_bytes {
@@ -547,8 +546,9 @@ impl ResultBuilder {
                     limit: self.limits.max_value_bytes,
                 });
             }
-            row_bytes = row_bytes.saturating_add(value_bytes);
         }
+
+        let row_bytes = row_json_bytes(&row);
 
         let total = self.bytes.saturating_add(row_bytes);
         if total > self.limits.max_result_bytes {
@@ -638,19 +638,28 @@ mod tests {
     }
 
     #[test]
-    fn the_builder_accounts_rows_exactly_as_row_json_bytes_does() {
-        let columns = vec![ResultColumn {
-            name: "id".to_owned(),
-            database_type: "BIGINT".to_owned(),
-            nullable: None,
-        }];
-        let row = vec![ResultValue::I64(-12_345)];
+    fn the_builder_and_shared_accountant_match_escaped_multi_value_json() {
+        let columns = vec![
+            ResultColumn {
+                name: "id".to_owned(),
+                database_type: "BIGINT".to_owned(),
+                nullable: None,
+            },
+            ResultColumn {
+                name: "note".to_owned(),
+                database_type: "TEXT".to_owned(),
+                nullable: None,
+            },
+        ];
+        let row = vec![
+            ResultValue::I64(-12_345),
+            ResultValue::String("quote: \"; tab: \t; newline: \n".to_owned()),
+        ];
+        let expected = serde_json::to_string(&row).unwrap().len();
         let mut builder = ResultBuilder::new(columns, ExecutionLimits::default());
         builder.push_row(row.clone()).unwrap();
-        assert_eq!(
-            builder.finish(Duration::ZERO).stats.bytes,
-            row_json_bytes(&row)
-        );
+        assert_eq!(row_json_bytes(&row), expected);
+        assert_eq!(builder.finish(Duration::ZERO).stats.bytes, expected);
     }
 
     #[test]
