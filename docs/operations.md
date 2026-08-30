@@ -667,6 +667,12 @@ pid (`SELECT pg_cancel_backend($1)`) and its per-request deadline binds a value
 `format!` at all in `execute.rs`. A future change that needs one needs its own review
 and its own ADR rather than an exemption inherited from the other adapter.
 
+PostgreSQL's `plan.rs` carries the same single `format!` for the same reason and
+under the same pinned constant, while its `explain.rs` carries none at all: the
+cancellation binds a pid, the deadline binds a value, and the plan binds its
+parameters, so `crates/warden-postgres/tests/adapter_rules.rs` keeps the strict rule
+there that it already keeps for `execute.rs`.
+
 ### 6.4 Dynamic queries
 
 Agent SQL arrives at runtime, so `query!` / `query_as!` do not apply. Use runtime

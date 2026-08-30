@@ -45,7 +45,34 @@ pub(crate) fn statement(
     sql: &str,
     parameters: &[ParameterValue],
 ) -> Query<'static, Postgres, PgArguments> {
-    let mut statement = agent_query(AssertSqlSafe(sql.to_owned())).persistent(true);
+    bind_all(
+        agent_query(AssertSqlSafe(sql.to_owned())).persistent(true),
+        parameters,
+    )
+}
+
+/// Builds the bound statement for one plan request.
+///
+/// Unlike [`statement`], this one keeps `agent_query`'s non-persistent default. The
+/// single output column of `EXPLAIN (FORMAT JSON)` is `json`, a type SQLx already
+/// knows, so nothing makes it resolve custom result metadata through a simple query
+/// — which is the only reason the executed form needs a named statement and the
+/// `DEALLOCATE ALL` that follows it. Confirmed against a PostgreSQL 17 container
+/// with a user-defined enum in the inner statement's projection, so this is a
+/// measurement rather than an inference (`docs/testing.md` section 4). No named
+/// statement means nothing to clean up and no connection to retire.
+pub(crate) fn plan_statement(
+    sql: &str,
+    parameters: &[ParameterValue],
+) -> Query<'static, Postgres, PgArguments> {
+    bind_all(agent_query(AssertSqlSafe(sql.to_owned())), parameters)
+}
+
+/// Binds every parameter in placeholder order, under ADR-0035's two rules.
+fn bind_all<'q>(
+    mut statement: Query<'q, Postgres, PgArguments>,
+    parameters: &[ParameterValue],
+) -> Query<'q, Postgres, PgArguments> {
     for parameter in parameters {
         statement = match parameter {
             ParameterValue::Null => statement.bind(Option::<String>::None),
@@ -112,5 +139,17 @@ mod tests {
             let arguments = Execute::take_arguments(&mut statement).unwrap().unwrap();
             assert_eq!(sqlx::Arguments::len(&arguments), 1, "{value}");
         }
+    }
+
+    #[test]
+    fn a_plan_statement_needs_no_named_statement() {
+        let sql = "EXPLAIN (FORMAT JSON) SELECT id FROM orders WHERE id = $1";
+        let statement = plan_statement(sql, &[ParameterValue::I64(1)]);
+        assert!(
+            !Execute::persistent(&statement),
+            "a plan has one json column, so nothing makes SQLx resolve custom \
+             result metadata and no named statement is needed"
+        );
+        assert_eq!(Execute::sql(statement).as_str(), sql);
     }
 }

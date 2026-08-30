@@ -19,6 +19,7 @@ const PUBLIC_FILES: &[&str] = &[
     "connection.rs",
     "error.rs",
     "execute.rs",
+    "explain.rs",
     "inspector.rs",
 ];
 
@@ -366,7 +367,7 @@ fn only_the_analyzer_and_the_crate_root_export_anything() {
     assert!(
         violations.is_empty(),
         "these internal items are exported:\n{}\n\n\
-         Keeping the crate's public surface to the five reviewed files is what \
+         Keeping the crate's public surface to the seven reviewed files is what \
          makes \"no parser AST and no driver handle leaves the adapter\" checkable \
          at all (ADR-0007, ADR-0005). Use `pub(crate)`.",
         violations.join("\n")
@@ -755,5 +756,75 @@ fn executor_closes_the_named_agent_statement_after_each_request() {
     assert!(
         source.contains("DEALLOCATE ALL"),
         "src/execute.rs does not close the temporary named agent statement"
+    );
+}
+
+#[test]
+fn explain_rs_interpolates_nothing_at_all() {
+    // The strict rule this crate already applies to `execute.rs`: its cancellation
+    // binds a pid and its deadline binds a value, and the plan path binds its
+    // parameters, so nothing here needs `format!` (`docs/operations.md` section 6.3).
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/explain.rs");
+    for (number, line) in code_lines(&path) {
+        assert!(
+            !line.contains("format!"),
+            "src/explain.rs:{number} interpolates with format!; PostgreSQL's plan \
+             path needs no exception and gaining one needs its own review"
+        );
+    }
+}
+
+#[test]
+fn the_only_format_in_plan_rs_builds_the_non_executing_prefix() {
+    // `plan.rs` interpolates agent SQL after a prefix, which *is* SPEC section 6,
+    // invariant 19's exception; the compensating control is the reparse in the same
+    // file. A second, unrelated `format!` would be a new exception rather than this
+    // one.
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/plan.rs");
+    let lines = code_lines(&path);
+    let mut found = false;
+    for (number, line) in &lines {
+        if line.contains("format!") {
+            assert!(
+                line.contains("EXPLAIN_PREFIX"),
+                "src/plan.rs:{number} interpolates with format! outside the \
+                 verified EXPLAIN prefix"
+            );
+            found = true;
+        }
+    }
+    assert!(found, "src/plan.rs builds no prefixed string at all");
+
+    assert!(
+        lines.iter().any(|(_, line)| line.as_str()
+            == r#"const EXPLAIN_PREFIX: &str = "EXPLAIN (FORMAT JSON) ";"#),
+        "the non-executing prefix is not declared verbatim; `ANALYZE` runs the \
+         statement (SPEC section 6, invariant 11, ADR-0017), so this constant \
+         changes only through a failing test"
+    );
+    assert!(
+        lines.iter().any(|(_, line)| line.contains("fn verify(")),
+        "src/plan.rs declares no verification, so the prefix would reach the server \
+         unchecked (docs/mcp.md section 3.2)"
+    );
+}
+
+#[test]
+fn a_plan_is_read_as_one_row_and_bounded_before_it_is_returned() {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/explain.rs");
+    let lines = code_lines(&path);
+    for (number, line) in &lines {
+        assert!(
+            !line.contains("fetch_all(") && !line.contains(".fetch("),
+            "src/explain.rs:{number} reads a plan as a stream or a vector"
+        );
+    }
+    assert!(
+        lines.iter().any(|(_, line)| line.contains("fetch_one(")),
+        "src/explain.rs never fetches anything, so the ban above passed on an absence"
+    );
+    assert!(
+        lines.iter().any(|(_, line)| line.contains(".validate()")),
+        "src/explain.rs returns a plan without bounding it"
     );
 }

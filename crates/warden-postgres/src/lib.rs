@@ -1,5 +1,5 @@
-//! Warden's PostgreSQL adapter: analysis, connections, execution, and inspection
-//! now; explain in Milestone 10.
+//! Warden's PostgreSQL adapter: analysis, connections, execution, inspection, and
+//! non-executing plans.
 //!
 //! This crate may depend on `warden-core`, `warden-policy`, `warden-ports`, `sqlx`,
 //! and `sqlparser`, but never `rmcp`.
@@ -11,7 +11,7 @@
 //! only `warden-core`, `warden-policy`, and `warden-ports` types, so no `sqlparser`
 //! type can appear in a public signature (SPEC section 6, invariant 28; ADR-0007).
 //! `tests/adapter_rules.rs` enforces that mechanically rather than by review, over
-//! the six files allowed to declare a `pub` item.
+//! the seven files allowed to declare a `pub` item.
 //!
 //! # The driver stops here too
 //!
@@ -35,6 +35,9 @@
 //! Catalog queries are different: they use static `sqlx::query` statements on
 //! `control_pool`, keeping its default statement cache for the small fixed catalog
 //! query set.
+//! The plan path adds no exception of its own: its one output column is `json`, so
+//! `crate::bind::plan_statement` keeps `agent_query`'s non-persistent default and
+//! leaves nothing to deallocate.
 //!
 //! # How analysis fails, and how it does not
 //!
@@ -64,12 +67,14 @@ mod catalog;
 mod connection;
 mod error;
 mod execute;
+mod explain;
 mod fingerprint;
 mod functions;
 mod inspector;
 mod normalize;
 mod options;
 mod parse;
+mod plan;
 mod pool;
 mod query;
 mod statement;
@@ -85,4 +90,5 @@ pub use connection::{
 };
 pub use error::ConnectError;
 pub use execute::PostgreSqlQueryExecutor;
+pub use explain::PostgreSqlExplainer;
 pub use inspector::PostgreSqlSchemaInspector;
