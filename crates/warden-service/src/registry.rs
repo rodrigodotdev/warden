@@ -140,12 +140,29 @@ mod tests {
     }
 
     #[test]
-    fn listing_is_sorted_by_name_and_carries_no_dsn() {
-        let registry = testing::registry();
+    fn listing_is_sorted_by_name() {
+        let runtime = |name: &str| {
+            let mut parts = testing::FakeParts::new(Dialect::MySql);
+            parts.metadata.name = name.parse().unwrap();
+            Arc::new(testing::runtime_from(parts))
+        };
+        let registry = StaticConnectionRegistry::new(vec![
+            runtime("zulu-db"),
+            runtime("tango-db"),
+            runtime("mike-db"),
+            runtime("golf-db"),
+            runtime("alpha-db"),
+        ])
+        .unwrap();
         let listed = registry.list();
-        let mut sorted = listed.clone();
-        sorted.sort_by(|left, right| left.name.cmp(&right.name));
-        assert_eq!(listed, sorted, "list() must be deterministic");
+        let names: Vec<&str> = listed
+            .iter()
+            .map(|metadata| metadata.name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            ["alpha-db", "golf-db", "mike-db", "tango-db", "zulu-db"]
+        );
         assert_eq!(listed.len(), registry.len());
     }
 }
