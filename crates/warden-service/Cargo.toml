@@ -12,3 +12,24 @@ publish = false
 workspace = true
 
 [dependencies]
+warden-core = { workspace = true }
+warden-policy = { workspace = true }
+warden-ports = { workspace = true }
+thiserror = { workspace = true }
+# `time` for `tokio::time::{timeout, Instant}`: the audit sink takes no deadline, so
+# the caller bounds its writes (`crates/warden-ports/src/audit.rs`), and every port
+# that runs SQL takes a `tokio::time::Instant` deadline (ADR-0024). No runtime
+# feature: this crate orchestrates, it never starts a runtime.
+tokio = { workspace = true, features = ["time"] }
+# `CancellationToken` lives in the ungated `tokio_util::sync` module.
+tokio-util = { workspace = true }
+# The redaction matcher walks `QueryPlan::plan`, which is a `serde_json::Value`.
+serde_json = { workspace = true }
+# The audit outcome write fails open with an alarm (ADR-0022), and an alarm needs a
+# logger. Fields follow `docs/operations.md` section 10.2; `raw_sql` is not one.
+tracing = { workspace = true }
+
+[dev-dependencies]
+# `test-util` provides `#[tokio::test(start_paused = true)]`, which makes every
+# deadline and queue-wait test deterministic and instant.
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }

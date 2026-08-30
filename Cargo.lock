@@ -3128,6 +3128,16 @@ dependencies = [
 [[package]]
 name = "warden-service"
 version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "warden-core",
+ "warden-policy",
+ "warden-ports",
+]
 
 [[package]]
 name = "warden-tracer"
