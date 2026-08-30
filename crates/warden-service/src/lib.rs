@@ -40,9 +40,11 @@
 //! wire either; it returns typed errors whose [`warden_core::error::PublicError`]
 //! code Milestone 12 maps at the MCP boundary.
 
+pub mod redaction;
 pub mod registry;
 
 #[cfg(test)]
 mod testing;
 
+pub use redaction::{REDACTED, RedactionRuleError, RedactionSettings, RedactionStrategy, Redactor};
 pub use registry::{RegistryError, StaticConnectionRegistry};

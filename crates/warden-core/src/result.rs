@@ -462,6 +462,23 @@ pub enum RowOutcome {
     Truncated,
 }
 
+///
+/// The exact JSON length of one row: two brackets, one comma between neighbours, and
+/// each value's own encoding.
+///
+/// Public because redaction happens after normalization
+/// (`docs/security.md` section 8) and rewrites stored values, so
+/// `QueryStats::bytes` has to be recomputed with the same accounting
+/// [`ResultBuilder`] used to enforce the budget. One formula in one place: the unit
+/// test below pins the builder's incremental accounting against this function.
+#[must_use]
+pub fn row_json_bytes(row: &[ResultValue]) -> usize {
+    row.iter()
+        .fold(2 + row.len().saturating_sub(1), |total, value| {
+            total.saturating_add(value.json_bytes())
+        })
+}
+
 /// A result assembled under its row, value, and byte budgets.
 ///
 /// The budgets apply while rows arrive, never afterwards: `docs/operations.md`
@@ -618,6 +635,22 @@ mod tests {
 
     fn row(n: usize) -> Vec<ResultValue> {
         vec![ResultValue::String("x".repeat(n))]
+    }
+
+    #[test]
+    fn the_builder_accounts_rows_exactly_as_row_json_bytes_does() {
+        let columns = vec![ResultColumn {
+            name: "id".to_owned(),
+            database_type: "BIGINT".to_owned(),
+            nullable: None,
+        }];
+        let row = vec![ResultValue::I64(-12_345)];
+        let mut builder = ResultBuilder::new(columns, ExecutionLimits::default());
+        builder.push_row(row.clone()).unwrap();
+        assert_eq!(
+            builder.finish(Duration::ZERO).stats.bytes,
+            row_json_bytes(&row)
+        );
     }
 
     #[test]
