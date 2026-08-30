@@ -147,6 +147,38 @@ Fixture administration uses one scoped `BEGIN READ WRITE` transaction on a held
 `control_pool` connection, then verifies the returned physical session is still
 read-only. It does not change `default_transaction_read_only` at session scope.
 
+**Milestone 10 added the plan rows on both engines.** On MySQL 8.4 and PostgreSQL 17:
+a bound `SELECT` producing the engine's own structured document; a statement whose
+execution would take three seconds — `SLEEP(3)`, `pg_sleep(3)` — returning a plan in
+milliseconds, which is the measurement behind "EXPLAIN does not execute"; twenty
+consecutive plans leaving no prepared statement on either engine and no escaped
+`statement_timeout` on PostgreSQL; a cancelled token and an elapsed deadline each
+stopping the call with the right variant; a missing relation failing without the
+driver's message reaching `Display`; and the connection still serving after a failed
+plan.
+
+PostgreSQL adds three of its own: the root node's `Plan Rows` reaching
+`summary.estimated_rows` while MySQL's stays empty; the returned document carrying
+none of `Actual Rows`, `Actual Total Time` or `Actual Loops`, which exist only in an
+executed plan and are therefore the direct server-side proof that no `ANALYZE` was
+sent; and a user-defined enum in the inner statement's projection still planning
+through an unnamed statement, which is the measurement `bind::plan_statement` rests
+on.
+
+The prefix verification itself needs no database and is covered in section 1: both
+`ANALYZE` spellings, a decorated or differently-formatted prefix, a second statement
+after the prefix, a different inner statement, and an unparseable string are each
+refused, while a plain `SELECT`, a read-only CTE and a statement ending in a line
+comment each verify. A separate unit test proves that `EXPLAIN` submitted as agent
+SQL is denied by the analyzer and the policy engine before any explainer sees it
+(ADR-0020).
+
+**A read-only transaction does not refuse to plan a write, and the tests say so.**
+`EXPLAIN (FORMAT JSON) INSERT ...` succeeds inside `BEGIN READ ONLY` on PostgreSQL,
+because planning writes nothing. The barrier is `ReadOnlyRootStatementPolicy`, and
+the test asserts the rejection there rather than pretending the transaction is doing
+the work.
+
 Coverage uses `cargo llvm-cov --workspace --all-features --no-report --
 --test-threads=1`: all features include these container cases, while the serial test
 harness avoids intermittent PostgreSQL startup contention under LLVM instrumentation.

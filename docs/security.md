@@ -604,7 +604,7 @@ isolated.
 - [ ] MySQL session mutation is tested
 - [ ] PostgreSQL sequence mutation is tested
 - [ ] PostgreSQL locking tests exist
-- [ ] `EXPLAIN` cannot select `ANALYZE`
+- [x] `EXPLAIN` cannot select `ANALYZE`
 - [x] Real-database timeouts cover client and server
 - [x] Semaphore and `max_queue_wait` are tested
 - [x] Per-value and total-byte limits are tested

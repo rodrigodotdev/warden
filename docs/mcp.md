@@ -165,8 +165,17 @@ comparable.
 
 Never run `EXPLAIN ANALYZE`; it executes the underlying query.
 
-- **MySQL:** `EXPLAIN` or `EXPLAIN FORMAT=JSON`, never `EXPLAIN ANALYZE`.
+- **MySQL:** `EXPLAIN FORMAT=JSON`, never `EXPLAIN ANALYZE`.
 - **PostgreSQL:** `EXPLAIN (FORMAT JSON)`, never `ANALYZE TRUE`.
+
+**Shipped in Milestone 10.** Both prefixes are declared verbatim as a constant that
+`tests/adapter_rules.rs` pins, both adapters run the plan on `agent_pool` under the
+connection's `QueryPermit`, inside the same read-only transaction and under the same
+deadline and cancellation token as `query`, and the response is bounded by
+`MAX_PLAN_BYTES` before it reaches model context (`docs/data-model.md` section 10).
+`summary.estimated_rows` is PostgreSQL's root-node `Plan Rows`; MySQL's summary is
+empty because MySQL states no statement-level estimate, and Warden does not invent
+one.
 
 ### 3.1 Why all policies still apply
 
@@ -182,6 +191,16 @@ from the analyzed string (SPEC section 6, invariant 19).
 After adding the prefix, **reparse the resulting string** and verify that it is an
 `Statement::Explain` containing a statement equivalent to the analyzed one. This is
 cheap and closes the entire class of comment- or quoting-based context breaks.
+
+**Shipped in Milestone 10 as a type, not a step (ADR-0037).** Each adapter's private
+`plan.rs` declares `VerifiedExplain`, whose only constructor prefixes the analyzed
+SQL and then reparses the result. The check asserts the shape it requires — exactly
+one statement, an `EXPLAIN` with every executing and decorating flag false, the
+dialect's exact JSON-format spelling, and an inner statement equal to a standalone
+parse of the analyzed SQL — rather than enumerating forbidden spellings. Both of
+PostgreSQL's `ANALYZE` spellings fail it, and so does a prefix followed by a second
+statement, which `sqlparser` really does accept as two statements. The only failure
+is `explain_error`, and it names no part of the agent's statement.
 
 ## 4. Tool-schema evolution
 
