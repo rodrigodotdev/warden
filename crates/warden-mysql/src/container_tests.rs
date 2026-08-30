@@ -13,6 +13,7 @@
 
 mod execution;
 mod inspection;
+mod planning;
 mod privileges;
 
 use std::path::{Path, PathBuf};
