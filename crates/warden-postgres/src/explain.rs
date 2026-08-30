@@ -25,7 +25,12 @@
 //! Unlike [`crate::execute`], nothing here needs a named prepared statement: the one
 //! output column is `json`, so no custom result metadata is resolved, and
 //! `crate::bind::plan_statement` keeps `agent_query`'s non-persistent default. There
-//! is no `DEALLOCATE ALL` and no connection to retire.
+//! is no `DEALLOCATE ALL`, and this path does not need `execute.rs`'s
+//! `RetiringConnection`/`disarm` either: with no named statement to strand, the only
+//! open question after an unconfirmed rollback is the transaction itself, and a
+//! dropped `sqlx::Transaction` queues a `ROLLBACK` that runs before the connection's
+//! next statement, with `pool.rs`'s default `test_before_acquire` discarding a
+//! connection that cannot answer before it is handed out again.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -140,7 +145,12 @@ impl PostgreSqlExplainer {
 
         // Rollback on its own short budget, its outcome discarded: a read-only
         // transaction has nothing to commit, and a slow rollback must not replace a
-        // valid plan with a timeout.
+        // valid plan with a timeout. Unlike `execute.rs`, an unconfirmed rollback
+        // here does not need `RetiringConnection`/`disarm`: `plan_statement` left no
+        // named statement to strand, dropping `transaction` below queues a
+        // `ROLLBACK` that PostgreSQL runs before this connection's next statement,
+        // and `pool.rs`'s default `test_before_acquire` discards a connection that
+        // cannot answer before it is handed out again.
         let rollback_deadline = Instant::now() + ROLLBACK_TIMEOUT;
         let _rollback_outcome = bounded(rollback_deadline, transaction.rollback()).await;
         outcome
