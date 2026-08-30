@@ -292,6 +292,55 @@ async fn the_read_only_transaction_is_not_what_refuses_a_write() {
 }
 
 #[tokio::test]
+async fn the_server_plans_an_insert_inside_the_read_only_transaction() {
+    // The other half of the pair with `the_read_only_transaction_is_not_what_refuses_a_write`
+    // above. That test goes through the real analyzer and policy engine, so it can
+    // only prove the policy engine refuses an INSERT before an `AuthorizedQuery` for
+    // it ever exists — it never reaches `PostgreSqlExplainer`, and so cannot say
+    // what the transaction itself would have done with the statement. This test goes
+    // straight past the policy engine to the server and pins the premise
+    // `explain.rs` cites: `EXPLAIN (FORMAT JSON) INSERT ...` succeeds inside
+    // `BEGIN READ ONLY`, because planning writes nothing. Together the two tests are
+    // the actual argument: the server would have planned the write, and
+    // `ReadOnlyRootStatementPolicy` — not the transaction — is what stops it from
+    // ever reaching here.
+    //
+    // This premise is fail-safe, not a vulnerability: if a future PostgreSQL started
+    // refusing to plan a write inside a read-only transaction, Warden would become
+    // stricter, not weaker. This test exists only so the premise cannot go stale
+    // silently in a doc comment.
+    let container = start_postgres().await;
+    let pools = Arc::new(
+        PostgreSqlConnectionPools::connect(config(dsn(&container).await))
+            .await
+            .unwrap(),
+    );
+    fixture(&pools).await;
+
+    let mut connection = pools.agent().acquire().await.unwrap();
+    let mut transaction = connection.begin_with("BEGIN READ ONLY").await.unwrap();
+    let row = sqlx::query(AssertSqlSafe(
+        "EXPLAIN (FORMAT JSON) INSERT INTO orders VALUES (99, 'x')".to_owned(),
+    ))
+    .fetch_one(&mut *transaction)
+    .await
+    .expect("the server must plan a write inside a read-only transaction");
+    let document: serde_json::Value = row.try_get(0).unwrap();
+    assert!(
+        root_node(&document).get("Node Type").is_some(),
+        "expected a plan document naming its root node: {document}"
+    );
+
+    transaction.rollback().await.unwrap();
+    // `pools.close()` waits for every checked-out connection to return before it
+    // resolves. `connection` was acquired directly rather than through a permit, so
+    // nothing else returns it to the pool; without this drop, `close()` never
+    // observes it and the test hangs forever.
+    drop(connection);
+    pools.close().await;
+}
+
+#[tokio::test]
 async fn a_plan_leaves_no_prepared_statement_and_no_session_state_behind() {
     // The two facts ADR-0025 and `docs/operations.md` section 4 care about: nothing
     // named survives on `agent_pool`, and the per-request `SET LOCAL
