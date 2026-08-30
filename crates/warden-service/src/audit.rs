@@ -90,13 +90,114 @@ pub(crate) async fn record_outcome(sink: &dyn AuditSink, event: AuditOutcomeEven
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    use std::collections::BTreeMap;
+    use std::fmt;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex, OnceLock};
     use std::time::Duration;
 
+    use tracing::field::{Field, Visit};
+    use tracing::span;
+    use tracing::{Event, Metadata, Subscriber};
     use warden_core::dialect::Dialect;
     use warden_ports::{AuditError, AuditOutcome};
 
     use super::*;
     use crate::testing;
+
+    #[derive(Debug)]
+    struct CapturedEvent {
+        target: String,
+        fields: BTreeMap<String, String>,
+    }
+
+    #[derive(Debug)]
+    struct AuditAlarmSubscriber {
+        events: Arc<Mutex<Vec<CapturedEvent>>>,
+    }
+
+    impl Subscriber for AuditAlarmSubscriber {
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            Some(tracing::level_filters::LevelFilter::TRACE)
+        }
+
+        fn new_span(&self, _attributes: &span::Attributes<'_>) -> span::Id {
+            span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &span::Id, _values: &span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &span::Id, _follows: &span::Id) {}
+
+        fn event(&self, event: &Event<'_>) {
+            let mut visitor = FieldVisitor::default();
+            event.record(&mut visitor);
+            self.events.lock().unwrap().push(CapturedEvent {
+                target: event.metadata().target().to_owned(),
+                fields: visitor.fields,
+            });
+        }
+
+        fn enter(&self, _span: &span::Id) {}
+
+        fn exit(&self, _span: &span::Id) {}
+    }
+
+    #[derive(Default)]
+    struct FieldVisitor {
+        fields: BTreeMap<String, String>,
+    }
+
+    impl Visit for FieldVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn fmt::Debug) {
+            self.fields
+                .insert(field.name().to_owned(), format!("{value:?}"));
+        }
+    }
+
+    static ALARM_TEST_LOCK: AtomicBool = AtomicBool::new(false);
+
+    struct AlarmTestLock;
+
+    impl Drop for AlarmTestLock {
+        fn drop(&mut self) {
+            ALARM_TEST_LOCK.store(false, Ordering::Release);
+        }
+    }
+
+    fn alarm_test_lock() -> AlarmTestLock {
+        while ALARM_TEST_LOCK.swap(true, Ordering::Acquire) {
+            std::thread::yield_now();
+        }
+        AlarmTestLock
+    }
+
+    fn alarm_events() -> Arc<Mutex<Vec<CapturedEvent>>> {
+        static EVENTS: OnceLock<Arc<Mutex<Vec<CapturedEvent>>>> = OnceLock::new();
+        Arc::clone(EVENTS.get_or_init(|| {
+            let events = Arc::new(Mutex::new(Vec::new()));
+            tracing::subscriber::set_global_default(AuditAlarmSubscriber {
+                events: Arc::clone(&events),
+            })
+            .unwrap();
+            events
+        }))
+    }
+
+    fn outcome() -> AuditOutcomeEvent {
+        AuditOutcomeEvent {
+            attempt_id: AuditEventId::generate(),
+            outcome: AuditOutcome::Succeeded,
+            duration: Some(Duration::from_millis(1)),
+            rows_returned: Some(1),
+            result_bytes: Some(3),
+            error_code: None,
+        }
+    }
 
     #[test]
     fn an_attempt_carries_every_denial_and_no_statement() {
@@ -143,20 +244,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_broken_outcome_write_does_not_fail_the_request() {
+    async fn a_recorded_outcome_reaches_the_sink() {
+        let sink = testing::FakeAuditSink::new();
+        let recorded = outcome();
+        record_outcome(&sink, recorded).await;
+        assert_eq!(sink.outcomes(), vec![recorded]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_outcome_write_is_cancelled_at_the_audit_timeout() {
+        let _guard = alarm_test_lock();
+        let _events = alarm_events();
+        let sink = testing::FakeAuditSink::taking(AUDIT_WRITE_TIMEOUT * 10);
+        record_outcome(&sink, outcome()).await;
+        assert!(sink.outcomes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_broken_outcome_write_raises_a_sanitized_alarm_without_failing_the_request() {
+        let _guard = alarm_test_lock();
+        let events = alarm_events();
+        events.lock().unwrap().clear();
         let sink = testing::FakeAuditSink::broken_outcomes();
-        record_outcome(
-            &sink,
-            AuditOutcomeEvent {
-                attempt_id: AuditEventId::generate(),
-                outcome: AuditOutcome::Succeeded,
-                duration: Some(Duration::from_millis(1)),
-                rows_returned: Some(1),
-                result_bytes: Some(3),
-                error_code: None,
-            },
-        )
-        .await;
+        let recorded = outcome();
+
+        record_outcome(&sink, recorded).await;
+
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        let alarm = &events[0];
+        assert_eq!(alarm.target, "warden.audit");
+        assert_eq!(
+            alarm.fields.get("attempt_id"),
+            Some(&recorded.attempt_id.to_string())
+        );
+        assert_eq!(alarm.fields.get("outcome"), Some(&"succeeded".to_owned()));
+        assert_eq!(
+            alarm.fields.get("error"),
+            Some(&"the audit sink is unavailable".to_owned())
+        );
+        assert!(
+            !alarm
+                .fields
+                .values()
+                .any(|value| value.contains("the fake sink is broken"))
+        );
     }
 
     #[test]

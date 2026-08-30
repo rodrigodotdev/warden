@@ -95,4 +95,13 @@ mod tests {
         );
         assert!(total > limits.client_timeout(), "{total:?}");
     }
+
+    #[test]
+    fn the_total_budget_saturates_at_the_largest_duration() {
+        let limits = ExecutionLimits {
+            max_queue_wait: Duration::MAX,
+            ..ExecutionLimits::default()
+        };
+        assert_eq!(RequestBudget::new(limits).total(), Duration::MAX);
+    }
 }
