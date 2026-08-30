@@ -31,12 +31,13 @@ use warden_core::schema::{
     SchemaDescribeRequest, SchemaDescription, SchemaSearchRequest, SchemaSearchResult,
 };
 use warden_policy::{
-    AnalyzedQuery, AuthorizedQuery, ObjectFilter, PolicyEngine, PolicyRejection, PolicySettings,
+    AnalyzedQuery, AuthorizedQuery, DenyReason, ObjectFilter, PolicyEngine, PolicyRejection,
+    PolicySettings,
 };
 use warden_ports::{
-    AnalyzeError, AuditAttempt, AuditError, AuditOutcomeEvent, AuditSink, ConnectionRuntime,
-    ConnectionRuntimeParts, ExecuteError, ExplainError, Explainer, QueryAnalyzer, QueryExecutor,
-    QueryPermit, SchemaError, SchemaInspector,
+    AnalyzeError, AuditAttempt, AuditError, AuditEventId, AuditOutcomeEvent, AuditSink,
+    ConnectionRuntime, ConnectionRuntimeParts, ExecuteError, ExplainError, Explainer,
+    QueryAnalyzer, QueryExecutor, QueryPermit, SchemaError, SchemaInspector,
 };
 
 use crate::StaticConnectionRegistry;
@@ -76,6 +77,23 @@ pub(crate) fn connection(dialect: Dialect) -> ConnectionMetadata {
         dialect,
         environment: Environment::Production,
         database: "app".to_owned(),
+    }
+}
+
+/// A valid audit attempt with no policy denials.
+pub(crate) fn attempt() -> AuditAttempt {
+    AuditAttempt {
+        id: AuditEventId::generate(),
+        timestamp: time::OffsetDateTime::now_utc(),
+        request_id: request_context().request_id().clone(),
+        principal: request_context().principal().clone(),
+        client: request_context().client().clone(),
+        connection: connection(Dialect::MySql).name,
+        dialect: Dialect::MySql,
+        environment: Environment::Production,
+        fingerprint: None,
+        statement_kind: StatementKind::Select,
+        deny_reasons: Vec::<DenyReason>::new(),
     }
 }
 
@@ -425,6 +443,7 @@ pub(crate) struct FakeAuditSink {
     outcomes: Mutex<Vec<AuditOutcomeEvent>>,
     broken_attempts: bool,
     broken_outcomes: bool,
+    duration: Duration,
 }
 
 impl FakeAuditSink {
@@ -443,6 +462,13 @@ impl FakeAuditSink {
     pub(crate) fn broken_outcomes() -> Self {
         Self {
             broken_outcomes: true,
+            ..Self::default()
+        }
+    }
+    /// Creates a sink whose writes take the given duration.
+    pub(crate) fn taking(duration: Duration) -> Self {
+        Self {
+            duration,
             ..Self::default()
         }
     }
@@ -467,6 +493,7 @@ impl AuditSink for FakeAuditSink {
         event: &'a AuditAttempt,
     ) -> warden_ports::BoxFuture<'a, Result<(), AuditError>> {
         Box::pin(async move {
+            sleep(self.duration).await;
             self.attempts.lock().unwrap().push(event.clone());
             if self.broken_attempts {
                 return Err(Self::failure());
@@ -479,6 +506,7 @@ impl AuditSink for FakeAuditSink {
         event: &'a AuditOutcomeEvent,
     ) -> warden_ports::BoxFuture<'a, Result<(), AuditError>> {
         Box::pin(async move {
+            sleep(self.duration).await;
             self.outcomes.lock().unwrap().push(*event);
             if self.broken_outcomes {
                 return Err(Self::failure());

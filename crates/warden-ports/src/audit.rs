@@ -123,16 +123,25 @@ pub enum AuditOutcome {
     TimedOut,
     /// The statement was cancelled.
     Cancelled,
+    /// The statement was authorized but never reached the database.
+    ///
+    /// The attempt is recorded before the concurrency permit is acquired
+    /// (ADR-0022), so an authorized statement can end here — the queue was still
+    /// full when `max_queue_wait` elapsed, or the connection became unavailable.
+    /// [`AuditOutcome::Failed`] would say the database failed the statement, which
+    /// is a different fact, and an audit record must not state one for the other.
+    NotStarted,
 }
 
 impl AuditOutcome {
     /// Every outcome. Milestone 13's sink iterates this to prove each has a mapping.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Denied,
         Self::Succeeded,
         Self::Failed,
         Self::TimedOut,
         Self::Cancelled,
+        Self::NotStarted,
     ];
 
     /// The stable name used in audit records, trace fields, and metric labels.
@@ -147,6 +156,7 @@ impl AuditOutcome {
             Self::Failed => "failed",
             Self::TimedOut => "timed_out",
             Self::Cancelled => "cancelled",
+            Self::NotStarted => "not_started",
         }
     }
 }
