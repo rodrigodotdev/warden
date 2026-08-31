@@ -136,12 +136,17 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use warden_core::error::{PublicError, PublicErrorCode};
-    use warden_ports::{AnalyzeError, AuditError, ConnectionError, ExecuteError};
+    use warden_core::result::NormalizationError;
+    use warden_ports::{
+        AnalyzeError, AuditError, ConnectionError, ExecuteError, ExplainError, SchemaError,
+    };
 
     use super::*;
+    use crate::testing;
 
     #[test]
     fn every_query_failure_maps_to_the_documented_public_code() {
+        let rejection = testing::rejection_with_internal_detail();
         let cases: Vec<(QueryServiceError, PublicErrorCode)> = vec![
             (
                 ConnectionError::NotFound {
@@ -151,6 +156,13 @@ mod tests {
                 PublicErrorCode::ConnectionNotFound,
             ),
             (
+                ConnectionError::Unavailable {
+                    name: "down".parse().unwrap(),
+                }
+                .into(),
+                PublicErrorCode::ConnectionUnavailable,
+            ),
+            (
                 ConnectionError::Busy {
                     name: "busy".parse().unwrap(),
                 }
@@ -158,11 +170,48 @@ mod tests {
                 PublicErrorCode::ServerBusy,
             ),
             (
+                AnalyzeError::Parse {
+                    detail: "parser.internal".to_owned(),
+                }
+                .into(),
+                PublicErrorCode::QueryParseError,
+            ),
+            (
                 AnalyzeError::RecursionLimit.into(),
                 PublicErrorCode::QueryParseError,
             ),
+            (rejection.into(), PublicErrorCode::QueryRejected),
+            (
+                AuditError::Unavailable {
+                    detail: "audit.internal".to_owned(),
+                }
+                .into(),
+                PublicErrorCode::InternalError,
+            ),
             (AuditError::Timeout.into(), PublicErrorCode::InternalError),
             (ExecuteError::Timeout.into(), PublicErrorCode::QueryTimeout),
+            (
+                ExecuteError::Cancelled.into(),
+                PublicErrorCode::QueryCancelled,
+            ),
+            (
+                ExecuteError::ResultTooLarge { limit: 4096 }.into(),
+                PublicErrorCode::QueryResultTooLarge,
+            ),
+            (
+                ExecuteError::Normalization(NormalizationError::NonFiniteFloat {
+                    column: "amount".to_owned(),
+                })
+                .into(),
+                PublicErrorCode::QueryNormalizationError,
+            ),
+            (
+                ExecuteError::Database {
+                    detail: "db.internal".to_owned(),
+                }
+                .into(),
+                PublicErrorCode::QueryExecutionError,
+            ),
         ];
         for (error, expected) in cases {
             assert_eq!(error.public_code(), expected, "{error}");
@@ -170,10 +219,224 @@ mod tests {
     }
 
     #[test]
-    fn a_failure_never_prints_a_detail_field() {
-        let error = QueryServiceError::from(ExecuteError::Database {
-            detail: "connection to db.internal as warden failed".to_owned(),
-        });
-        assert!(!error.to_string().contains("db.internal"), "{error}");
+    fn every_explain_failure_maps_to_the_documented_public_code() {
+        let rejection = testing::rejection_with_internal_detail();
+        let cases: Vec<(ExplainServiceError, PublicErrorCode)> = vec![
+            (
+                ConnectionError::NotFound {
+                    name: "gone".parse().unwrap(),
+                }
+                .into(),
+                PublicErrorCode::ConnectionNotFound,
+            ),
+            (
+                ConnectionError::Unavailable {
+                    name: "down".parse().unwrap(),
+                }
+                .into(),
+                PublicErrorCode::ConnectionUnavailable,
+            ),
+            (
+                ConnectionError::Busy {
+                    name: "busy".parse().unwrap(),
+                }
+                .into(),
+                PublicErrorCode::ServerBusy,
+            ),
+            (
+                AnalyzeError::Parse {
+                    detail: "parser.internal".to_owned(),
+                }
+                .into(),
+                PublicErrorCode::QueryParseError,
+            ),
+            (
+                AnalyzeError::RecursionLimit.into(),
+                PublicErrorCode::QueryParseError,
+            ),
+            (rejection.into(), PublicErrorCode::QueryRejected),
+            (
+                AuditError::Unavailable {
+                    detail: "audit.internal".to_owned(),
+                }
+                .into(),
+                PublicErrorCode::InternalError,
+            ),
+            (AuditError::Timeout.into(), PublicErrorCode::InternalError),
+            (
+                ExplainError::PrefixVerificationFailed.into(),
+                PublicErrorCode::ExplainError,
+            ),
+            (
+                ExplainError::MalformedPlan {
+                    detail: "plan.internal".to_owned(),
+                }
+                .into(),
+                PublicErrorCode::ExplainError,
+            ),
+            (
+                ExplainError::PlanTooLarge { limit: 4096 }.into(),
+                PublicErrorCode::ExplainError,
+            ),
+            (ExplainError::Timeout.into(), PublicErrorCode::QueryTimeout),
+            (
+                ExplainError::Cancelled.into(),
+                PublicErrorCode::QueryCancelled,
+            ),
+            (
+                ExplainError::Database {
+                    detail: "db.internal".to_owned(),
+                }
+                .into(),
+                PublicErrorCode::ExplainError,
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(error.public_code(), expected, "{error}");
+        }
+    }
+
+    #[test]
+    fn every_schema_failure_maps_to_the_documented_public_code() {
+        let rejection = testing::rejection_with_internal_detail();
+        let cases: Vec<(SchemaServiceError, PublicErrorCode)> = vec![
+            (
+                ConnectionError::NotFound {
+                    name: "gone".parse().unwrap(),
+                }
+                .into(),
+                PublicErrorCode::ConnectionNotFound,
+            ),
+            (
+                ConnectionError::Unavailable {
+                    name: "down".parse().unwrap(),
+                }
+                .into(),
+                PublicErrorCode::ConnectionUnavailable,
+            ),
+            (
+                ConnectionError::Busy {
+                    name: "busy".parse().unwrap(),
+                }
+                .into(),
+                PublicErrorCode::ServerBusy,
+            ),
+            (
+                SchemaError::Rejected(rejection).into(),
+                PublicErrorCode::QueryRejected,
+            ),
+            (SchemaError::Timeout.into(), PublicErrorCode::QueryTimeout),
+            (
+                SchemaError::Cancelled.into(),
+                PublicErrorCode::QueryCancelled,
+            ),
+            (
+                SchemaError::Database {
+                    detail: "db.internal".to_owned(),
+                }
+                .into(),
+                PublicErrorCode::SchemaLookupError,
+            ),
+            (
+                SchemaServiceError::SearchUnsupported,
+                PublicErrorCode::SchemaLookupError,
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(error.public_code(), expected, "{error}");
+        }
+    }
+
+    #[test]
+    fn every_internal_detail_is_sanitized_by_its_local_display() {
+        let rejection = testing::rejection_with_internal_detail();
+        assert!(
+            rejection
+                .reasons()
+                .iter()
+                .any(|reason| reason.internal_detail().is_some_and(|detail| {
+                    detail.contains("staging-db") && detail.contains("production-db")
+                }))
+        );
+        let normalization = NormalizationError::NonFiniteFloat {
+            column: "safe_column".to_owned(),
+        };
+        let normalization_display = normalization.to_string();
+        let rendered_and_hidden = vec![
+            (
+                QueryServiceError::from(rejection.clone()).to_string(),
+                "staging-db",
+            ),
+            (
+                ExplainServiceError::from(rejection.clone()).to_string(),
+                "staging-db",
+            ),
+            (
+                SchemaServiceError::from(SchemaError::Rejected(rejection)).to_string(),
+                "staging-db",
+            ),
+            (
+                QueryServiceError::from(AuditError::Unavailable {
+                    detail: "audit.internal".to_owned(),
+                })
+                .to_string(),
+                "audit.internal",
+            ),
+            (
+                ExplainServiceError::from(AuditError::Unavailable {
+                    detail: "audit.internal".to_owned(),
+                })
+                .to_string(),
+                "audit.internal",
+            ),
+            (
+                QueryServiceError::from(AnalyzeError::Parse {
+                    detail: "parser.internal".to_owned(),
+                })
+                .to_string(),
+                "parser.internal",
+            ),
+            (
+                ExplainServiceError::from(AnalyzeError::Parse {
+                    detail: "parser.internal".to_owned(),
+                })
+                .to_string(),
+                "parser.internal",
+            ),
+            (
+                QueryServiceError::from(ExecuteError::Database {
+                    detail: "execute.internal".to_owned(),
+                })
+                .to_string(),
+                "execute.internal",
+            ),
+            (
+                ExplainServiceError::from(ExplainError::MalformedPlan {
+                    detail: "plan.internal".to_owned(),
+                })
+                .to_string(),
+                "plan.internal",
+            ),
+            (
+                ExplainServiceError::from(ExplainError::Database {
+                    detail: "explain-db.internal".to_owned(),
+                })
+                .to_string(),
+                "explain-db.internal",
+            ),
+            (
+                SchemaServiceError::from(SchemaError::Database {
+                    detail: "schema-db.internal".to_owned(),
+                })
+                .to_string(),
+                "schema-db.internal",
+            ),
+        ];
+        for (rendered, hidden) in rendered_and_hidden {
+            assert!(!rendered.contains(hidden), "{rendered}");
+        }
+
+        let error = QueryServiceError::from(ExecuteError::Normalization(normalization));
+        assert_eq!(error.to_string(), normalization_display);
     }
 }

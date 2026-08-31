@@ -171,6 +171,18 @@ pub(crate) fn rejection() -> PolicyRejection {
         .unwrap_err()
 }
 
+/// A real rejection whose audit-only detail names mismatched connections.
+pub(crate) fn rejection_with_internal_detail() -> PolicyRejection {
+    engine()
+        .authorize(
+            &request_context(),
+            &connection(Dialect::MySql),
+            AnalyzedQuery::new(request_for("staging-db"), analysis(Dialect::MySql)),
+            ExecutionLimits::default(),
+        )
+        .unwrap_err()
+}
+
 /// A valid normalized result.
 pub(crate) fn result_set() -> ResultSet {
     ResultSet {
@@ -259,6 +271,7 @@ pub(crate) struct FakeExecutor {
     duration: Duration,
     failure: Option<ExecuteError>,
     calls: Arc<AtomicUsize>,
+    observations: Mutex<Vec<(Instant, CancellationToken)>>,
 }
 
 impl Default for FakeExecutor {
@@ -274,6 +287,7 @@ impl FakeExecutor {
             duration: Duration::ZERO,
             failure: None,
             calls: Arc::new(AtomicUsize::new(0)),
+            observations: Mutex::new(Vec::new()),
         }
     }
     /// Creates an executor that takes the given duration.
@@ -294,6 +308,10 @@ impl FakeExecutor {
     pub(crate) fn calls(&self) -> usize {
         self.calls.load(Ordering::Relaxed)
     }
+    /// Returns the deadline and cancellation token received by the latest call.
+    pub(crate) fn latest_observation(&self) -> (Instant, CancellationToken) {
+        self.observations.lock().unwrap().last().unwrap().clone()
+    }
 }
 
 impl QueryExecutor for FakeExecutor {
@@ -306,6 +324,10 @@ impl QueryExecutor for FakeExecutor {
     ) -> warden_ports::BoxFuture<'a, Result<ResultSet, ExecuteError>> {
         Box::pin(async move {
             self.calls.fetch_add(1, Ordering::Relaxed);
+            self.observations
+                .lock()
+                .unwrap()
+                .push((deadline, cancel.clone()));
             tokio::select! { () = sleep(self.duration) => {}, () = cancel.cancelled() => return Err(ExecuteError::Cancelled), () = sleep_until(deadline) => return Err(ExecuteError::Timeout) }
             match &self.failure {
                 Some(error) => Err(error.clone()),
@@ -320,6 +342,7 @@ impl QueryExecutor for FakeExecutor {
 pub(crate) struct FakeExplainer {
     failure: Option<ExplainError>,
     calls: Arc<AtomicUsize>,
+    observations: Mutex<Vec<(Instant, CancellationToken)>>,
 }
 
 impl Default for FakeExplainer {
@@ -334,6 +357,7 @@ impl FakeExplainer {
         Self {
             failure: None,
             calls: Arc::new(AtomicUsize::new(0)),
+            observations: Mutex::new(Vec::new()),
         }
     }
     /// Creates an explainer that always fails.
@@ -347,6 +371,10 @@ impl FakeExplainer {
     pub(crate) fn calls(&self) -> usize {
         self.calls.load(Ordering::Relaxed)
     }
+    /// Returns the deadline and cancellation token received by the latest call.
+    pub(crate) fn latest_observation(&self) -> (Instant, CancellationToken) {
+        self.observations.lock().unwrap().last().unwrap().clone()
+    }
 }
 
 impl Explainer for FakeExplainer {
@@ -354,11 +382,12 @@ impl Explainer for FakeExplainer {
         &'a self,
         _query: &'a AuthorizedQuery,
         _permit: &'a QueryPermit,
-        _deadline: Instant,
-        _cancel: CancellationToken,
+        deadline: Instant,
+        cancel: CancellationToken,
     ) -> warden_ports::BoxFuture<'a, Result<QueryPlan, ExplainError>> {
         Box::pin(async move {
             self.calls.fetch_add(1, Ordering::Relaxed);
+            self.observations.lock().unwrap().push((deadline, cancel));
             match &self.failure {
                 Some(error) => Err(error.clone()),
                 None => Ok(plan()),
@@ -494,10 +523,10 @@ impl AuditSink for FakeAuditSink {
     ) -> warden_ports::BoxFuture<'a, Result<(), AuditError>> {
         Box::pin(async move {
             sleep(self.duration).await;
-            self.attempts.lock().unwrap().push(event.clone());
             if self.broken_attempts {
                 return Err(Self::failure());
             }
+            self.attempts.lock().unwrap().push(event.clone());
             Ok(())
         })
     }
@@ -561,6 +590,16 @@ pub(crate) fn runtime_with_executor(
 ) -> ConnectionRuntime {
     let mut parts = FakeParts::new(dialect);
     parts.executor = executor;
+    runtime_from(parts)
+}
+
+/// A runtime whose explainer is observable by the caller.
+pub(crate) fn runtime_with_explainer(
+    dialect: Dialect,
+    explainer: Arc<FakeExplainer>,
+) -> ConnectionRuntime {
+    let mut parts = FakeParts::new(dialect);
+    parts.explainer = explainer;
     runtime_from(parts)
 }
 
