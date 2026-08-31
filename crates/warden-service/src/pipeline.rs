@@ -21,11 +21,6 @@
 //! that calls the ports directly, and it does not replace database privileges
 //! (ADR-0016).
 
-#![cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Task 6 consumes the gate's explain path")
-)]
-
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use warden_core::explain::QueryPlan;

@@ -40,6 +40,7 @@ use warden_ports::{
     Explainer, QueryAnalyzer, QueryExecutor, QueryPermit, SchemaError, SchemaInspector,
 };
 
+use crate::explain::ExplainService;
 use crate::query::QueryService;
 use crate::{RedactionSettings, Redactor, StaticConnectionRegistry};
 
@@ -243,7 +244,7 @@ pub(crate) fn plan() -> QueryPlan {
         summary: PlanSummary {
             estimated_rows: Some(1200),
         },
-        plan: serde_json::json!({ "Node Type": "Seq Scan" }),
+        plan: serde_json::json!({ "Node Type": "Seq Scan", "password": "hunter2" }),
     }
 }
 
@@ -399,6 +400,7 @@ pub(crate) struct FakeExplainer {
     failure: Option<ExplainError>,
     calls: Arc<AtomicUsize>,
     observations: Mutex<Vec<(Instant, CancellationToken)>>,
+    observed_limits: Mutex<Option<ExecutionLimits>>,
 }
 
 impl Default for FakeExplainer {
@@ -415,6 +417,7 @@ impl FakeExplainer {
             failure: None,
             calls: Arc::new(AtomicUsize::new(0)),
             observations: Mutex::new(Vec::new()),
+            observed_limits: Mutex::new(None),
         }
     }
     /// Creates an explainer that takes the given duration.
@@ -431,6 +434,10 @@ impl FakeExplainer {
             ..Self::new()
         }
     }
+    /// Creates an explainer that exposes the authorized limits it receives.
+    pub(crate) fn recording_limits() -> Self {
+        Self::new()
+    }
     /// Returns the number of calls made to the database port.
     pub(crate) fn calls(&self) -> usize {
         self.calls.load(Ordering::Relaxed)
@@ -439,12 +446,16 @@ impl FakeExplainer {
     pub(crate) fn latest_observation(&self) -> (Instant, CancellationToken) {
         self.observations.lock().unwrap().last().unwrap().clone()
     }
+    /// Returns the limits carried by the latest authorized query.
+    pub(crate) fn observed_limits(&self) -> Option<ExecutionLimits> {
+        *self.observed_limits.lock().unwrap()
+    }
 }
 
 impl Explainer for FakeExplainer {
     fn explain<'a>(
         &'a self,
-        _query: &'a AuthorizedQuery,
+        query: &'a AuthorizedQuery,
         _permit: &'a QueryPermit,
         deadline: Instant,
         cancel: CancellationToken,
@@ -455,6 +466,7 @@ impl Explainer for FakeExplainer {
                 .lock()
                 .unwrap()
                 .push((deadline, cancel.clone()));
+            *self.observed_limits.lock().unwrap() = Some(query.limits());
             tokio::select! { () = sleep(self.duration) => {}, () = cancel.cancelled() => return Err(ExplainError::Cancelled), () = sleep_until(deadline) => return Err(ExplainError::Timeout) }
             match &self.failure {
                 Some(error) => Err(error.clone()),
@@ -720,7 +732,7 @@ pub(crate) fn redactor(columns: &[&str]) -> Arc<Redactor> {
     )
 }
 
-/// Swappable fixtures for one query service.
+/// Swappable fixtures for query and explain services.
 pub(crate) struct ServiceFakes {
     /// Per-connection execution limits.
     pub(crate) limits: ExecutionLimits,
@@ -728,6 +740,8 @@ pub(crate) struct ServiceFakes {
     pub(crate) analyzer: Arc<dyn QueryAnalyzer>,
     /// The executor port.
     pub(crate) executor: Arc<dyn QueryExecutor>,
+    /// The explainer port.
+    pub(crate) explainer: Arc<dyn Explainer>,
     /// The two-phase audit port.
     pub(crate) audit: Arc<dyn AuditSink>,
     /// Response redaction rules.
@@ -742,6 +756,7 @@ impl Default for ServiceFakes {
             limits: ExecutionLimits::default(),
             analyzer: Arc::new(FakeAnalyzer::new(Dialect::MySql)),
             executor: Arc::new(FakeExecutor::new()),
+            explainer: Arc::new(FakeExplainer::new()),
             audit: Arc::new(FakeAuditSink::new()),
             redactor: redactor(&[]),
             shutdown: CancellationToken::new(),
@@ -755,10 +770,30 @@ pub(crate) fn query_service(fakes: ServiceFakes) -> QueryService {
     parts.limits = fakes.limits;
     parts.analyzer = fakes.analyzer;
     parts.executor = fakes.executor;
+    parts.explainer = fakes.explainer;
     let runtime = Arc::new(runtime_from(parts));
     let registry: Arc<dyn ConnectionRegistry> =
         Arc::new(StaticConnectionRegistry::new(vec![runtime]).unwrap());
     QueryService::new(
+        registry,
+        engine(),
+        fakes.audit,
+        fakes.redactor,
+        fakes.shutdown,
+    )
+}
+
+/// Builds one explain service whose tests can replace one collaborator at a time.
+pub(crate) fn explain_service(fakes: ServiceFakes) -> ExplainService {
+    let mut parts = FakeParts::new(Dialect::MySql);
+    parts.limits = fakes.limits;
+    parts.analyzer = fakes.analyzer;
+    parts.executor = fakes.executor;
+    parts.explainer = fakes.explainer;
+    let runtime = Arc::new(runtime_from(parts));
+    let registry: Arc<dyn ConnectionRegistry> =
+        Arc::new(StaticConnectionRegistry::new(vec![runtime]).unwrap());
+    ExplainService::new(
         registry,
         engine(),
         fakes.audit,
@@ -781,6 +816,30 @@ pub(crate) async fn saturated_query_service() -> (QueryService, Arc<FakeAuditSin
         Arc::new(StaticConnectionRegistry::new(vec![runtime]).unwrap());
     let sink = Arc::new(FakeAuditSink::new());
     let service = QueryService::new(
+        registry,
+        engine(),
+        Arc::clone(&sink) as Arc<dyn AuditSink>,
+        redactor(&[]),
+        CancellationToken::new(),
+    );
+    (service, sink, held)
+}
+
+/// Builds an explain service whose only connection has no free query slot.
+pub(crate) async fn saturated_explain_service() -> (ExplainService, Arc<FakeAuditSink>, QueryPermit)
+{
+    let limits = ExecutionLimits {
+        max_concurrent_queries: 1,
+        ..ExecutionLimits::default()
+    };
+    let mut parts = FakeParts::new(Dialect::MySql);
+    parts.limits = limits;
+    let runtime = Arc::new(runtime_from(parts));
+    let held = runtime.acquire_query_permit().await.unwrap();
+    let registry: Arc<dyn ConnectionRegistry> =
+        Arc::new(StaticConnectionRegistry::new(vec![runtime]).unwrap());
+    let sink = Arc::new(FakeAuditSink::new());
+    let service = ExplainService::new(
         registry,
         engine(),
         Arc::clone(&sink) as Arc<dyn AuditSink>,

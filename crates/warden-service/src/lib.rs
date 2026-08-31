@@ -41,6 +41,7 @@
 //! code Milestone 12 maps at the MCP boundary.
 
 pub mod error;
+pub mod explain;
 /// Aggregate request timing bounds and their components.
 pub mod limits;
 pub mod query;
@@ -55,6 +56,7 @@ mod audit;
 mod testing;
 
 pub use error::{ExplainServiceError, QueryServiceError, SchemaServiceError, ServiceBuildError};
+pub use explain::ExplainService;
 pub use limits::{AUDIT_WRITE_TIMEOUT, MAX_ADAPTER_CLEANUP, RequestBudget};
 pub use query::QueryService;
 pub use redaction::{REDACTED, RedactionRuleError, RedactionSettings, RedactionStrategy, Redactor};
