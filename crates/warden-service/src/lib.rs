@@ -43,6 +43,7 @@
 pub mod error;
 /// Aggregate request timing bounds and their components.
 pub mod limits;
+pub mod query;
 pub mod redaction;
 pub mod registry;
 
@@ -55,5 +56,6 @@ mod testing;
 
 pub use error::{ExplainServiceError, QueryServiceError, SchemaServiceError, ServiceBuildError};
 pub use limits::{AUDIT_WRITE_TIMEOUT, MAX_ADAPTER_CLEANUP, RequestBudget};
+pub use query::QueryService;
 pub use redaction::{REDACTED, RedactionRuleError, RedactionSettings, RedactionStrategy, Redactor};
 pub use registry::{RegistryError, StaticConnectionRegistry};

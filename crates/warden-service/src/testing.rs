@@ -36,11 +36,12 @@ use warden_policy::{
 };
 use warden_ports::{
     AnalyzeError, AuditAttempt, AuditError, AuditEventId, AuditOutcomeEvent, AuditSink,
-    ConnectionRuntime, ConnectionRuntimeParts, ExecuteError, ExplainError, Explainer,
-    QueryAnalyzer, QueryExecutor, QueryPermit, SchemaError, SchemaInspector,
+    ConnectionRegistry, ConnectionRuntime, ConnectionRuntimeParts, ExecuteError, ExplainError,
+    Explainer, QueryAnalyzer, QueryExecutor, QueryPermit, SchemaError, SchemaInspector,
 };
 
-use crate::StaticConnectionRegistry;
+use crate::query::QueryService;
+use crate::{RedactionSettings, Redactor, StaticConnectionRegistry};
 
 /// The statement every fixture uses.
 pub(crate) const SQL: &str = "SELECT id FROM orders";
@@ -201,6 +202,39 @@ pub(crate) fn result_set() -> ResultSet {
     }
 }
 
+/// A normalized result containing one column that the query-service tests redact.
+pub(crate) fn secret_result() -> ResultSet {
+    let rows = vec![vec![
+        ResultValue::I64(1),
+        ResultValue::String("hunter2".to_owned()),
+    ]];
+    let bytes = rows
+        .iter()
+        .map(|row| warden_core::result::row_json_bytes(row))
+        .sum();
+    ResultSet {
+        columns: vec![
+            ResultColumn {
+                name: "id".to_owned(),
+                database_type: "BIGINT".to_owned(),
+                nullable: Some(false),
+            },
+            ResultColumn {
+                name: "password".to_owned(),
+                database_type: "TEXT".to_owned(),
+                nullable: Some(false),
+            },
+        ],
+        rows,
+        truncated: false,
+        stats: QueryStats {
+            rows_returned: 1,
+            bytes,
+            duration: Duration::from_millis(1),
+        },
+    }
+}
+
 /// A valid structured query plan.
 pub(crate) fn plan() -> QueryPlan {
     QueryPlan {
@@ -270,8 +304,10 @@ impl QueryAnalyzer for FakeAnalyzer {
 pub(crate) struct FakeExecutor {
     duration: Duration,
     failure: Option<ExecuteError>,
+    result: ResultSet,
     calls: Arc<AtomicUsize>,
     observations: Mutex<Vec<(Instant, CancellationToken)>>,
+    observed_limits: Mutex<Option<ExecutionLimits>>,
 }
 
 impl Default for FakeExecutor {
@@ -286,8 +322,10 @@ impl FakeExecutor {
         Self {
             duration: Duration::ZERO,
             failure: None,
+            result: result_set(),
             calls: Arc::new(AtomicUsize::new(0)),
             observations: Mutex::new(Vec::new()),
+            observed_limits: Mutex::new(None),
         }
     }
     /// Creates an executor that takes the given duration.
@@ -304,6 +342,17 @@ impl FakeExecutor {
             ..Self::new()
         }
     }
+    /// Creates an executor that returns the given normalized result.
+    pub(crate) fn returning(result: ResultSet) -> Self {
+        Self {
+            result,
+            ..Self::new()
+        }
+    }
+    /// Creates an executor that exposes the authorized limits it receives.
+    pub(crate) fn recording_limits() -> Self {
+        Self::new()
+    }
     /// Returns the number of calls made to the database port.
     pub(crate) fn calls(&self) -> usize {
         self.calls.load(Ordering::Relaxed)
@@ -312,12 +361,16 @@ impl FakeExecutor {
     pub(crate) fn latest_observation(&self) -> (Instant, CancellationToken) {
         self.observations.lock().unwrap().last().unwrap().clone()
     }
+    /// Returns the limits carried by the latest authorized query.
+    pub(crate) fn observed_limits(&self) -> Option<ExecutionLimits> {
+        *self.observed_limits.lock().unwrap()
+    }
 }
 
 impl QueryExecutor for FakeExecutor {
     fn execute_read_only<'a>(
         &'a self,
-        _query: &'a AuthorizedQuery,
+        query: &'a AuthorizedQuery,
         _permit: &'a QueryPermit,
         deadline: Instant,
         cancel: CancellationToken,
@@ -328,10 +381,11 @@ impl QueryExecutor for FakeExecutor {
                 .lock()
                 .unwrap()
                 .push((deadline, cancel.clone()));
+            *self.observed_limits.lock().unwrap() = Some(query.limits());
             tokio::select! { () = sleep(self.duration) => {}, () = cancel.cancelled() => return Err(ExecuteError::Cancelled), () = sleep_until(deadline) => return Err(ExecuteError::Timeout) }
             match &self.failure {
                 Some(error) => Err(error.clone()),
-                None => Ok(result_set()),
+                None => Ok(self.result.clone()),
             }
         })
     }
@@ -652,4 +706,85 @@ pub(crate) fn runtime_from(parts: FakeParts) -> ConnectionRuntime {
 /// A registry holding the one MySQL fixture connection.
 pub(crate) fn registry() -> StaticConnectionRegistry {
     StaticConnectionRegistry::new(vec![Arc::new(runtime(Dialect::MySql))]).unwrap()
+}
+
+/// Builds a parsed redactor for service tests.
+pub(crate) fn redactor(columns: &[&str]) -> Arc<Redactor> {
+    Arc::new(
+        Redactor::new(&RedactionSettings {
+            columns: columns.iter().map(|column| (*column).to_owned()).collect(),
+            ..RedactionSettings::default()
+        })
+        .unwrap(),
+    )
+}
+
+/// Swappable fixtures for one query service.
+pub(crate) struct ServiceFakes {
+    /// Per-connection execution limits.
+    pub(crate) limits: ExecutionLimits,
+    /// The analyzer port.
+    pub(crate) analyzer: Arc<dyn QueryAnalyzer>,
+    /// The executor port.
+    pub(crate) executor: Arc<dyn QueryExecutor>,
+    /// The two-phase audit port.
+    pub(crate) audit: Arc<dyn AuditSink>,
+    /// Response redaction rules.
+    pub(crate) redactor: Arc<Redactor>,
+    /// Root shutdown signal.
+    pub(crate) shutdown: CancellationToken,
+}
+
+impl Default for ServiceFakes {
+    fn default() -> Self {
+        Self {
+            limits: ExecutionLimits::default(),
+            analyzer: Arc::new(FakeAnalyzer::new(Dialect::MySql)),
+            executor: Arc::new(FakeExecutor::new()),
+            audit: Arc::new(FakeAuditSink::new()),
+            redactor: redactor(&[]),
+            shutdown: CancellationToken::new(),
+        }
+    }
+}
+
+/// Builds one query service whose tests can replace one collaborator at a time.
+pub(crate) fn query_service(fakes: ServiceFakes) -> QueryService {
+    let mut parts = FakeParts::new(Dialect::MySql);
+    parts.limits = fakes.limits;
+    parts.analyzer = fakes.analyzer;
+    parts.executor = fakes.executor;
+    let runtime = Arc::new(runtime_from(parts));
+    let registry: Arc<dyn ConnectionRegistry> =
+        Arc::new(StaticConnectionRegistry::new(vec![runtime]).unwrap());
+    QueryService::new(
+        registry,
+        engine(),
+        fakes.audit,
+        fakes.redactor,
+        fakes.shutdown,
+    )
+}
+
+/// Builds a query service whose only connection has no free query slot.
+pub(crate) async fn saturated_query_service() -> (QueryService, Arc<FakeAuditSink>, QueryPermit) {
+    let limits = ExecutionLimits {
+        max_concurrent_queries: 1,
+        ..ExecutionLimits::default()
+    };
+    let mut parts = FakeParts::new(Dialect::MySql);
+    parts.limits = limits;
+    let runtime = Arc::new(runtime_from(parts));
+    let held = runtime.acquire_query_permit().await.unwrap();
+    let registry: Arc<dyn ConnectionRegistry> =
+        Arc::new(StaticConnectionRegistry::new(vec![runtime]).unwrap());
+    let sink = Arc::new(FakeAuditSink::new());
+    let service = QueryService::new(
+        registry,
+        engine(),
+        Arc::clone(&sink) as Arc<dyn AuditSink>,
+        redactor(&[]),
+        CancellationToken::new(),
+    );
+    (service, sink, held)
 }

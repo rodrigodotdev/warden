@@ -28,10 +28,6 @@ use crate::limits::AUDIT_WRITE_TIMEOUT;
 /// has no such fields: raw SQL and parameter values are off by default and a field
 /// that does not exist cannot be switched on by a configuration mistake
 /// (`docs/security.md` section 11.3).
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "Task 5 constructs attempts through this helper")
-)]
 pub(crate) fn attempt(
     context: &RequestContext,
     connection: &ConnectionMetadata,
@@ -74,13 +70,6 @@ pub(crate) async fn record_attempt(
 /// The alarm carries the attempt id, the outcome, and the sink error's `Display`,
 /// which prints no `detail` field — so the operator log gains no hostname, database
 /// user, or statement fragment (`docs/security.md` section 10).
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Tasks 5 and 6 complete outcomes through this helper"
-    )
-)]
 pub(crate) async fn record_outcome(sink: &dyn AuditSink, event: AuditOutcomeEvent) {
     let written = match timeout(AUDIT_WRITE_TIMEOUT, sink.record_outcome(&event)).await {
         Ok(result) => result,

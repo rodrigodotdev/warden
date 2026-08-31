@@ -23,10 +23,7 @@
 
 #![cfg_attr(
     not(test),
-    expect(
-        dead_code,
-        reason = "Tasks 5 and 6 consume the gate from the query and explain services"
-    )
+    expect(dead_code, reason = "Task 6 consumes the gate's explain path")
 )]
 
 use tokio::time::Instant;
