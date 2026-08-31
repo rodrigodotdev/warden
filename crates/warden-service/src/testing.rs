@@ -146,6 +146,7 @@ pub(crate) fn analyzed(dialect: Dialect) -> AnalyzedQuery {
 pub(crate) fn writing_analysis(dialect: Dialect) -> QueryAnalysis {
     QueryAnalysis::new(QueryAnalysisParts {
         root_kind: StatementKind::Insert,
+        nested_kinds: vec![StatementKind::Delete],
         ..parts(dialect)
     })
 }

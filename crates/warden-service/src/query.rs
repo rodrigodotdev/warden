@@ -243,9 +243,11 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use std::sync::Arc;
+    use std::time::Duration;
 
     use warden_core::dialect::Dialect;
     use warden_core::error::{PublicError, PublicErrorCode};
+    use warden_core::result::NormalizationError;
     use warden_ports::{AnalyzeError, AuditOutcome, ExecuteError};
 
     use crate::testing;
@@ -262,10 +264,13 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(result.rows.len(), 1);
-        assert_eq!(sink.attempts().len(), 1);
-        let outcome = &sink.outcomes()[0];
+        let attempts = sink.attempts();
+        let outcomes = sink.outcomes();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(outcomes.len(), 1);
+        let outcome = &outcomes[0];
         assert_eq!(outcome.outcome, AuditOutcome::Succeeded);
-        assert_eq!(outcome.attempt_id, sink.attempts()[0].id);
+        assert_eq!(outcome.attempt_id, attempts[0].id);
         assert_eq!(outcome.rows_returned, Some(1));
         assert_eq!(outcome.result_bytes, Some(result.stats.bytes));
         assert_eq!(outcome.error_code, None);
@@ -300,39 +305,102 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.public_code(), PublicErrorCode::QueryRejected);
         assert_eq!(executor.calls(), 0);
-        assert!(!sink.attempts()[0].deny_reasons.is_empty());
-        assert_eq!(sink.outcomes()[0].outcome, AuditOutcome::Denied);
+        let attempts = sink.attempts();
+        let outcomes = sink.outcomes();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].attempt_id, attempts[0].id);
         assert_eq!(
-            sink.outcomes()[0].error_code,
-            Some(PublicErrorCode::QueryRejected)
+            attempts[0]
+                .deny_reasons
+                .iter()
+                .map(warden_policy::DenyReason::code)
+                .collect::<Vec<_>>(),
+            [
+                warden_policy::DenyCode::WriteStatement,
+                warden_policy::DenyCode::NestedWrite,
+            ]
         );
+        assert_eq!(outcomes[0].outcome, AuditOutcome::Denied);
+        assert_eq!(outcomes[0].error_code, Some(PublicErrorCode::QueryRejected));
     }
 
     #[tokio::test]
-    async fn an_unparseable_statement_is_audited_before_it_is_refused() {
-        let sink = Arc::new(testing::FakeAuditSink::new());
-        let service = testing::query_service(testing::ServiceFakes {
-            analyzer: Arc::new(testing::FakeAnalyzer::failing(AnalyzeError::RecursionLimit)),
-            audit: sink.clone(),
-            ..testing::ServiceFakes::default()
-        });
-        let error = service
-            .execute(&testing::request_context(), testing::request())
-            .await
-            .unwrap_err();
-        assert_eq!(error.public_code(), PublicErrorCode::QueryParseError);
-        assert_eq!(
-            sink.attempts()[0].deny_reasons[0].code(),
-            warden_policy::DenyCode::ParserRecursionLimit
-        );
-        assert_eq!(sink.outcomes()[0].outcome, AuditOutcome::Denied);
+    async fn every_analysis_failure_is_audited_with_its_exact_denial() {
+        for (failure, expected_deny_code) in [
+            (
+                AnalyzeError::Parse {
+                    detail: "parser.internal".to_owned(),
+                },
+                warden_policy::DenyCode::UnknownConstruct,
+            ),
+            (
+                AnalyzeError::RecursionLimit,
+                warden_policy::DenyCode::ParserRecursionLimit,
+            ),
+        ] {
+            let sink = Arc::new(testing::FakeAuditSink::new());
+            let service = testing::query_service(testing::ServiceFakes {
+                analyzer: Arc::new(testing::FakeAnalyzer::failing(failure)),
+                audit: sink.clone(),
+                ..testing::ServiceFakes::default()
+            });
+            let error = service
+                .execute(&testing::request_context(), testing::request())
+                .await
+                .unwrap_err();
+            assert_eq!(error.public_code(), PublicErrorCode::QueryParseError);
+            let attempts = sink.attempts();
+            let outcomes = sink.outcomes();
+            assert_eq!(attempts.len(), 1);
+            assert_eq!(outcomes.len(), 1);
+            assert_eq!(outcomes[0].attempt_id, attempts[0].id);
+            assert_eq!(attempts[0].deny_reasons.len(), 1);
+            assert_eq!(attempts[0].deny_reasons[0].code(), expected_deny_code);
+            assert_eq!(outcomes[0].outcome, AuditOutcome::Denied);
+            assert_eq!(
+                outcomes[0].error_code,
+                Some(PublicErrorCode::QueryParseError)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn every_analysis_failure_keeps_its_code_when_attempt_audit_fails() {
+        for failure in [
+            AnalyzeError::Parse {
+                detail: "parser.internal".to_owned(),
+            },
+            AnalyzeError::RecursionLimit,
+        ] {
+            let sink = Arc::new(testing::FakeAuditSink::broken_attempts());
+            let service = testing::query_service(testing::ServiceFakes {
+                analyzer: Arc::new(testing::FakeAnalyzer::failing(failure)),
+                audit: sink.clone(),
+                ..testing::ServiceFakes::default()
+            });
+            let error = service
+                .execute(&testing::request_context(), testing::request())
+                .await
+                .unwrap_err();
+            assert_eq!(error.public_code(), PublicErrorCode::QueryParseError);
+            assert!(sink.attempts().is_empty());
+            let outcomes = sink.outcomes();
+            assert_eq!(outcomes.len(), 1);
+            assert_eq!(outcomes[0].outcome, AuditOutcome::Denied);
+            assert_eq!(
+                outcomes[0].error_code,
+                Some(PublicErrorCode::QueryParseError)
+            );
+        }
     }
 
     #[tokio::test]
     async fn a_broken_attempt_write_denies_the_query_as_an_internal_error() {
         let executor = Arc::new(testing::FakeExecutor::new());
+        let sink = Arc::new(testing::FakeAuditSink::broken_attempts());
         let service = testing::query_service(testing::ServiceFakes {
-            audit: Arc::new(testing::FakeAuditSink::broken_attempts()),
+            audit: sink.clone(),
             executor: executor.clone(),
             ..testing::ServiceFakes::default()
         });
@@ -342,12 +410,15 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.public_code(), PublicErrorCode::InternalError);
         assert_eq!(executor.calls(), 0);
+        assert!(sink.attempts().is_empty());
+        assert!(sink.outcomes().is_empty());
     }
 
     #[tokio::test]
     async fn a_broken_outcome_write_still_returns_the_result() {
+        let sink = Arc::new(testing::FakeAuditSink::broken_outcomes());
         let service = testing::query_service(testing::ServiceFakes {
-            audit: Arc::new(testing::FakeAuditSink::broken_outcomes()),
+            audit: sink.clone(),
             ..testing::ServiceFakes::default()
         });
         assert!(
@@ -356,18 +427,44 @@ mod tests {
                 .await
                 .is_ok()
         );
+        let attempts = sink.attempts();
+        let outcomes = sink.outcomes();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].attempt_id, attempts[0].id);
     }
 
     #[tokio::test]
     async fn a_failed_execution_records_the_outcome_the_failure_actually_was() {
-        for (failure, expected) in [
-            (ExecuteError::Timeout, AuditOutcome::TimedOut),
-            (ExecuteError::Cancelled, AuditOutcome::Cancelled),
+        for (failure, expected_outcome, expected_code) in [
+            (
+                ExecuteError::Timeout,
+                AuditOutcome::TimedOut,
+                PublicErrorCode::QueryTimeout,
+            ),
+            (
+                ExecuteError::Cancelled,
+                AuditOutcome::Cancelled,
+                PublicErrorCode::QueryCancelled,
+            ),
+            (
+                ExecuteError::ResultTooLarge { limit: 4096 },
+                AuditOutcome::Failed,
+                PublicErrorCode::QueryResultTooLarge,
+            ),
+            (
+                ExecuteError::Normalization(NormalizationError::NonFiniteFloat {
+                    column: "amount".to_owned(),
+                }),
+                AuditOutcome::Failed,
+                PublicErrorCode::QueryNormalizationError,
+            ),
             (
                 ExecuteError::Database {
                     detail: "boom".to_owned(),
                 },
                 AuditOutcome::Failed,
+                PublicErrorCode::QueryExecutionError,
             ),
         ] {
             let sink = Arc::new(testing::FakeAuditSink::new());
@@ -380,9 +477,14 @@ mod tests {
                 .execute(&testing::request_context(), testing::request())
                 .await
                 .unwrap_err();
-            assert_eq!(sink.attempts().len(), 1);
-            assert_eq!(sink.outcomes()[0].outcome, expected);
-            assert_eq!(sink.outcomes()[0].error_code, Some(error.public_code()));
+            let attempts = sink.attempts();
+            let outcomes = sink.outcomes();
+            assert_eq!(attempts.len(), 1);
+            assert_eq!(outcomes.len(), 1);
+            assert_eq!(outcomes[0].attempt_id, attempts[0].id);
+            assert_eq!(error.public_code(), expected_code);
+            assert_eq!(outcomes[0].outcome, expected_outcome);
+            assert_eq!(outcomes[0].error_code, Some(expected_code));
         }
     }
 
@@ -420,18 +522,24 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.public_code(), PublicErrorCode::ServerBusy);
-        assert_eq!(sink.attempts().len(), 1);
-        assert_eq!(
-            sink.outcomes().last().unwrap().outcome,
-            AuditOutcome::NotStarted
-        );
+        let attempts = sink.attempts();
+        let outcomes = sink.outcomes();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].attempt_id, attempts[0].id);
+        assert_eq!(outcomes[0].outcome, AuditOutcome::NotStarted);
+        assert_eq!(outcomes[0].error_code, Some(PublicErrorCode::ServerBusy));
     }
 
     #[tokio::test]
     async fn authorization_uses_the_connection_s_own_limits() {
         let limits = warden_core::limits::ExecutionLimits {
+            timeout: Duration::from_secs(11),
+            max_queue_wait: Duration::from_secs(3),
             max_rows: 7,
-            ..warden_core::limits::ExecutionLimits::default()
+            max_value_bytes: 1_234,
+            max_result_bytes: 4_321,
+            max_concurrent_queries: 2,
         };
         let executor = Arc::new(testing::FakeExecutor::recording_limits());
         let service = testing::query_service(testing::ServiceFakes {
@@ -443,35 +551,65 @@ mod tests {
             .execute(&testing::request_context(), testing::request())
             .await
             .unwrap();
-        assert_eq!(executor.observed_limits().unwrap().max_rows, 7);
+        assert_eq!(executor.observed_limits().unwrap(), limits);
     }
 
-    #[tokio::test]
-    async fn execution_receives_a_child_of_the_shutdown_token() {
+    #[tokio::test(start_paused = true)]
+    async fn root_shutdown_cancels_an_in_flight_query_through_its_child() {
         let shutdown = tokio_util::sync::CancellationToken::new();
-        let executor = Arc::new(testing::FakeExecutor::new());
+        let executor = Arc::new(testing::FakeExecutor::taking(Duration::from_secs(60)));
         let service = testing::query_service(testing::ServiceFakes {
             executor: executor.clone(),
             shutdown: shutdown.clone(),
             ..testing::ServiceFakes::default()
         });
-        service
-            .execute(&testing::request_context(), testing::request())
-            .await
-            .unwrap();
+        let context = testing::request_context();
+        let mut execution = Box::pin(service.execute(&context, testing::request()));
+        tokio::select! {
+            result = &mut execution => panic!("query completed before shutdown: {result:?}"),
+            () = tokio::time::sleep(Duration::from_millis(1)) => {}
+        }
+        assert_eq!(executor.calls(), 1);
+
+        let (_, observed) = executor.latest_observation();
+        shutdown.cancel();
+        let error = execution.await.unwrap_err();
+        assert_eq!(error.public_code(), PublicErrorCode::QueryCancelled);
+        assert!(observed.is_cancelled());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_an_in_flight_request_does_not_cancel_root_shutdown() {
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let executor = Arc::new(testing::FakeExecutor::taking(Duration::from_secs(60)));
+        let service = testing::query_service(testing::ServiceFakes {
+            executor: executor.clone(),
+            shutdown: shutdown.clone(),
+            ..testing::ServiceFakes::default()
+        });
+        let context = testing::request_context();
+        let mut execution = Box::pin(service.execute(&context, testing::request()));
+        tokio::select! {
+            result = &mut execution => panic!("query completed before cancellation: {result:?}"),
+            () = tokio::time::sleep(Duration::from_millis(1)) => {}
+        }
+        assert_eq!(executor.calls(), 1);
 
         let (_, observed) = executor.latest_observation();
         observed.cancel();
         assert!(!shutdown.is_cancelled());
+        let error = execution.await.unwrap_err();
+        assert_eq!(error.public_code(), PublicErrorCode::QueryCancelled);
     }
 
     #[tokio::test]
     async fn a_refused_statement_keeps_its_denial_when_the_attempt_write_fails() {
         let executor = Arc::new(testing::FakeExecutor::new());
+        let sink = Arc::new(testing::FakeAuditSink::broken_attempts());
         let service = testing::query_service(testing::ServiceFakes {
             analyzer: Arc::new(testing::FakeAnalyzer::writing(Dialect::MySql)),
             executor: executor.clone(),
-            audit: Arc::new(testing::FakeAuditSink::broken_attempts()),
+            audit: sink.clone(),
             ..testing::ServiceFakes::default()
         });
         let error = service
@@ -480,6 +618,11 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.public_code(), PublicErrorCode::QueryRejected);
         assert_eq!(executor.calls(), 0);
+        assert!(sink.attempts().is_empty());
+        let outcomes = sink.outcomes();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].outcome, AuditOutcome::Denied);
+        assert_eq!(outcomes[0].error_code, Some(PublicErrorCode::QueryRejected));
     }
 
     #[test]
