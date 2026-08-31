@@ -545,11 +545,26 @@ impl SchemaInspector for FakeInspector {
     }
 }
 
+/// One event observed by [`FakeAuditSink`], preserving cross-phase order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FakeAuditEvent {
+    /// An attempt write that succeeded.
+    Attempt(AuditAttempt),
+    /// An outcome write that was issued, including a write that then failed.
+    Outcome(AuditOutcomeEvent),
+}
+
+#[derive(Debug, Default)]
+struct FakeAuditRecords {
+    attempts: Vec<AuditAttempt>,
+    outcomes: Vec<AuditOutcomeEvent>,
+    history: Vec<FakeAuditEvent>,
+}
+
 /// An audit sink that records each phase and can fail either one independently.
 #[derive(Debug, Default)]
 pub(crate) struct FakeAuditSink {
-    attempts: Mutex<Vec<AuditAttempt>>,
-    outcomes: Mutex<Vec<AuditOutcomeEvent>>,
+    records: Mutex<FakeAuditRecords>,
     broken_attempts: bool,
     broken_outcomes: bool,
     duration: Duration,
@@ -583,11 +598,15 @@ impl FakeAuditSink {
     }
     /// Returns recorded attempt events.
     pub(crate) fn attempts(&self) -> Vec<AuditAttempt> {
-        self.attempts.lock().unwrap().clone()
+        self.records.lock().unwrap().attempts.clone()
     }
     /// Returns recorded outcome events.
     pub(crate) fn outcomes(&self) -> Vec<AuditOutcomeEvent> {
-        self.outcomes.lock().unwrap().clone()
+        self.records.lock().unwrap().outcomes.clone()
+    }
+    /// Returns every recorded phase in the order the sink observed it.
+    pub(crate) fn history(&self) -> Vec<FakeAuditEvent> {
+        self.records.lock().unwrap().history.clone()
     }
     fn failure() -> AuditError {
         AuditError::Unavailable {
@@ -606,7 +625,9 @@ impl AuditSink for FakeAuditSink {
             if self.broken_attempts {
                 return Err(Self::failure());
             }
-            self.attempts.lock().unwrap().push(event.clone());
+            let mut records = self.records.lock().unwrap();
+            records.attempts.push(event.clone());
+            records.history.push(FakeAuditEvent::Attempt(event.clone()));
             Ok(())
         })
     }
@@ -616,7 +637,10 @@ impl AuditSink for FakeAuditSink {
     ) -> warden_ports::BoxFuture<'a, Result<(), AuditError>> {
         Box::pin(async move {
             sleep(self.duration).await;
-            self.outcomes.lock().unwrap().push(*event);
+            let mut records = self.records.lock().unwrap();
+            records.outcomes.push(*event);
+            records.history.push(FakeAuditEvent::Outcome(*event));
+            drop(records);
             if self.broken_outcomes {
                 return Err(Self::failure());
             }

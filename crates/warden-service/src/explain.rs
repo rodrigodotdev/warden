@@ -245,7 +245,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_plan_is_produced_audited_redacted_and_timed() {
-        let sink = Arc::new(testing::FakeAuditSink::new());
+        let sink = Arc::new(testing::FakeAuditSink::taking(Duration::from_millis(5)));
         let explainer = Arc::new(testing::FakeExplainer::taking(Duration::from_millis(7)));
         let service = testing::explain_service(testing::ServiceFakes {
             audit: sink.clone(),
@@ -319,6 +319,13 @@ mod tests {
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].attempt_id, attempts[0].id);
         assert_eq!(
+            sink.history(),
+            vec![
+                testing::FakeAuditEvent::Attempt(attempts[0].clone()),
+                testing::FakeAuditEvent::Outcome(outcomes[0]),
+            ]
+        );
+        assert_eq!(
             attempts[0]
                 .deny_reasons
                 .iter()
@@ -369,6 +376,13 @@ mod tests {
             assert_eq!(attempts.len(), 1);
             assert_eq!(outcomes.len(), 1);
             assert_eq!(outcomes[0].attempt_id, attempts[0].id);
+            assert_eq!(
+                sink.history(),
+                vec![
+                    testing::FakeAuditEvent::Attempt(attempts[0].clone()),
+                    testing::FakeAuditEvent::Outcome(outcomes[0]),
+                ]
+            );
             assert_eq!(attempts[0].deny_reasons.len(), 1);
             assert_eq!(attempts[0].deny_reasons[0].code(), expected_deny_code);
             assert_eq!(outcomes[0].outcome, AuditOutcome::Denied);
