@@ -40,25 +40,20 @@
 //! wire either; it returns typed errors whose [`warden_core::error::PublicError`]
 //! code Milestone 12 maps at the MCP boundary.
 
+pub mod error;
 /// Aggregate request timing bounds and their components.
 pub mod limits;
 pub mod redaction;
 pub mod registry;
 
-// Task 4 wires these service-internal operations into the pipeline. Keep their
-// visibility crate-local now so no external crate can bypass that ordering.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Task 4 owns the pipeline that calls these operations"
-    )
-)]
+mod pipeline;
+
 mod audit;
 
 #[cfg(test)]
 mod testing;
 
+pub use error::{ExplainServiceError, QueryServiceError, SchemaServiceError, ServiceBuildError};
 pub use limits::{AUDIT_WRITE_TIMEOUT, MAX_ADAPTER_CLEANUP, RequestBudget};
 pub use redaction::{REDACTED, RedactionRuleError, RedactionSettings, RedactionStrategy, Redactor};
 pub use registry::{RegistryError, StaticConnectionRegistry};

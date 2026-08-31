@@ -554,6 +554,35 @@ pub(crate) fn runtime(dialect: Dialect) -> ConnectionRuntime {
     runtime_from(FakeParts::new(dialect))
 }
 
+/// A runtime whose executor is observable by the caller.
+pub(crate) fn runtime_with_executor(
+    dialect: Dialect,
+    executor: Arc<FakeExecutor>,
+) -> ConnectionRuntime {
+    let mut parts = FakeParts::new(dialect);
+    parts.executor = executor;
+    runtime_from(parts)
+}
+
+/// A runtime with explicit execution limits.
+pub(crate) fn runtime_with_limits(dialect: Dialect, limits: ExecutionLimits) -> ConnectionRuntime {
+    let mut parts = FakeParts::new(dialect);
+    parts.limits = limits;
+    runtime_from(parts)
+}
+
+/// Authorizes the fixture statement against this runtime's own metadata and limits.
+pub(crate) fn authorized(runtime: &ConnectionRuntime) -> AuthorizedQuery {
+    engine()
+        .authorize(
+            &request_context(),
+            runtime.metadata(),
+            analyzed(runtime.metadata().dialect),
+            runtime.limits(),
+        )
+        .unwrap()
+}
+
 /// A runtime built from port fixtures, allowing a test to replace exactly one port.
 pub(crate) fn runtime_from(parts: FakeParts) -> ConnectionRuntime {
     ConnectionRuntime::new(ConnectionRuntimeParts {
