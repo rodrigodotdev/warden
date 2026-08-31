@@ -375,6 +375,31 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn cancelling_an_explain_releases_its_permit() {
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let runtime = testing::runtime_with_explainer(
+            Dialect::MySql,
+            Arc::new(testing::FakeExplainer::taking(Duration::from_secs(600))),
+        );
+        let gate = ExecutionGate::enter(
+            &runtime,
+            &testing::FakeAuditSink::new(),
+            &testing::attempt(),
+            testing::authorized(&runtime),
+            cancel,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(gate.explain().await.unwrap_err(), ExplainError::Cancelled);
+        assert_eq!(
+            runtime.available_permits(),
+            ExecutionLimits::default().max_concurrent_queries
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn dropping_an_in_flight_execution_releases_its_permit() {
         let limits = ExecutionLimits {
             max_concurrent_queries: 1,
@@ -404,6 +429,82 @@ mod tests {
         drop(execution);
 
         assert_eq!(runtime.available_permits(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_an_in_flight_explain_releases_its_permit() {
+        let limits = ExecutionLimits {
+            max_concurrent_queries: 1,
+            ..ExecutionLimits::default()
+        };
+        let explainer = Arc::new(testing::FakeExplainer::taking(Duration::from_secs(600)));
+        let mut parts = testing::FakeParts::new(Dialect::MySql);
+        parts.limits = limits;
+        parts.explainer = explainer;
+        let runtime = testing::runtime_from(parts);
+        let gate = ExecutionGate::enter(
+            &runtime,
+            &testing::FakeAuditSink::new(),
+            &testing::attempt(),
+            testing::authorized(&runtime),
+            CancellationToken::new(),
+        )
+        .await
+        .unwrap();
+        let mut explanation = Box::pin(gate.explain());
+        tokio::select! {
+            result = &mut explanation => panic!("explain unexpectedly finished: {result:?}"),
+            () = tokio::time::sleep(Duration::from_millis(1)) => {}
+        }
+        assert_eq!(runtime.available_permits(), 0);
+
+        drop(explanation);
+
+        assert_eq!(runtime.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn execute_receives_the_same_cancellation_domain_not_a_child() {
+        let executor = Arc::new(testing::FakeExecutor::new());
+        let runtime = testing::runtime_with_executor(Dialect::MySql, Arc::clone(&executor));
+        let cancel = CancellationToken::new();
+        let gate = ExecutionGate::enter(
+            &runtime,
+            &testing::FakeAuditSink::new(),
+            &testing::attempt(),
+            testing::authorized(&runtime),
+            cancel.clone(),
+        )
+        .await
+        .unwrap();
+
+        gate.execute().await.unwrap();
+
+        let (_, observed_cancel) = executor.latest_observation();
+        observed_cancel.cancel();
+        assert!(cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn explain_receives_the_same_cancellation_domain_not_a_child() {
+        let explainer = Arc::new(testing::FakeExplainer::new());
+        let runtime = testing::runtime_with_explainer(Dialect::MySql, Arc::clone(&explainer));
+        let cancel = CancellationToken::new();
+        let gate = ExecutionGate::enter(
+            &runtime,
+            &testing::FakeAuditSink::new(),
+            &testing::attempt(),
+            testing::authorized(&runtime),
+            cancel.clone(),
+        )
+        .await
+        .unwrap();
+
+        gate.explain().await.unwrap();
+
+        let (_, observed_cancel) = explainer.latest_observation();
+        observed_cancel.cancel();
+        assert!(cancel.is_cancelled());
     }
 
     #[tokio::test(start_paused = true)]

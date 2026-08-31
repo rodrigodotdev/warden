@@ -340,6 +340,7 @@ impl QueryExecutor for FakeExecutor {
 /// An explainer with a fixed failure and observable call count.
 #[derive(Debug)]
 pub(crate) struct FakeExplainer {
+    duration: Duration,
     failure: Option<ExplainError>,
     calls: Arc<AtomicUsize>,
     observations: Mutex<Vec<(Instant, CancellationToken)>>,
@@ -355,9 +356,17 @@ impl FakeExplainer {
     /// Creates an explainer that immediately returns the fixture plan.
     pub(crate) fn new() -> Self {
         Self {
+            duration: Duration::ZERO,
             failure: None,
             calls: Arc::new(AtomicUsize::new(0)),
             observations: Mutex::new(Vec::new()),
+        }
+    }
+    /// Creates an explainer that takes the given duration.
+    pub(crate) fn taking(duration: Duration) -> Self {
+        Self {
+            duration,
+            ..Self::new()
         }
     }
     /// Creates an explainer that always fails.
@@ -387,7 +396,11 @@ impl Explainer for FakeExplainer {
     ) -> warden_ports::BoxFuture<'a, Result<QueryPlan, ExplainError>> {
         Box::pin(async move {
             self.calls.fetch_add(1, Ordering::Relaxed);
-            self.observations.lock().unwrap().push((deadline, cancel));
+            self.observations
+                .lock()
+                .unwrap()
+                .push((deadline, cancel.clone()));
+            tokio::select! { () = sleep(self.duration) => {}, () = cancel.cancelled() => return Err(ExplainError::Cancelled), () = sleep_until(deadline) => return Err(ExplainError::Timeout) }
             match &self.failure {
                 Some(error) => Err(error.clone()),
                 None => Ok(plan()),
