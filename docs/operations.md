@@ -474,8 +474,11 @@ deadline, is under test: a `KILL QUERY` (section 5.4) does terminate it.
 issues a `KILL QUERY` under its own budget and then a `ROLLBACK` under its own budget,
 both after the query itself has already resolved (section 6.2), so total call latency
 can exceed the configured `deadline` by up to `KILL_TIMEOUT + ROLLBACK_TIMEOUT`—2s + 2s
-at today's constants. A caller enforcing its own aggregate request timeout needs to
-budget for that sum, not for `deadline` alone (Milestone 11).
+at today's constants. A caller enforcing its own aggregate request timeout should use
+`warden_service::RequestBudget::total`, which adds queue wait, the client timeout,
+`MAX_ADAPTER_CLEANUP`, and two `AUDIT_WRITE_TIMEOUT` writes; `MAX_ADAPTER_CLEANUP` is
+pinned to PostgreSQL's larger three-step bound rather than this engine's own 2s + 2s
+figure, because one shared constant must hold for both adapters.
 
 **Milestone 8 measured PostgreSQL's server deadline with real work.** A
 `SELECT count(*) FROM generate_series(1, 2000000000)` under a two-second server

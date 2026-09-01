@@ -28,8 +28,8 @@
 //! ordered it against the audit attempt (`docs/open-questions.md` item 14).
 //! `crate::pipeline`'s gate closes both gaps: its single constructor records the
 //! attempt and then acquires the permit from the same [`ConnectionRuntime`] it will
-//! dispatch to, and it is the only place in this crate allowed to name
-//! `executor()`, `explainer()`, or `acquire_query_permit()` (ADR-0038).
+//! dispatch to, and it is the only place in this crate's production code allowed to
+//! name `executor()`, `explainer()`, or `acquire_query_permit()` (ADR-0038).
 //! `tests/service_rules.rs` enforces that mechanically.
 //!
 //! # What this crate does not do
