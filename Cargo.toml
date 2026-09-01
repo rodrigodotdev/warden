@@ -84,6 +84,9 @@ sha2 = "0.11"
 # Mechanical guards parse the adapters' own source: `visit` walks every call site
 # so a comment or a string literal can neither satisfy nor trip a check.
 syn = { version = "2", features = ["full", "visit"] }
+# `syn::Macro` deliberately leaves a macro body as a token stream, so a guard that must
+# see inside one walks those token trees itself.
+proc-macro2 = "1"
 
 # Serialization and errors
 serde = { version = "1.0", features = ["derive"] }

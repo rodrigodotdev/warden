@@ -1,4 +1,5 @@
-//! What one request may cost in wall-clock time, end to end.
+//! What one request may cost in wall-clock time, end to end: the aggregate bound and
+//! the components it is built from.
 //!
 //! `ExecutionLimits::timeout` bounds the *query*, not the call. Both adapters run
 //! cancellation, `ROLLBACK`, and — on PostgreSQL — `DEALLOCATE ALL` under their own

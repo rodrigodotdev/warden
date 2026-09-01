@@ -40,4 +40,4 @@ tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 syn = { workspace = true }
 # `syn::Macro` deliberately leaves its body as a token stream. The guards walk
 # those token trees to cover macro-generated gated calls and startup error impls.
-proc-macro2 = "1"
+proc-macro2 = { workspace = true }

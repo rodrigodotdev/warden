@@ -426,10 +426,6 @@ impl FakeExecutor {
             ..Self::new()
         }
     }
-    /// Creates an executor that exposes the authorized limits it receives.
-    pub(crate) fn recording_limits() -> Self {
-        Self::new()
-    }
     /// Returns the number of calls made to the database port.
     pub(crate) fn calls(&self) -> usize {
         self.calls.load(Ordering::Relaxed)
@@ -508,10 +504,6 @@ impl FakeExplainer {
             failure: Some(error),
             ..Self::new()
         }
-    }
-    /// Creates an explainer that exposes the authorized limits it receives.
-    pub(crate) fn recording_limits() -> Self {
-        Self::new()
     }
     /// Returns the number of calls made to the database port.
     pub(crate) fn calls(&self) -> usize {
