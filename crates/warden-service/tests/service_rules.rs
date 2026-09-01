@@ -2,15 +2,18 @@
 //!
 //! `tests/architecture.rs` guards the dependency graph and this separate crate sees
 //! the same public surface as `warden-mcp` and the composition root. These narrow
-//! textual checks deliberately complement behavioral tests for invariants that have
+//! syntax checks deliberately complement behavioral tests for invariants that have
 //! no compiler representation (R5).
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::collections::BTreeSet;
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use syn::visit::Visit;
 use tokio_util::sync::CancellationToken;
 use warden_core::connection::{ConnectionMetadata, ConnectionName, Environment};
 use warden_core::dialect::Dialect;
@@ -32,76 +35,172 @@ fn src_dir() -> PathBuf {
 }
 
 fn rust_source_files() -> Vec<PathBuf> {
-    fs::read_dir(src_dir())
+    let root = src_dir();
+    let test_only_modules = cfg_test_modules(&fs::read_to_string(root.join("lib.rs")).unwrap());
+    rust_source_files_at(&root)
         .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .filter(|path| path.is_file())
-        .filter(|path| path.extension().is_some_and(|extension| extension == "rs"))
+        .into_iter()
+        .filter(|path| path != &root.join("testing.rs") || !test_only_modules.contains("testing"))
         .collect()
 }
 
-fn uncommented_source(source: &str) -> String {
-    let mut code = String::with_capacity(source.len());
-    let mut characters = source.chars().peekable();
-    let mut block_depth = 0_u32;
-    let mut in_line_comment = false;
-    let mut in_string = false;
-    let mut escaped = false;
-
-    while let Some(character) = characters.next() {
-        if in_line_comment {
-            if character == '\n' {
-                in_line_comment = false;
-                code.push(character);
+fn rust_source_files_at(root: &Path) -> io::Result<Vec<PathBuf>> {
+    fn collect(directory: &Path, files: &mut Vec<PathBuf>) -> io::Result<()> {
+        for entry in fs::read_dir(directory)? {
+            let entry = entry?;
+            let file_type = entry.file_type()?;
+            let path = entry.path();
+            if file_type.is_dir() {
+                collect(&path, files)?;
+            } else if file_type.is_file()
+                && path.extension().is_some_and(|extension| extension == "rs")
+            {
+                files.push(path);
             }
-            continue;
         }
-        if block_depth > 0 {
-            if character == '/' && characters.peek() == Some(&'*') {
-                characters.next();
-                block_depth += 1;
-            } else if character == '*' && characters.peek() == Some(&'/') {
-                characters.next();
-                block_depth -= 1;
-            } else if character == '\n' {
-                code.push(character);
-            }
-            continue;
-        }
-        if in_string {
-            code.push(character);
-            if escaped {
-                escaped = false;
-            } else if character == '\\' {
-                escaped = true;
-            } else if character == '"' {
-                in_string = false;
-            }
-            continue;
-        }
-        if character == '"' {
-            in_string = true;
-            code.push(character);
-        } else if character == '/' && characters.peek() == Some(&'/') {
-            characters.next();
-            in_line_comment = true;
-        } else if character == '/' && characters.peek() == Some(&'*') {
-            characters.next();
-            block_depth = 1;
-        } else {
-            code.push(character);
-        }
+        Ok(())
     }
 
-    code
+    let mut files = Vec::new();
+    collect(root, &mut files)?;
+    files.sort();
+    Ok(files)
 }
 
-fn production_source(source: &str) -> String {
-    uncommented_source(source)
-        .lines()
-        .take_while(|line| line.trim() != "#[cfg(test)]")
-        .collect::<Vec<_>>()
-        .join("\n")
+fn is_cfg_test(attributes: &[syn::Attribute]) -> bool {
+    attributes.iter().any(|attribute| {
+        attribute.path().is_ident("cfg")
+            && attribute
+                .parse_args::<syn::Ident>()
+                .is_ok_and(|condition| condition == "test")
+    })
+}
+
+fn item_attributes(item: &syn::Item) -> &[syn::Attribute] {
+    match item {
+        syn::Item::Const(item) => &item.attrs,
+        syn::Item::Enum(item) => &item.attrs,
+        syn::Item::ExternCrate(item) => &item.attrs,
+        syn::Item::Fn(item) => &item.attrs,
+        syn::Item::ForeignMod(item) => &item.attrs,
+        syn::Item::Impl(item) => &item.attrs,
+        syn::Item::Macro(item) => &item.attrs,
+        syn::Item::Mod(item) => &item.attrs,
+        syn::Item::Static(item) => &item.attrs,
+        syn::Item::Struct(item) => &item.attrs,
+        syn::Item::Trait(item) => &item.attrs,
+        syn::Item::TraitAlias(item) => &item.attrs,
+        syn::Item::Type(item) => &item.attrs,
+        syn::Item::Union(item) => &item.attrs,
+        syn::Item::Use(item) => &item.attrs,
+        syn::Item::Verbatim(_) => &[],
+        _ => &[],
+    }
+}
+
+fn gated_call(method: &str) -> Option<&'static str> {
+    GATED_CALLS.iter().copied().find(|call| {
+        call.strip_prefix('.')
+            .and_then(|call| call.strip_suffix("()"))
+            .is_some_and(|name| method == name)
+    })
+}
+
+fn path_ends_with(path: &syn::Path, expected: &str) -> bool {
+    path.segments
+        .last()
+        .is_some_and(|segment| segment.ident == expected)
+}
+
+fn type_ends_with(ty: &syn::Type, expected: &str) -> bool {
+    matches!(ty, syn::Type::Path(path) if path_ends_with(&path.path, expected))
+}
+
+#[derive(Default)]
+struct SourceAnalysis {
+    calls: Vec<String>,
+    cfg_test_modules: BTreeSet<String>,
+    implements_public_error_for_service_build: bool,
+    error_message_contains_detail: bool,
+}
+
+impl<'ast> Visit<'ast> for SourceAnalysis {
+    fn visit_item(&mut self, node: &'ast syn::Item) {
+        if is_cfg_test(item_attributes(node)) {
+            if let syn::Item::Mod(module) = node {
+                self.cfg_test_modules.insert(module.ident.to_string());
+            }
+            return;
+        }
+        syn::visit::visit_item(self, node);
+    }
+
+    fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+        self.calls.push(node.method.to_string());
+        syn::visit::visit_expr_method_call(self, node);
+    }
+
+    fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+        if let syn::Expr::Path(path) = node.func.as_ref()
+            && let Some(segment) = path.path.segments.last()
+        {
+            self.calls.push(segment.ident.to_string());
+        }
+        syn::visit::visit_expr_call(self, node);
+    }
+
+    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        if node
+            .trait_
+            .as_ref()
+            .is_some_and(|(_, path, _)| path_ends_with(path, "PublicError"))
+            && type_ends_with(node.self_ty.as_ref(), "ServiceBuildError")
+        {
+            self.implements_public_error_for_service_build = true;
+        }
+        syn::visit::visit_item_impl(self, node);
+    }
+
+    fn visit_attribute(&mut self, node: &'ast syn::Attribute) {
+        if node.path().is_ident("error")
+            && node
+                .parse_args::<syn::LitStr>()
+                .is_ok_and(|message| message.value().contains("{detail"))
+        {
+            self.error_message_contains_detail = true;
+        }
+        syn::visit::visit_attribute(self, node);
+    }
+}
+
+fn analyze_source(source: &str) -> SourceAnalysis {
+    let file = syn::parse_file(source).expect("guard fixture/source must be valid Rust syntax");
+    let mut analysis = SourceAnalysis::default();
+    analysis.visit_file(&file);
+    analysis
+}
+
+fn gated_calls(source: &str) -> Vec<&'static str> {
+    analyze_source(source)
+        .calls
+        .iter()
+        .filter_map(|call| gated_call(call))
+        .collect()
+}
+
+fn calls_method(source: &str, method: &str) -> bool {
+    analyze_source(source)
+        .calls
+        .iter()
+        .any(|call| call == method)
+}
+
+fn implements_public_error_for_service_build(source: &str) -> bool {
+    analyze_source(source).implements_public_error_for_service_build
+}
+
+fn cfg_test_modules(source: &str) -> BTreeSet<String> {
+    analyze_source(source).cfg_test_modules
 }
 
 struct ListedRegistry {
@@ -159,17 +258,15 @@ fn parts(redaction: RedactionSettings) -> ServiceParts {
 
 #[test]
 fn only_the_gate_may_reach_a_database_or_take_a_permit() {
+    let pipeline = src_dir().join("pipeline.rs");
     for path in rust_source_files() {
-        let name = path.file_name().unwrap().to_string_lossy().into_owned();
-        if name == "pipeline.rs" || name == "testing.rs" {
-            continue;
-        }
-        let source = production_source(&fs::read_to_string(&path).unwrap());
-        for call in GATED_CALLS {
+        let source = fs::read_to_string(&path).unwrap();
+        for call in gated_calls(&source) {
             assert!(
-                !source.contains(call),
-                "{name} calls {call}; only pipeline.rs may, so the audit attempt \
-                 and permit-to-connection pairing stay structural (ADR-0038)"
+                path == pipeline,
+                "{} calls {call}; only pipeline.rs may, so the audit attempt \
+                 and permit-to-connection pairing stay structural (ADR-0038)",
+                path.display()
             );
         }
     }
@@ -182,12 +279,11 @@ fn the_gate_guard_ignores_line_and_nested_block_comments_but_not_code() {
         /* runtime.explainer()
            /* runtime.acquire_query_permit() */
         */
-        let executor = runtime.executor();
+        fn production(runtime: &ConnectionRuntime) {
+            let executor = runtime.executor();
+        }
     "#;
-    let code = uncommented_source(source);
-    assert_eq!(code.matches(".executor()").count(), 1);
-    assert!(!code.contains(".explainer()"));
-    assert!(!code.contains(".acquire_query_permit()"));
+    assert_eq!(gated_calls(source), vec![".executor()"]);
 }
 
 #[test]
@@ -205,17 +301,7 @@ fn the_gate_guard_checks_production_code_but_ignores_cfg_test_modules() {
             }
         }
     "#;
-    let code = production_source(source);
-    assert!(code.contains(".executor()"));
-    assert!(!code.contains(".explainer()"));
-    assert!(!code.contains(".acquire_query_permit()"));
-}
-
-#[test]
-fn the_gate_guard_scans_only_regular_rust_files() {
-    assert!(rust_source_files().iter().all(|path| {
-        path.is_file() && path.extension().is_some_and(|extension| extension == "rs")
-    }));
+    assert_eq!(gated_calls(source), vec![".executor()"]);
 }
 
 #[test]
@@ -225,9 +311,9 @@ fn every_response_path_redacts_before_it_returns() {
         ("explain.rs", "redact_plan"),
         ("schema.rs", "redact_description"),
     ] {
-        let source = production_source(&fs::read_to_string(src_dir().join(file)).unwrap());
+        let source = fs::read_to_string(src_dir().join(file)).unwrap();
         assert!(
-            source.contains(call),
+            calls_method(&source, call),
             "{file} must call {call}: redaction happens after normalization and \
              before serialization (docs/security.md section 8)"
         );
@@ -236,9 +322,9 @@ fn every_response_path_redacts_before_it_returns() {
 
 #[test]
 fn a_startup_only_error_implements_no_public_error() {
-    let source = production_source(&fs::read_to_string(src_dir().join("error.rs")).unwrap());
+    let source = fs::read_to_string(src_dir().join("error.rs")).unwrap();
     assert!(
-        !source.contains("impl PublicError for ServiceBuildError"),
+        !implements_public_error_for_service_build(&source),
         "ServiceBuildError is raised before any transport serves, so it has no \
          public code to leak"
     );
@@ -282,7 +368,10 @@ fn invalid_redaction_rules_fail_the_build_before_any_service_is_used() {
 
 #[test]
 fn the_exposed_registry_is_the_authority_supplied_at_startup() {
-    let services = Services::new(parts(RedactionSettings::default())).unwrap();
+    let parts = parts(RedactionSettings::default());
+    let registry = Arc::clone(&parts.registry);
+    let services = Services::new(parts).unwrap();
+    assert!(std::ptr::eq(services.registry(), registry.as_ref()));
     assert_eq!(services.registry().list(), vec![metadata("primary")]);
 }
 
@@ -310,11 +399,104 @@ fn debug_output_contains_only_safe_composition_metadata() {
 
 #[test]
 fn no_service_error_prints_an_internal_detail() {
-    let source = production_source(&fs::read_to_string(src_dir().join("error.rs")).unwrap());
-    for line in source.lines() {
-        assert!(
-            !line.contains("{detail"),
-            "an error message must not interpolate a detail field: {line}"
-        );
-    }
+    let source = fs::read_to_string(src_dir().join("error.rs")).unwrap();
+    assert!(!analyze_source(&source).error_message_contains_detail);
+}
+
+#[test]
+fn syntax_guard_detects_method_and_ufcs_calls_across_comments_and_whitespace() {
+    let source = r#"
+        fn bypasses(runtime: &ConnectionRuntime) {
+            runtime
+                . /* gap */ executor /* gap */ ();
+            ConnectionRuntime /* gap */ :: explainer(
+                runtime,
+            );
+            ConnectionRuntime::acquire_query_permit /* gap */ (runtime);
+        }
+    "#;
+    assert_eq!(
+        gated_calls(source),
+        vec![".executor()", ".explainer()", ".acquire_query_permit()"]
+    );
+}
+
+#[test]
+fn syntax_guard_ignores_normal_raw_byte_and_raw_byte_string_literals() {
+    let source = r###"
+        const NORMAL: &str = "runtime.executor()";
+        const RAW: &str = r#"ConnectionRuntime::explainer(&runtime)"#;
+        const BYTE: &[u8] = b"runtime.acquire_query_permit()";
+        const RAW_BYTE: &[u8] = br#"runtime.executor()"#;
+        const CHARACTER: char = 'x';
+        const BYTE_CHARACTER: u8 = b'x';
+    "###;
+    assert!(gated_calls(source).is_empty());
+}
+
+#[test]
+fn syntax_guard_keeps_production_items_after_a_cfg_test_module_visible() {
+    let source = r#"
+        #[cfg(test)]
+        mod tests {
+            fn permitted_direct_port_test(runtime: &ConnectionRuntime) {
+                runtime.executor();
+            }
+        }
+
+        fn production_after_tests(runtime: &ConnectionRuntime) {
+            runtime.explainer();
+        }
+    "#;
+    assert_eq!(gated_calls(source), vec![".explainer()"]);
+}
+
+#[test]
+fn syntax_guard_visits_calls_inside_inline_submodules() {
+    let source = r#"
+        mod nested {
+            fn bypasses(runtime: &ConnectionRuntime) {
+                runtime.acquire_query_permit();
+            }
+        }
+    "#;
+    assert_eq!(gated_calls(source), vec![".acquire_query_permit()"]);
+}
+
+#[test]
+fn startup_error_guard_detects_qualified_impl_with_comments_and_whitespace() {
+    let source = r#"
+        impl warden_core::error::PublicError
+            for /* gap */ crate::error::ServiceBuildError
+        {
+            fn public_code(&self) -> PublicErrorCode { todo!() }
+        }
+    "#;
+    assert!(implements_public_error_for_service_build(source));
+}
+
+#[test]
+fn source_collection_recurses_and_rejects_non_rust_files_and_rs_directories() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/source-tree");
+    let relative = rust_source_files_at(&root)
+        .unwrap()
+        .into_iter()
+        .map(|path| path.strip_prefix(&root).unwrap().to_owned())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        relative,
+        vec![PathBuf::from("nested/child.rs"), PathBuf::from("root.rs")]
+    );
+}
+
+#[test]
+fn testing_file_exclusion_requires_a_cfg_test_module_link() {
+    assert!(cfg_test_modules("#[cfg(test)] mod testing;").contains("testing"));
+    assert!(!cfg_test_modules("mod testing;").contains("testing"));
+}
+
+#[test]
+fn test_support_file_is_cfg_test_linked_by_the_real_crate_root() {
+    let source = fs::read_to_string(src_dir().join("lib.rs")).unwrap();
+    assert!(cfg_test_modules(&source).contains("testing"));
 }

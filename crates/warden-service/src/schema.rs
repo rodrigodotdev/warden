@@ -116,6 +116,11 @@ impl SchemaService {
 }
 
 #[cfg(test)]
+pub(crate) fn redactor_arc(service: &SchemaService) -> &Arc<Redactor> {
+    &service.redactor
+}
+
+#[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 

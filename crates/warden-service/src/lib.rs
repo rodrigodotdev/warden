@@ -210,12 +210,17 @@ mod composition_tests {
     #[tokio::test]
     async fn one_parsed_redactor_applies_to_query_explain_and_schema_services() {
         let mut runtime_parts = testing::FakeParts::new(Dialect::MySql);
-        runtime_parts.executor =
-            Arc::new(testing::FakeExecutor::returning(testing::secret_result()));
+        let executor = Arc::new(testing::FakeExecutor::returning(testing::secret_result()));
+        let explainer = Arc::new(testing::FakeExplainer::new());
+        let inspector = Arc::new(testing::FakeInspector::new());
+        runtime_parts.executor = Arc::clone(&executor) as Arc<dyn warden_ports::QueryExecutor>;
+        runtime_parts.explainer = Arc::clone(&explainer) as Arc<dyn warden_ports::Explainer>;
+        runtime_parts.inspector = Arc::clone(&inspector) as Arc<dyn warden_ports::SchemaInspector>;
         let registry: Arc<dyn ConnectionRegistry> = Arc::new(
             StaticConnectionRegistry::new(vec![Arc::new(testing::runtime_from(runtime_parts))])
                 .unwrap(),
         );
+        let shutdown = CancellationToken::new();
         let services = Services::new(ServiceParts {
             registry,
             engine: Arc::new(PolicyEngine::with_defaults(&Default::default()).unwrap()),
@@ -224,9 +229,18 @@ mod composition_tests {
                 columns: vec!["*.password".to_owned(), "orders.secret".to_owned()],
                 ..RedactionSettings::default()
             },
-            shutdown: CancellationToken::new(),
+            shutdown: shutdown.clone(),
         })
         .unwrap();
+
+        assert!(Arc::ptr_eq(
+            query::redactor_arc(services.query()),
+            explain::redactor_arc(services.explain())
+        ));
+        assert!(Arc::ptr_eq(
+            query::redactor_arc(services.query()),
+            schema::redactor_arc(services.schema())
+        ));
 
         let result = services
             .query()
@@ -255,5 +269,16 @@ mod composition_tests {
                 .as_deref(),
             Some(REDACTED)
         );
+
+        let query_child = executor.latest_observation().1;
+        let explain_child = explainer.latest_observation().1;
+        let schema_child = inspector.latest_describe().cancel;
+        assert_ne!(query_child, shutdown);
+        assert_ne!(explain_child, shutdown);
+        assert_ne!(schema_child, shutdown);
+        shutdown.cancel();
+        assert!(query_child.is_cancelled());
+        assert!(explain_child.is_cancelled());
+        assert!(schema_child.is_cancelled());
     }
 }
