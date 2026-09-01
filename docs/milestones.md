@@ -151,6 +151,11 @@ execute -> normalize -> redact -> audit outcome.
 
 No MCP yet. Service tests use fake ports.
 
+Delivered here: `warden-service` structurally orders the fail-closed audit attempt
+before permit acquisition and adapter dispatch, and pairs the permit with that
+runtime. The persistent sink remains Milestone 13 work, so the definition-of-done
+checkbox for two-phase auditing does not flip in M11.
+
 ---
 
 ## M12 — MCP over stdio

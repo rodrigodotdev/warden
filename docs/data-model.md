@@ -337,6 +337,12 @@ budget protects is model context, and model context is spent on the JSON an agen
 actually receives, not on how the database or the driver represented the value
 internally.
 
+Redaction rewrites stored values after normalization, so Milestone 11 recomputes
+`QueryStats.bytes` before returning the result. Both the adapter's incremental budget
+and the redactor use `warden_core::result::row_json_bytes`; the figure therefore stays
+the exact encoded length of the rows the agent actually receives rather than the
+length before replacement or nulling.
+
 Example error:
 
 ```text
@@ -424,17 +430,18 @@ existence. Response bounds are `MAX_DESCRIBED_COLUMNS` 512,
 `MAX_DESCRIBED_INDEXES` 128 and `MAX_DESCRIBED_FOREIGN_KEYS` 128 per relation, on top
 of the 20-table cap per call.
 
-Column defaults and comments are bounded, not redacted in Milestone 9. Each retains
-at most `MAX_SCHEMA_VALUE_BYTES` (64 KiB) at a valid UTF-8 boundary, and their
-accumulated retained payload is at most `MAX_SCHEMA_DESCRIPTION_BYTES` (256 KiB)
-per cached table and again per complete `describe_schema` response. Exhausting
-either budget sets the affected `Table.truncated`; identifiers and serialization
-overhead are not part of this text-byte count. Both adapters ask static catalog SQL
-for one sentinel character beyond the byte limit before decoding, then enforce the
-exact byte bound in core. The sentinel distinguishes an ASCII value cut at exactly
-64 KiB from a complete value of that length. Never include connection data. The
-Milestone 11 redaction matcher
-will also apply here because defaults and comments may contain secrets.
+Column defaults and comments are bounded and, since Milestone 11, redacted by the
+shared service matcher before `describe_schema` returns. `*.column` and
+`table.column` rules compare names ASCII case-insensitively and replace or null the
+matched default and comment. Each value still retains at most
+`MAX_SCHEMA_VALUE_BYTES` (64 KiB) at a valid UTF-8 boundary, and accumulated retained
+payload is at most `MAX_SCHEMA_DESCRIPTION_BYTES` (256 KiB) per cached table and again
+per complete response. Exhausting either budget sets the affected `Table.truncated`;
+identifiers and serialization overhead are not part of this text-byte count. Both
+adapters ask static catalog SQL for one sentinel character beyond the byte limit before
+decoding, then enforce the exact byte bound in core. The sentinel distinguishes an
+ASCII value cut at exactly 64 KiB from a complete value of that length. Never include
+connection data.
 
 Schema discovery is a product capability, not an implementation detail. The agent
 must learn tables, columns, primary and foreign keys, indexes, relation and view
@@ -523,6 +530,7 @@ and an agent reading a shortened plan would read it as complete. `QueryPlan::pla
 computes the exact serialized length through the same counter `ResultValue::json_bytes`
 uses, iteratively, so a deep document cannot overflow the stack.
 
-The plan document is database-controlled text and enters model context; the
-Milestone 11 redaction matcher applies here for the same reason it applies to column
-defaults and comments.
+The plan document is database-controlled text and enters model context. Milestone 11
+applies the shared redactor to it before return: a JSON member whose key matches a
+`*.column` rule has its value replaced or nulled. A plan has no table provenance, so
+`table.column` does not match it, and free text inside a member value is not scanned.

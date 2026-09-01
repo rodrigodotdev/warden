@@ -492,7 +492,9 @@ the delay function (section 5.4).
 path, cancellation, `ROLLBACK`, and — only after a confirmed rollback — `DEALLOCATE
 ALL` run sequentially under their own two-second budgets. Those paths can therefore add
 up to six seconds after `deadline`; a caller enforcing an aggregate request timeout must
-budget for that maximum.
+budget for that maximum. `warden_service::RequestBudget::total` is the shipped
+aggregate envelope: it adds queue wait, the client timeout,
+`MAX_ADAPTER_CLEANUP`, and two `AUDIT_WRITE_TIMEOUT` writes.
 
 ### 5.4 Explicit cancellation
 
@@ -789,6 +791,13 @@ mcp.tool.query
     ├── result.redact
     └── audit.outcome
 ```
+
+The child labels are code paths today: connection resolution, analysis, policy,
+attempt and outcome writes, permit acquisition, the adapter's read-only transaction
+and execution/normalization, and service-layer redaction all exist. They are not
+tracing spans yet. Milestone 13 adds the tracing instrumentation for those paths;
+`mcp.tool.query` also depends on Milestone 12's MCP handler. Do not interpret this
+tree as claiming either spans or an MCP entry point already exists.
 
 ### 10.2 Fields
 

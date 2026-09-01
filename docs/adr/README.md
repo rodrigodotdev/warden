@@ -42,9 +42,11 @@ supersedes it; never change it silently.
 | [0035](0035-postgresql-parameter-typing.md) | PostgreSQL parameter typing |
 | [0036](0036-object-filter-at-the-source.md) | The schema inspector filters objects at the source |
 | [0037](0037-verified-explain-prefix.md) | A prefixed statement is a verified type |
+| [0038](0038-the-service-owns-the-execution-gate.md) | The service layer owns the execution gate |
 
 ADRs 0021–0026 are new in v0.3. ADR-0002 supersedes the v0.2 MSRV definition;
 ADR-0022 supersedes the single-event audit model; ADR-0023 resolves v0.2 open
 question 13; and ADR-0024 closes the MySQL timeout gap. ADR-0032 resolves open
 question 14's permit half. ADR-0036 resolves open question 13. ADR-0037 is new
-in Milestone 10.
+in Milestone 10. ADR-0038 resolves open question 14's remaining half and is new in
+Milestone 11.

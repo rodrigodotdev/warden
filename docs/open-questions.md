@@ -10,6 +10,7 @@ These remain listed because they were open in v0.2 and someone may search for th
 | 13 — do views automatically inherit table policy? | No. `GRANT` is the read boundary; the allowlist reduces attack surface—ADR-0023 |
 | 1 — does `AuthorizedQuery` live in policy or core? | In `warden-policy` with the `AllowDecision` token—ADR-0010 |
 | 14 (permit half) — does anything besides convention stop an adapter from bypassing the query permit? | No longer convention: `execute_read_only` and `explain` both take `&QueryPermit` as a parameter—ADR-0032 |
+| 14 (remaining half) — does anything besides convention order the audit attempt and pair the permit with its connection? | Within `warden-service`, `ExecutionGate` makes both structural and the service source guard keeps it the only call path—ADR-0038 |
 
 ## 2. Still open
 
@@ -84,16 +85,16 @@ otherwise, none blocks M0–M5.
     `search_schema` drops a refused relation before the limit is applied and
     `describe_schema` returns `SchemaError::Rejected`.
 
-14. **Does anything besides convention stop an adapter from bypassing the audit
-    attempt?** No. ADR-0022 requires the attempt to be recorded before the
-    concurrency permit is acquired, and that ordering lives only in a doc comment:
-    nothing in the types stops a caller from acquiring a permit and executing before
-    `AuditSink::record_attempt` has run, or from never calling it at all. The permit
-    half of this question is resolved — ADR-0032 makes `&QueryPermit` a parameter of
-    `execute_read_only` and `explain`, so a missing permit is now a compile error —
-    but ADR-0032 explicitly does not order the permit against the audit attempt; it
-    only proves a permit exists. Milestone 11's service layer is expected to make the
-    attempt-before-execution ordering structural rather than left to the caller.
+14. **Resolved in Milestone 11 by ADR-0038 — does anything besides convention stop
+    an adapter from bypassing the audit attempt?** The original question noted that
+    ADR-0022's attempt-before-permit order was only prose: a caller could acquire a
+    permit first, skip `AuditSink::record_attempt`, or pass a permit from another
+    connection. ADR-0032 had already made a missing `&QueryPermit` a compile error.
+    `warden-service` now closes the remainder with a private `ExecutionGate` whose
+    only constructor records the attempt and then acquires from the runtime it stores
+    and dispatches to. An AST- and token-aware source guard keeps all three gated
+    runtime calls in that module. The resolution is intentionally limited to
+    `warden-service`; a future crate that calls the ports directly is not constrained.
 
 15. **Should the session time zone be pinned?** MySQL's `TIMESTAMP` is currently
     emitted in whatever zone the server session uses, unpinned. Setting
@@ -155,6 +156,13 @@ otherwise, none blocks M0–M5.
     is a correctness question about a rare value rather than a panic, and folding it
     into an execution milestone would have widened the guard's scope without a
     measurement behind it.
+
+21. **Should schema reads produce an audit event?** `AuditAttempt` is
+    statement-shaped: it requires a `StatementKind`, fingerprint, and denial reasons.
+    Milestone 11 deliberately records no schema event rather than invent a statement
+    kind or fingerprint that does not describe the catalog read. A denied
+    `describe_schema` is therefore unaudited today. Milestone 13 owns the event-shape
+    and policy decision.
 
 ## 3. Future work deliberately outside v0.x
 
