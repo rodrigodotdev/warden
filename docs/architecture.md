@@ -53,7 +53,17 @@ warden/
 │   ├── warden-ports/     analyzer, executor, inspector, explainer, audit, registry traits
 │   ├── warden-mysql/     analyzer, executor, inspector, explainer, normalize, connection
 │   ├── warden-postgres/  same responsibilities for PostgreSQL
-│   ├── warden-service/   query, schema, explain, registry, limits, redaction
+│   ├── warden-service/   application orchestration
+│   │   ├── lib.rs        composition and shared service wiring
+│   │   ├── query.rs      query orchestration
+│   │   ├── schema.rs     schema orchestration
+│   │   ├── explain.rs    explain orchestration
+│   │   ├── registry.rs   immutable connection registry
+│   │   ├── limits.rs     aggregate request budget
+│   │   ├── redaction.rs  shared response redaction
+│   │   ├── audit.rs      bounded two-phase audit writes
+│   │   ├── pipeline.rs   private execution gate
+│   │   └── error.rs      typed service and startup errors
 │   ├── warden-mcp/       server, tools, mappings, stdio, HTTP
 │   └── warden-config/    model, loading, validation, secrets
 │
@@ -288,13 +298,15 @@ server (`docs/mcp.md` section 3.1) and shares `agent_pool` with `execute_read_on
 (section 6.1 below), so its concurrency must be bounded by the same permit rather than
 left to the pool alone.
 
-The parameter proves *a* permit exists; it does not prove the permit came from
-*this* connection, or from `AuditSink::record_attempt` having run first (ADR-0022).
-Nothing today stops a caller from acquiring a permit on one `ConnectionRuntime` and
-handing it to another's executor — the type only says `&QueryPermit`, not
-`&QueryPermit` scoped to a particular connection. Milestone 11 owns the service layer
-that makes that pairing, and the attempt-before-execution ordering, structural rather
-than left to the caller; see `docs/open-questions.md` for what remains open.
+`warden-service` closes the two gaps left by that parameter with its private
+`ExecutionGate` (ADR-0038). Its only constructor records the attempt and then acquires
+a permit from the same `ConnectionRuntime` it stores and dispatches to; `execute` and
+`explain` consume the gate so the slot is released when the call returns. An AST- and
+token-aware guard in `crates/warden-service/tests/service_rules.rs` makes that gate the
+only production code in the crate allowed to call `executor()`, `explainer()`, or
+`acquire_query_permit()`. The guarantee is scoped to `warden-service`: a future crate
+that calls the ports directly is not constrained by this guard, and database
+privileges remain the final boundary (ADR-0016).
 
 `available_permits` returns a copied `usize`, not the semaphore itself, so it hands
 out no way to raise the limit — only to read it. Diagnostics and tests use it; no
@@ -372,7 +384,11 @@ pub async fn execute(
 }
 ```
 
-Exact APIs may differ. Dependency flow and ordering may not.
+This is the shipped `QueryService::execute` signature. Step 1 is discharged before
+the service is entered by `QueryRequest::new`, which is the only way to construct the
+request. Step 8 is adapter-owned: the service passes `runtime.limits()` into
+`PolicyEngine::authorize`, and the adapter normalizes under the resulting
+`AuthorizedQuery::limits()`. Dependency flow and ordering may not differ.
 
 The attempt is recorded **before** permit acquisition and execution. If the sink
 fails, deny the query. If the process dies during execution, the attempt is already

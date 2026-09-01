@@ -428,13 +428,19 @@ material does **not** present redaction as an exfiltration control.
 Redaction must also apply to `describe_schema` output because column defaults and
 comments can contain secrets.
 
-Milestone 9 returns `ColumnDescription::default` and `comment` unredacted: the
-redaction matcher is `warden-service` work in Milestone 11, and shipping a second
-matcher inside two adapters would create the divergence the single matcher exists to
-prevent. Until then, do not configure Warden against a database whose column defaults
-or comments contain secrets. Milestone 9 does bound their volume: 64 KiB per value
-and 256 KiB accumulated across one description response, with UTF-8-safe truncation.
-Bounding is not redaction and does not make a retained secret safe.
+Milestone 11 ships one `warden_service::Redactor`, parsed once and shared by all three
+response paths: `redact_result` for normalized rows, `redact_description` for column
+defaults and comments, and `redact_plan` for structured plan documents. A rule is
+`*.column` or `table.column`, and matching is ASCII case-insensitive. Result columns
+and plan members carry no table provenance, so only `*.column` can match them;
+described columns can match either form.
+
+The limits remain intentional. Aliasing a result column or selecting an expression
+changes the output name and can bypass a rule. Plan redaction matches JSON member keys
+but does not scan free text such as a node's `Filter` string. These are consequences
+of column-name matching, not defects that turn redaction into authorization. Schema
+text remains bounded independently: 64 KiB per value and 256 KiB accumulated across
+one description response, with UTF-8-safe truncation.
 
 ## 9. Injection through returned data
 
@@ -510,8 +516,13 @@ pub struct AuditOutcomeEvent {
     pub error_code: Option<PublicErrorCode>,
 }
 
-pub enum AuditOutcome { Denied, Succeeded, Failed, TimedOut, Cancelled }
+pub enum AuditOutcome {
+    Denied, Succeeded, Failed, TimedOut, Cancelled, NotStarted,
+}
 ```
+
+`NotStarted` means an authorized statement had an attempt on record but never reached
+the database, such as when permit acquisition ended at `server_busy`.
 
 Identifiers are newtypes, not `String`; swapping two `String` fields in an audit event
 would otherwise compile. `error_code` is the `PublicErrorCode` enum rather than a

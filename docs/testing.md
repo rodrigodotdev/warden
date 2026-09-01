@@ -21,6 +21,16 @@ the current time as a parameter rather than sleeping.
 `MatchReason::Description` remains unproduced because configured human descriptions
 are deferred schema-intelligence work.
 
+Milestone 11 adds these no-database unit rows:
+
+| Area | Evidence |
+|---|---|
+| Registry | resolution, missing names, duplicate and empty startup rejection, and deterministic sorted listing |
+| Redaction | ASCII case-insensitive wildcard/qualified matching, both strategies, all three response shapes, and result-byte recomputation |
+| Request budget | client-deadline selection, aggregate arithmetic, and saturating overflow behavior |
+| Auditing | bounded writes, fail-closed attempts, fail-open outcomes, and the `NotStarted` distinction |
+| Execution gate | attempt-before-permit ordering, same-runtime dispatch, by-value permit release, and the exclusive AST/token-aware call-site guard |
+
 ## 2. Policy
 
 Use synthetic `QueryAnalysis`. Test each policy separately **and** composed in the
@@ -172,6 +182,16 @@ refused, while a plain `SELECT`, a read-only CTE and a statement ending in a lin
 comment each verify. A separate unit test proves that `EXPLAIN` submitted as agent
 SQL is denied by the analyzer and the policy engine before any explainer sees it
 (ADR-0020).
+
+**Milestone 11 added application-service coverage against fake ports.** The tests
+prove registry selection; analyze/authorize ordering and use of the runtime's own
+limits; fail-closed attempt writes and fail-open outcome writes; permit ordering and
+release for query and explain; exact audit outcomes for denial, timeout,
+cancellation, failure and `server_busy`; child cancellation-token propagation;
+capability-driven schema search; object filters and deadlines reaching inspectors;
+redaction of normalized results, schema descriptions and plans; byte recomputation;
+and sanitized typed error mappings. No database, MCP handler, real audit sink, span,
+or panic-containment claim is made by these fakes.
 
 **A read-only transaction does not refuse to plan a write, and the tests say so.**
 `EXPLAIN (FORMAT JSON) INSERT ...` succeeds inside `BEGIN READ ONLY` on PostgreSQL,
