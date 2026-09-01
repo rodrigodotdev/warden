@@ -21,7 +21,7 @@ const FORBIDDEN_EDGES: &[(&str, &[&str])] = &[
     ("warden-policy", &["sqlx", "rmcp", "sqlparser"]),
     ("warden-ports", &["sqlx", "rmcp", "sqlparser"]),
     ("warden-config", &["sqlx", "rmcp", "sqlparser"]),
-    ("warden-service", &["sqlx", "sqlparser"]),
+    ("warden-service", &["sqlx", "sqlparser", "rmcp"]),
     ("warden-mcp", &["sqlx", "sqlparser"]),
     ("warden-mysql", &["rmcp"]),
     ("warden-postgres", &["rmcp"]),
