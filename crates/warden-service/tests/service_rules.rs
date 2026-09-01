@@ -593,6 +593,19 @@ fn only_the_gate_may_reach_a_database_or_take_a_permit() {
     }
 }
 
+/// Derives the guarded surface from `crates/warden-ports/src/runtime.rs` instead of
+/// trusting a hand-written list, so `GATED_CALLS` and the port cannot drift apart
+/// unnoticed.
+///
+/// The derivation is syntactic and deliberately narrow, so it is a floor rather than a
+/// proof: it reads only `runtime.rs`, so an `impl ConnectionRuntime` block written in
+/// another file is invisible to it; it reads only inherent impls, so an accessor added
+/// through a trait impl is not seen; it matches the names a signature spells, so a type
+/// alias or a renamed import standing in for a port trait or for `QueryPermit` reads as
+/// an unrelated type; it does not expand macros, so a macro-generated accessor escapes
+/// it; and an accessor handing out the raw `Arc<Semaphore>` rather than a `QueryPermit`
+/// would hand out the power to mint slots without ever naming one. Those shapes need a
+/// reviewer, not this test.
 #[test]
 fn the_gated_list_covers_every_accessor_that_hands_out_a_port_or_a_permit() {
     let io_ports = io_port_traits();
