@@ -167,8 +167,58 @@ fn macro_path_marker_before(tokens: &[TokenTree], index: usize) -> bool {
     ))
 }
 
+fn macro_stream_generates_public_error_impl(tokens: &[TokenTree]) -> bool {
+    let mut inside_impl = false;
+    let mut generic_depth = 0_u32;
+    let mut saw_trait_identifier = false;
+    let mut last_trait_is_public_error = false;
+
+    for (index, token) in tokens.iter().enumerate() {
+        match token {
+            TokenTree::Ident(identifier)
+                if identifier == "impl" && (!inside_impl || generic_depth == 0) =>
+            {
+                inside_impl = true;
+                generic_depth = 0;
+                saw_trait_identifier = false;
+                last_trait_is_public_error = false;
+            }
+            TokenTree::Punct(punctuation) if inside_impl && punctuation.as_char() == '<' => {
+                generic_depth = generic_depth.saturating_add(1);
+            }
+            TokenTree::Punct(punctuation) if inside_impl && punctuation.as_char() == '>' => {
+                generic_depth = generic_depth.saturating_sub(1);
+            }
+            TokenTree::Ident(identifier)
+                if inside_impl && generic_depth == 0 && identifier == "for" =>
+            {
+                let starts_higher_ranked_bound = punct_is(tokens.get(index + 1), '<');
+                if !starts_higher_ranked_bound && last_trait_is_public_error {
+                    return true;
+                }
+                if !starts_higher_ranked_bound && saw_trait_identifier {
+                    inside_impl = false;
+                }
+            }
+            TokenTree::Ident(identifier) if inside_impl && generic_depth == 0 => {
+                saw_trait_identifier = true;
+                last_trait_is_public_error = identifier == "PublicError";
+            }
+            TokenTree::Group(_)
+            | TokenTree::Ident(_)
+            | TokenTree::Literal(_)
+            | TokenTree::Punct(_) => {}
+        }
+    }
+
+    false
+}
+
 fn scan_macro_tokens(tokens: TokenStream, analysis: &mut SourceAnalysis) {
     let tokens = tokens.into_iter().collect::<Vec<_>>();
+    if macro_stream_generates_public_error_impl(&tokens) {
+        analysis.implements_public_error_for_service_build = true;
+    }
     for (index, token) in tokens.iter().enumerate() {
         match token {
             TokenTree::Group(group) => scan_macro_tokens(group.stream(), analysis),
@@ -670,6 +720,22 @@ fn startup_error_guard_rejects_service_build_error_split_across_macro_streams() 
 }
 
 #[test]
+fn startup_error_guard_rejects_an_alias_passed_to_a_public_error_impl_macro() {
+    let source = r#"
+        type StartupError = ServiceBuildError;
+
+        macro_rules! expose {
+            ($ty:ty) => {
+                impl PublicError for $ty {}
+            };
+        }
+
+        expose!(StartupError);
+    "#;
+    assert!(implements_public_error_for_service_build(source));
+}
+
+#[test]
 fn startup_error_guard_allows_explicit_non_impl_uses_and_literals() {
     let source = r#"
         type StartupError = ServiceBuildError;
@@ -688,6 +754,26 @@ fn macro_scan_ignores_local_gated_names_and_literals() {
         }
     "#;
     assert!(gated_calls(source).is_empty());
+    assert!(!implements_public_error_for_service_build(source));
+}
+
+#[test]
+fn startup_error_guard_ignores_macros_without_a_public_error_impl_and_literals() {
+    let source = r#"
+        macro_rules! internal_impl {
+            ($ty:ty) => {
+                impl<T: PublicError> InternalTrait for $ty {}
+            };
+        }
+
+        macro_rules! accepts_public_error {
+            () => {
+                fn accepts(_: PublicError) {}
+            };
+        }
+
+        describe!("impl PublicError for ServiceBuildError");
+    "#;
     assert!(!implements_public_error_for_service_build(source));
 }
 
