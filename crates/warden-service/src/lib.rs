@@ -48,7 +48,6 @@ use warden_policy::PolicyEngine;
 
 pub mod error;
 pub mod explain;
-/// Aggregate request timing bounds and their components.
 pub mod limits;
 pub mod query;
 pub mod redaction;

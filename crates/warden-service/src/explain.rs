@@ -151,6 +151,13 @@ impl ExplainService {
             }
         };
 
+        // A service-side clock around the gated call: planning plus the adapter's own
+        // overhead, started after the permit was acquired so the queue wait is
+        // excluded. `QueryPlan` carries no adapter-measured duration the way
+        // `ResultSet::stats` does, so this is the only figure available here — it is
+        // wider than `query.rs`'s adapter-reported statement duration, and an auditor
+        // comparing `AuditOutcomeEvent.duration` across the two tools is comparing two
+        // different quantities.
         let started = Instant::now();
         let planned = gate.explain().await;
         let elapsed = started.elapsed();
@@ -578,7 +585,7 @@ mod tests {
             max_result_bytes: 4_321,
             max_concurrent_queries: 2,
         };
-        let explainer = Arc::new(testing::FakeExplainer::recording_limits());
+        let explainer = Arc::new(testing::FakeExplainer::new());
         let service = testing::explain_service(testing::ServiceFakes {
             limits,
             explainer: explainer.clone(),
