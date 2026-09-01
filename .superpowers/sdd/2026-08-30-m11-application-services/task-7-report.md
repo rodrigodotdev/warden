@@ -141,3 +141,60 @@ There are no specification deviations and no unresolved Task 7 implementation
 concerns. The only failing requested command is the documented, pre-existing
 no-feature PostgreSQL Clippy staging issue above; Task 7 neither changes nor suppresses
 it.
+
+## Independent review fix round 1
+
+The independent review approved production but identified three test-strength gaps.
+This round changed only `schema.rs`'s test module and this report; no production code,
+public API, fixture implementation, adapter, or dependency changed.
+
+Coverage was strengthened as follows:
+
+- search and describe now each independently prove both cancellation-token
+  directions: root cancellation reaches the observed inspector child, while
+  cancelling that child does not cancel the root;
+- search and describe now each hold the runtime's sole `QueryPermit`, complete at
+  zero elapsed Tokio time, and assert the exact inspector cardinality tuple;
+- search and describe each exercise independent literal matrices for all four current
+  `SchemaError` variants, asserting the exact propagated error, literal public code,
+  and absence of connection/driver details from public display.
+
+Representative mutations were applied one at a time to production and restored with
+`apply_patch` after observing RED:
+
+- cloning the root token in search failed
+  `cancelling_the_search_child_does_not_cancel_the_root` (0 passed, 1 failed);
+- supplying an unrelated token to describe failed
+  `root_cancellation_reaches_the_describe_child_token` (0 passed, 1 failed);
+- acquiring a query permit in both paths failed both permit-independence tests with
+  `Connection(Busy)` before an inspector call (0 passed, 2 failed);
+- mapping every search inspector error to timeout failed the search matrix on its
+  first exact-error assertion (0 passed, 1 failed).
+
+Post-restoration GREEN and final gates:
+
+```text
+rtk cargo test -p warden-service schema::tests
+rtk cargo test -p warden-service
+rtk cargo clippy -p warden-service --all-targets --all-features -- -D warnings
+rtk cargo fmt --all
+rtk taplo fmt
+rtk cargo fmt --check
+rtk cargo clippy --workspace --all-targets --all-features -- -D warnings
+rtk cargo test -p warden-service audit::tests::a_broken_outcome_write_raises_a_sanitized_alarm_without_failing_the_request
+rtk cargo test --workspace
+```
+
+Results were 17/17 focused schema tests, 92/92 `warden-service` tests, clean focused
+and workspace all-feature Clippy, clean Rustfmt/Taplo, and 694 workspace tests passed
+across 43 suites (1599 filtered). One earlier workspace execution encountered two
+captured tracing events where an unrelated audit test expected one; its shared mutex
+then poisoned five subsequent tests. The originating test passed alone immediately,
+and a fresh full workspace execution passed all 694 tests. No schema test installs a
+tracing subscriber or touches that shared capture state, so no out-of-scope change was
+made for the transient isolation failure.
+
+Self-review confirmed every source hunk is under `schema.rs`'s `#[cfg(test)]` module,
+all production mutations were restored, the production diff is empty, and the new
+expectations remain method-specific and literal. There are no new specification
+deviations or unresolved Task 7 concerns in this fix round.
