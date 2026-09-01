@@ -31,8 +31,25 @@ use warden_service::{
 /// the separate control pool and is deliberately outside this gate.
 const GATED_CALLS: &[&str] = &[".executor()", ".explainer()", ".acquire_query_permit()"];
 
+/// Every `ConnectionRuntime` accessor that hands out a port or a permit — the surface
+/// [`GATED_CALLS`] is a decision *about*, rather than an unrelated list beside it.
+///
+/// `inspector` is the one documented exception: a catalog read runs on the separate
+/// control pool with adapter-owned SQL, so it takes no agent slot and is deliberately
+/// not gated (`src/schema.rs`; ADR-0025). The other three are.
+///
+/// `the_gated_list_covers_every_accessor_that_hands_out_a_port_or_a_permit` reads this
+/// set back out of `crates/warden-ports/src/runtime.rs`, so a fifth such accessor turns
+/// that test red until someone decides whether it belongs in [`GATED_CALLS`].
+const PORT_AND_PERMIT_ACCESSORS: &[&str] =
+    &["acquire_query_permit", "executor", "explainer", "inspector"];
+
 fn src_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+}
+
+fn ports_src_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../warden-ports/src")
 }
 
 fn rust_source_files() -> Vec<PathBuf> {
@@ -156,6 +173,135 @@ fn path_ends_with(path: &syn::Path, expected: &str) -> bool {
 
 fn type_ends_with(ty: &syn::Type, expected: &str) -> bool {
     matches!(ty, syn::Type::Path(path) if path_ends_with(&path.path, expected))
+}
+
+/// The bare method names behind [`GATED_CALLS`]'s `.method()` spelling.
+fn gated_call_names() -> BTreeSet<String> {
+    GATED_CALLS
+        .iter()
+        .map(|call| {
+            call.strip_prefix('.')
+                .and_then(|call| call.strip_suffix("()"))
+                .expect("every gated call is spelled `.method()`")
+                .to_owned()
+        })
+        .collect()
+}
+
+/// Every identifier a type names, including through references, generic arguments, and
+/// `dyn` bounds — so `&dyn QueryExecutor` and `Result<QueryPermit, ConnectionError>` are
+/// both visible as the names they mention.
+#[derive(Default)]
+struct TypeIdentifiers {
+    names: BTreeSet<String>,
+}
+
+impl<'ast> Visit<'ast> for TypeIdentifiers {
+    fn visit_ident(&mut self, node: &'ast Ident) {
+        self.names.insert(normalized_identifier(node));
+    }
+}
+
+fn return_type_identifiers(output: &syn::ReturnType) -> BTreeSet<String> {
+    let mut identifiers = TypeIdentifiers::default();
+    if let syn::ReturnType::Type(_, ty) = output {
+        identifiers.visit_type(ty);
+    }
+    identifiers.names
+}
+
+/// The `warden-ports` traits whose calls leave this process.
+///
+/// The discriminator is a declared [`warden_ports::BoxFuture`] return, not merely
+/// `pub`: ADR-0013 requires every dynamically dispatched call that runs SQL to spell
+/// its future out as that alias, so it is `warden-ports`' own marker for "this port
+/// reaches a database". `QueryAnalyzer` is deliberately not one — `analyze` is
+/// synchronous and touches nothing — which is why `ConnectionRuntime::analyzer()`
+/// hands out a port yet stays outside the gate.
+#[derive(Default)]
+struct IoPortTraits {
+    traits: BTreeSet<String>,
+}
+
+impl<'ast> Visit<'ast> for IoPortTraits {
+    fn visit_item(&mut self, node: &'ast syn::Item) {
+        if is_cfg_test(item_attributes(node)) {
+            return;
+        }
+        syn::visit::visit_item(self, node);
+    }
+
+    fn visit_item_trait(&mut self, node: &'ast syn::ItemTrait) {
+        let runs_off_process_work = node.items.iter().any(|item| {
+            matches!(item, syn::TraitItem::Fn(function)
+                if return_type_identifiers(&function.sig.output).contains("BoxFuture"))
+        });
+        if runs_off_process_work {
+            self.traits.insert(normalized_identifier(&node.ident));
+        }
+        syn::visit::visit_item_trait(self, node);
+    }
+}
+
+fn io_port_traits() -> BTreeSet<String> {
+    let mut analysis = IoPortTraits::default();
+    for path in rust_source_files_at(&ports_src_dir()).unwrap() {
+        let source = fs::read_to_string(&path).unwrap();
+        analysis.visit_file(&syn::parse_file(&source).expect("warden-ports source must parse"));
+    }
+    analysis.traits
+}
+
+/// The public inherent `ConnectionRuntime` methods that hand out one of those ports or
+/// the connection's concurrency permit, discriminated by what the signature *returns*:
+/// naming an I/O port trait or `QueryPermit`. `metadata`, `capabilities`, and `limits`
+/// return plain description; `available_permits` returns a count, not a slot.
+struct PortAndPermitAccessors {
+    io_ports: BTreeSet<String>,
+    accessors: BTreeSet<String>,
+}
+
+impl<'ast> Visit<'ast> for PortAndPermitAccessors {
+    fn visit_item(&mut self, node: &'ast syn::Item) {
+        if is_cfg_test(item_attributes(node)) {
+            return;
+        }
+        syn::visit::visit_item(self, node);
+    }
+
+    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        if node.trait_.is_none() && type_ends_with(node.self_ty.as_ref(), "ConnectionRuntime") {
+            for item in &node.items {
+                if let syn::ImplItem::Fn(function) = item
+                    && matches!(function.vis, syn::Visibility::Public(_))
+                    && !is_cfg_test(&function.attrs)
+                {
+                    let returned = return_type_identifiers(&function.sig.output);
+                    if returned.contains("QueryPermit")
+                        || returned.iter().any(|name| self.io_ports.contains(name))
+                    {
+                        self.accessors
+                            .insert(normalized_identifier(&function.sig.ident));
+                    }
+                }
+            }
+        }
+        syn::visit::visit_item_impl(self, node);
+    }
+}
+
+fn port_and_permit_accessors(io_ports: BTreeSet<String>) -> BTreeSet<String> {
+    let source = fs::read_to_string(ports_src_dir().join("runtime.rs")).unwrap();
+    let mut analysis = PortAndPermitAccessors {
+        io_ports,
+        accessors: BTreeSet::new(),
+    };
+    analysis.visit_file(&syn::parse_file(&source).expect("warden-ports source must parse"));
+    analysis.accessors
+}
+
+fn names(entries: &[&str]) -> BTreeSet<String> {
+    entries.iter().map(|name| (*name).to_owned()).collect()
 }
 
 fn punct_is(token: Option<&TokenTree>, expected: char) -> bool {
@@ -445,6 +591,44 @@ fn only_the_gate_may_reach_a_database_or_take_a_permit() {
             );
         }
     }
+}
+
+#[test]
+fn the_gated_list_covers_every_accessor_that_hands_out_a_port_or_a_permit() {
+    let io_ports = io_port_traits();
+    assert!(
+        io_ports.contains("QueryExecutor")
+            && io_ports.contains("Explainer")
+            && io_ports.contains("SchemaInspector"),
+        "the discriminator found no I/O ports at all, so it proves nothing: {io_ports:?}"
+    );
+    assert!(
+        !io_ports.contains("QueryAnalyzer"),
+        "the discriminator is `returns a BoxFuture`, not `is a port`: `analyze` is \
+         synchronous, which is why `analyzer()` is outside the gate"
+    );
+
+    let accessors = port_and_permit_accessors(io_ports);
+    assert_eq!(
+        accessors,
+        names(PORT_AND_PERMIT_ACCESSORS),
+        "ConnectionRuntime's port-and-permit surface changed. Decide whether the new \
+         accessor is gated, add it to GATED_CALLS if it is, and only then update \
+         PORT_AND_PERMIT_ACCESSORS (ADR-0038)"
+    );
+
+    let mut expected_gated = names(PORT_AND_PERMIT_ACCESSORS);
+    assert!(
+        expected_gated.remove("inspector"),
+        "`inspector` is the documented control-pool exception and must stay in the \
+         accessor list it is excepted from"
+    );
+    assert_eq!(
+        gated_call_names(),
+        expected_gated,
+        "GATED_CALLS and ConnectionRuntime drifted apart: every accessor that hands \
+         out an agent-path port or a permit is gated, and nothing else is (ADR-0038)"
+    );
 }
 
 #[test]
