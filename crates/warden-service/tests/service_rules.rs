@@ -168,90 +168,26 @@ fn macro_path_marker_before(tokens: &[TokenTree], index: usize) -> bool {
 }
 
 fn scan_macro_tokens(tokens: TokenStream, analysis: &mut SourceAnalysis) {
-    fn collect_identifiers(tokens: &[TokenTree], identifiers: &mut Vec<String>) {
-        for token in tokens {
-            match token {
-                TokenTree::Group(group) => {
-                    let nested = group.stream().into_iter().collect::<Vec<_>>();
-                    collect_identifiers(&nested, identifiers);
-                }
-                TokenTree::Ident(identifier) => identifiers.push(identifier.to_string()),
-                // Literals are intentionally atomic: text that looks like Rust inside a
-                // string, raw string, byte string, or character must never trigger R5.
-                TokenTree::Literal(_) | TokenTree::Punct(_) => {}
-            }
-        }
-    }
-
-    fn has_generated_public_error_impl(identifiers: &[String]) -> bool {
-        identifiers
-            .iter()
-            .enumerate()
-            .filter(|(_, identifier)| identifier.as_str() == "impl")
-            .any(|(impl_index, _)| {
-                identifiers[impl_index + 1..]
-                    .iter()
-                    .position(|identifier| identifier == "PublicError")
-                    .map(|index| impl_index + 1 + index)
-                    .and_then(|public_error_index| {
-                        identifiers[public_error_index + 1..]
-                            .iter()
-                            .position(|identifier| identifier == "for")
-                            .map(|index| public_error_index + 1 + index)
-                    })
-                    .is_some_and(|for_index| {
-                        identifiers[for_index + 1..]
-                            .iter()
-                            .any(|identifier| identifier == "ServiceBuildError")
-                    })
-            })
-    }
-
-    fn parsed_item_implements_public_error_for_service_build(item: &syn::Item) -> bool {
-        if is_cfg_test(item_attributes(item)) {
-            return false;
-        }
-        match item {
-            syn::Item::Impl(item) => {
-                item.trait_
-                    .as_ref()
-                    .is_some_and(|(_, path, _)| path_ends_with(path, "PublicError"))
-                    && type_ends_with(item.self_ty.as_ref(), "ServiceBuildError")
-            }
-            syn::Item::Mod(module) => module.content.as_ref().is_some_and(|(_, items)| {
-                items
-                    .iter()
-                    .any(parsed_item_implements_public_error_for_service_build)
-            }),
-            _ => false,
-        }
-    }
-
     let tokens = tokens.into_iter().collect::<Vec<_>>();
     for (index, token) in tokens.iter().enumerate() {
         match token {
             TokenTree::Group(group) => scan_macro_tokens(group.stream(), analysis),
-            TokenTree::Ident(identifier) if macro_path_marker_before(&tokens, index) => {
-                analysis.calls.push(identifier.to_string());
+            TokenTree::Ident(identifier) => {
+                let identifier = identifier.to_string();
+                // Macro expansion can correlate definitions and invocations that no
+                // individual token stream can prove safe. Startup-only errors therefore
+                // stay in explicit Rust, where the exact impl visitor can reason about them.
+                if identifier == "ServiceBuildError" {
+                    analysis.implements_public_error_for_service_build = true;
+                }
+                if macro_path_marker_before(&tokens, index) {
+                    analysis.calls.push(identifier);
+                }
             }
-            TokenTree::Ident(_) | TokenTree::Literal(_) | TokenTree::Punct(_) => {}
+            // Literals are intentionally atomic: text that looks like Rust inside a
+            // string, raw string, byte string, or character must never trigger R5.
+            TokenTree::Literal(_) | TokenTree::Punct(_) => {}
         }
-    }
-
-    let mut identifiers = Vec::new();
-    collect_identifiers(&tokens, &mut identifiers);
-    let parsed_items = syn::parse2::<syn::File>(tokens.iter().cloned().collect());
-    let implements_public_error = match parsed_items {
-        Ok(file) => file
-            .items
-            .iter()
-            .any(parsed_item_implements_public_error_for_service_build),
-        // Macro DSLs need not be Rust syntax. For those only, conservatively
-        // recognize the ordered impl/trait/for/type identifiers.
-        Err(_) => has_generated_public_error_impl(&identifiers),
-    };
-    if implements_public_error {
-        analysis.implements_public_error_for_service_build = true;
     }
 }
 
@@ -324,9 +260,8 @@ impl<'ast> Visit<'ast> for SourceAnalysis {
     }
 
     fn visit_macro(&mut self, node: &'ast syn::Macro) {
-        // Syn cannot parse arbitrary macro input as Rust AST. Token trees still
-        // preserve the punctuation needed to distinguish `.executor` and
-        // `Type::executor` from an unrelated local identifier named `executor`.
+        // Syn cannot expand macros. Token trees still preserve gated path
+        // punctuation and every non-literal ServiceBuildError identifier.
         scan_macro_tokens(node.tokens.clone(), self);
         syn::visit::visit_macro(self, node);
     }
@@ -721,18 +656,35 @@ fn startup_error_guard_detects_an_impl_generated_inside_a_macro() {
 }
 
 #[test]
-fn macro_scan_ignores_local_gated_names_and_non_target_impls() {
+fn startup_error_guard_rejects_service_build_error_split_across_macro_streams() {
+    let source = r#"
+        macro_rules! expose {
+            ($ty:ty) => {
+                impl PublicError for $ty {}
+            };
+        }
+
+        expose!(ServiceBuildError);
+    "#;
+    assert!(implements_public_error_for_service_build(source));
+}
+
+#[test]
+fn startup_error_guard_allows_explicit_non_impl_uses_and_literals() {
+    let source = r#"
+        type StartupError = ServiceBuildError;
+        const ERROR_NAME: &str = "ServiceBuildError";
+    "#;
+    assert!(!implements_public_error_for_service_build(source));
+}
+
+#[test]
+fn macro_scan_ignores_local_gated_names_and_literals() {
     let source = r#"
         passthrough! {
             let executor = callback;
             executor(runtime);
             let note = "runtime.explainer()";
-        }
-
-        generate! {
-            impl<T: PublicError> InternalTrait for ServiceBuildError {
-                fn internal(&self) {}
-            }
         }
     "#;
     assert!(gated_calls(source).is_empty());
