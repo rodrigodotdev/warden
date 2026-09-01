@@ -343,6 +343,13 @@ and the redactor use `warden_core::result::row_json_bytes`; the figure therefore
 the exact encoded length of the rows the agent actually receives rather than the
 length before replacement or nulling.
 
+Because `max_result_bytes` is enforced before redaction, `RedactionStrategy::Replace`
+can push the recomputed figure past it — `"[REDACTED]"` is 12 JSON bytes and the value
+it replaces may be as small as `null` — so a response can end above the budget it was
+checked against by a bounded, deterministic amount, at most 12 bytes per redacted
+value, exactly as `redact_plan` can carry a plan above `MAX_PLAN_BYTES`;
+`RedactionStrategy::Null` never grows a response.
+
 Example error:
 
 ```text

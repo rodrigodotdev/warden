@@ -392,7 +392,10 @@ request. Step 8 is adapter-owned: the service passes `runtime.limits()` into
 
 The attempt is recorded **before** permit acquisition and execution. If the sink
 fails, deny the query. If the process dies during execution, the attempt is already
-recorded.
+recorded. A recorded attempt receives its terminal outcome only if the request future
+is polled to completion — dropping it mid-flight releases the permit but writes no
+outcome — so the audit trail's completeness depends on Milestone 12 running each
+request in its own task, as `AGENTS.md` requires.
 
 ## 9. Why adapters remain separate crates
 
