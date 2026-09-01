@@ -239,6 +239,11 @@ impl QueryService {
 }
 
 #[cfg(test)]
+pub(crate) fn redactor_arc(service: &QueryService) -> &Arc<Redactor> {
+    &service.redactor
+}
+
+#[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 

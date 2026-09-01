@@ -35,3 +35,6 @@ tracing = { workspace = true }
 # `test-util` provides `#[tokio::test(start_paused = true)]`, which makes every
 # deadline and queue-wait test deterministic and instant.
 tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
+# Mechanical guards inspect Rust syntax rather than text, so comments, literals,
+# formatting, UFCS, and nested modules cannot bypass or falsely trigger them.
+syn = { workspace = true }
