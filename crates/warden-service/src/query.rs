@@ -166,13 +166,16 @@ impl QueryService {
                     AuditOutcomeEvent {
                         attempt_id: attempt.id,
                         outcome: AuditOutcome::Succeeded,
-                        // The adapter's own measurement of the statement — server-side
-                        // execution plus normalization — not a service-side clock, so
-                        // the recorded figure matches what the database did rather
-                        // than what this process observed around it. `explain.rs`
-                        // records a service-side elapsed time instead, because a
-                        // `QueryPlan` carries no stats; the two are not the same
-                        // quantity and an auditor should not compare them directly.
+                        // The adapter's own clock over the whole database call, not a
+                        // measurement of the statement alone: it starts before the
+                        // pool checkout and `BEGIN READ ONLY` and their setup round
+                        // trips, and stops once the rows are collected and normalized,
+                        // before rollback and cleanup
+                        // (`crates/warden-mysql/src/execute.rs`; PostgreSQL has the
+                        // same shape). `explain.rs` records a service-side elapsed
+                        // time instead, because a `QueryPlan` carries no stats; the
+                        // two are not the same quantity and an auditor should not
+                        // compare them directly.
                         duration: Some(result.stats.duration),
                         rows_returned: Some(result.stats.rows_returned),
                         // After redaction, so the figure describes what the agent

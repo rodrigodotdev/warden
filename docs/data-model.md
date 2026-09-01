@@ -347,8 +347,10 @@ Because `max_result_bytes` is enforced before redaction, `RedactionStrategy::Rep
 can push the recomputed figure past it — `"[REDACTED]"` is 12 JSON bytes and the value
 it replaces may be as small as `null` — so a response can end above the budget it was
 checked against by a bounded, deterministic amount, at most 12 bytes per redacted
-value, exactly as `redact_plan` can carry a plan above `MAX_PLAN_BYTES`;
-`RedactionStrategy::Null` never grows a response.
+value, exactly as `redact_plan` can carry a plan above `MAX_PLAN_BYTES`.
+`RedactionStrategy::Null` is bounded far more tightly but is not immune: `null` encodes
+to 4 bytes, so nulling a value that encoded shorter—`0` at one byte, `""` at two—adds up
+to 3 bytes per redacted value.
 
 Example error:
 

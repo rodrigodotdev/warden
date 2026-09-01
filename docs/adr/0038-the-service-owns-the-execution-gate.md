@@ -43,6 +43,8 @@ reaching the database, and its audit outcome must not claim that execution faile
 
 A recorded attempt is guaranteed a terminal outcome only for a request future that is
 polled to completion: dropping one between the attempt and its outcome releases the
-permit through `Drop` but writes no outcome and raises no alarm, and Milestone 12's
-per-request task — `AGENTS.md`'s "run each request in its own task" — is what supplies
-that guarantee.
+permit through `Drop` but writes no outcome and raises no alarm. Milestone 12's
+per-request task — `AGENTS.md`'s "run each request in its own task" — is what keeps an
+ordinary request on that path and contains a panic to the one request that raised it; it
+does not cover a task aborted or dropped mid-flight, which still leaves its attempt
+without an outcome.
