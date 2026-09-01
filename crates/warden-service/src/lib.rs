@@ -47,6 +47,7 @@ pub mod limits;
 pub mod query;
 pub mod redaction;
 pub mod registry;
+pub mod schema;
 
 mod pipeline;
 
@@ -61,3 +62,4 @@ pub use limits::{AUDIT_WRITE_TIMEOUT, MAX_ADAPTER_CLEANUP, RequestBudget};
 pub use query::QueryService;
 pub use redaction::{REDACTED, RedactionRuleError, RedactionSettings, RedactionStrategy, Redactor};
 pub use registry::{RegistryError, StaticConnectionRegistry};
+pub use schema::SchemaService;

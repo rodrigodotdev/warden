@@ -19,7 +19,9 @@ use std::time::Duration;
 
 use tokio::time::{Instant, sleep, sleep_until};
 use tokio_util::sync::CancellationToken;
-use warden_core::analysis::{QueryAnalysis, QueryAnalysisParts, StatementKind};
+use warden_core::analysis::{
+    ObjectKind, ObjectRef, QueryAnalysis, QueryAnalysisParts, SqlIdentifier, StatementKind,
+};
 use warden_core::connection::{Capabilities, ConnectionMetadata, Environment};
 use warden_core::context::RequestContext;
 use warden_core::dialect::Dialect;
@@ -28,7 +30,8 @@ use warden_core::limits::ExecutionLimits;
 use warden_core::query::{InputLimits, QueryRequest};
 use warden_core::result::{QueryStats, ResultColumn, ResultSet, ResultValue};
 use warden_core::schema::{
-    SchemaDescribeRequest, SchemaDescription, SchemaSearchRequest, SchemaSearchResult,
+    ColumnDescription, MatchReason, Schema, SchemaDescribeRequest, SchemaDescription, SchemaMatch,
+    SchemaSearchRequest, SchemaSearchResult, Table, TableKind,
 };
 use warden_policy::{
     AnalyzedQuery, AuthorizedQuery, DenyReason, ObjectFilter, PolicyEngine, PolicyRejection,
@@ -42,6 +45,7 @@ use warden_ports::{
 
 use crate::explain::ExplainService;
 use crate::query::QueryService;
+use crate::schema::SchemaService;
 use crate::{RedactionSettings, Redactor, StaticConnectionRegistry};
 
 /// The statement every fixture uses.
@@ -70,6 +74,30 @@ pub(crate) fn request_context() -> RequestContext {
         "alice@example.com".parse().unwrap(),
         "Claude Code".parse().unwrap(),
     )
+}
+
+/// A bounded search request against the fixture connection.
+pub(crate) fn search_request() -> SchemaSearchRequest {
+    search_request_for("production-db")
+}
+
+/// A bounded search request against the named fixture connection.
+pub(crate) fn search_request_for(connection: &str) -> SchemaSearchRequest {
+    SchemaSearchRequest::new(connection.parse().unwrap(), "orders customer", 7).unwrap()
+}
+
+/// A bounded description request against the fixture connection.
+pub(crate) fn describe_request() -> SchemaDescribeRequest {
+    describe_request_for("production-db")
+}
+
+/// A bounded description request against the named fixture connection.
+pub(crate) fn describe_request_for(connection: &str) -> SchemaDescribeRequest {
+    SchemaDescribeRequest::new(
+        connection.parse().unwrap(),
+        vec!["app.orders".parse().unwrap()],
+    )
+    .unwrap()
 }
 
 /// A production connection on the given dialect.
@@ -234,6 +262,53 @@ pub(crate) fn secret_result() -> ResultSet {
             bytes,
             duration: Duration::from_millis(1),
         },
+    }
+}
+
+/// A bounded schema search result with one relation name and no sensitive values.
+pub(crate) fn schema_search_result() -> SchemaSearchResult {
+    SchemaSearchResult {
+        matches: vec![SchemaMatch {
+            schema: "app".to_owned(),
+            table: "orders".to_owned(),
+            kind: TableKind::Table,
+            reason: MatchReason::ExactTable,
+        }],
+        truncated: false,
+    }
+}
+
+/// A schema description containing one value that service tests redact.
+pub(crate) fn schema_description() -> SchemaDescription {
+    SchemaDescription {
+        schemas: vec![Schema {
+            name: "app".to_owned(),
+            tables: vec![Table {
+                schema: "app".to_owned(),
+                name: "orders".to_owned(),
+                kind: TableKind::Table,
+                columns: vec![
+                    ColumnDescription {
+                        name: "id".to_owned(),
+                        database_type: "BIGINT".to_owned(),
+                        nullable: false,
+                        default: Some("nextval('orders_id_seq')".to_owned()),
+                        comment: Some("public identifier".to_owned()),
+                    },
+                    ColumnDescription {
+                        name: "secret".to_owned(),
+                        database_type: "TEXT".to_owned(),
+                        nullable: true,
+                        default: Some("hunter2".to_owned()),
+                        comment: Some("production credential".to_owned()),
+                    },
+                ],
+                primary_key: vec!["id".to_owned()],
+                foreign_keys: Vec::new(),
+                indexes: Vec::new(),
+                truncated: false,
+            }],
+        }],
     }
 }
 
@@ -476,71 +551,164 @@ impl Explainer for FakeExplainer {
     }
 }
 
-/// An inspector with a fixed rejection or failure.
-#[derive(Debug, Default)]
+/// What one schema-port call observed at its trust boundary.
+#[derive(Debug, Clone)]
+pub(crate) struct InspectorObservation<T> {
+    /// The request value received by the port.
+    pub(crate) request: T,
+    /// The runtime metadata captured by the object filter.
+    pub(crate) filter_connection: ConnectionMetadata,
+    /// Whether the supplied engine permits the fixture's denied object.
+    pub(crate) filter_permits_secret: bool,
+    /// The absolute client deadline supplied by the service.
+    pub(crate) deadline: Instant,
+    /// The cancellation token supplied by the service.
+    pub(crate) cancel: CancellationToken,
+}
+
+/// An inspector with fixed answers and observable boundary inputs.
+#[derive(Debug)]
 pub(crate) struct FakeInspector {
-    rejecting: bool,
+    duration: Duration,
     failure: Option<SchemaError>,
+    search_result: SchemaSearchResult,
+    description: SchemaDescription,
+    search_observations: Mutex<Vec<InspectorObservation<SchemaSearchRequest>>>,
+    describe_observations: Mutex<Vec<InspectorObservation<SchemaDescribeRequest>>>,
+}
+
+impl Default for FakeInspector {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FakeInspector {
-    /// Creates an inspector that returns empty valid schema answers.
+    /// Creates an inspector that returns fixed bounded schema answers.
     pub(crate) fn new() -> Self {
-        Self::default()
+        Self {
+            duration: Duration::ZERO,
+            failure: None,
+            search_result: schema_search_result(),
+            description: schema_description(),
+            search_observations: Mutex::new(Vec::new()),
+            describe_observations: Mutex::new(Vec::new()),
+        }
     }
     /// Creates an inspector whose schema requests are rejected.
     pub(crate) fn rejecting() -> Self {
         Self {
-            rejecting: true,
-            failure: None,
+            failure: Some(SchemaError::Rejected(rejection())),
+            ..Self::new()
         }
     }
     /// Creates an inspector that always fails.
     pub(crate) fn failing(error: SchemaError) -> Self {
         Self {
-            rejecting: false,
             failure: Some(error),
+            ..Self::new()
         }
     }
-    fn result(&self) -> Result<(), SchemaError> {
-        if let Some(error) = &self.failure {
-            return Err(error.clone());
+    /// Creates an inspector whose catalog read takes the given duration.
+    pub(crate) fn taking(duration: Duration) -> Self {
+        Self {
+            duration,
+            ..Self::new()
         }
-        if self.rejecting {
-            return Err(SchemaError::Rejected(rejection()));
+    }
+    /// Number of search calls received by the port.
+    pub(crate) fn search_calls(&self) -> usize {
+        self.search_observations.lock().unwrap().len()
+    }
+    /// Number of describe calls received by the port.
+    pub(crate) fn describe_calls(&self) -> usize {
+        self.describe_observations.lock().unwrap().len()
+    }
+    /// The latest search boundary observation.
+    pub(crate) fn latest_search(&self) -> InspectorObservation<SchemaSearchRequest> {
+        self.search_observations
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone()
+    }
+    /// The latest describe boundary observation.
+    pub(crate) fn latest_describe(&self) -> InspectorObservation<SchemaDescribeRequest> {
+        self.describe_observations
+            .lock()
+            .unwrap()
+            .last()
+            .unwrap()
+            .clone()
+    }
+    fn observe<T: Clone>(
+        request: &T,
+        filter: ObjectFilter<'_>,
+        deadline: Instant,
+        cancel: &CancellationToken,
+    ) -> InspectorObservation<T> {
+        let secret = ObjectRef {
+            catalog: None,
+            schema: Some(SqlIdentifier::unquoted("app")),
+            name: SqlIdentifier::unquoted("secrets"),
+            kind: ObjectKind::Table,
+        };
+        InspectorObservation {
+            request: request.clone(),
+            filter_connection: filter.connection().clone(),
+            filter_permits_secret: filter.permits(&secret),
+            deadline,
+            cancel: cancel.clone(),
         }
-        Ok(())
     }
 }
 
 impl SchemaInspector for FakeInspector {
     fn search_schema<'a>(
         &'a self,
-        _request: &'a SchemaSearchRequest,
-        _filter: ObjectFilter<'a>,
-        _deadline: Instant,
-        _cancel: CancellationToken,
+        request: &'a SchemaSearchRequest,
+        filter: ObjectFilter<'a>,
+        deadline: Instant,
+        cancel: CancellationToken,
     ) -> warden_ports::BoxFuture<'a, Result<SchemaSearchResult, SchemaError>> {
         Box::pin(async move {
-            self.result()?;
-            Ok(SchemaSearchResult {
-                matches: Vec::new(),
-                truncated: false,
-            })
+            self.search_observations
+                .lock()
+                .unwrap()
+                .push(Self::observe(request, filter, deadline, &cancel));
+            tokio::select! {
+                () = sleep(self.duration) => {},
+                () = cancel.cancelled() => return Err(SchemaError::Cancelled),
+                () = sleep_until(deadline) => return Err(SchemaError::Timeout),
+            }
+            match &self.failure {
+                Some(error) => Err(error.clone()),
+                None => Ok(self.search_result.clone()),
+            }
         })
     }
     fn describe_schema<'a>(
         &'a self,
-        _request: &'a SchemaDescribeRequest,
-        _filter: ObjectFilter<'a>,
-        _deadline: Instant,
-        _cancel: CancellationToken,
+        request: &'a SchemaDescribeRequest,
+        filter: ObjectFilter<'a>,
+        deadline: Instant,
+        cancel: CancellationToken,
     ) -> warden_ports::BoxFuture<'a, Result<SchemaDescription, SchemaError>> {
         Box::pin(async move {
-            self.result()?;
-            Ok(SchemaDescription {
-                schemas: Vec::new(),
-            })
+            self.describe_observations
+                .lock()
+                .unwrap()
+                .push(Self::observe(request, filter, deadline, &cancel));
+            tokio::select! {
+                () = sleep(self.duration) => {},
+                () = cancel.cancelled() => return Err(SchemaError::Cancelled),
+                () = sleep_until(deadline) => return Err(SchemaError::Timeout),
+            }
+            match &self.failure {
+                Some(error) => Err(error.clone()),
+                None => Ok(self.description.clone()),
+            }
         })
     }
 }
@@ -756,8 +924,10 @@ pub(crate) fn redactor(columns: &[&str]) -> Arc<Redactor> {
     )
 }
 
-/// Swappable fixtures for query and explain services.
+/// Swappable fixtures for application-service tests.
 pub(crate) struct ServiceFakes {
+    /// Adapter capabilities.
+    pub(crate) capabilities: Capabilities,
     /// Per-connection execution limits.
     pub(crate) limits: ExecutionLimits,
     /// The analyzer port.
@@ -766,6 +936,8 @@ pub(crate) struct ServiceFakes {
     pub(crate) executor: Arc<dyn QueryExecutor>,
     /// The explainer port.
     pub(crate) explainer: Arc<dyn Explainer>,
+    /// The schema-inspector port.
+    pub(crate) inspector: Arc<dyn SchemaInspector>,
     /// The two-phase audit port.
     pub(crate) audit: Arc<dyn AuditSink>,
     /// Response redaction rules.
@@ -777,10 +949,12 @@ pub(crate) struct ServiceFakes {
 impl Default for ServiceFakes {
     fn default() -> Self {
         Self {
+            capabilities: capabilities(),
             limits: ExecutionLimits::default(),
             analyzer: Arc::new(FakeAnalyzer::new(Dialect::MySql)),
             executor: Arc::new(FakeExecutor::new()),
             explainer: Arc::new(FakeExplainer::new()),
+            inspector: Arc::new(FakeInspector::new()),
             audit: Arc::new(FakeAuditSink::new()),
             redactor: redactor(&[]),
             shutdown: CancellationToken::new(),
@@ -791,10 +965,12 @@ impl Default for ServiceFakes {
 /// Builds one query service whose tests can replace one collaborator at a time.
 pub(crate) fn query_service(fakes: ServiceFakes) -> QueryService {
     let mut parts = FakeParts::new(Dialect::MySql);
+    parts.capabilities = fakes.capabilities;
     parts.limits = fakes.limits;
     parts.analyzer = fakes.analyzer;
     parts.executor = fakes.executor;
     parts.explainer = fakes.explainer;
+    parts.inspector = fakes.inspector;
     let runtime = Arc::new(runtime_from(parts));
     let registry: Arc<dyn ConnectionRegistry> =
         Arc::new(StaticConnectionRegistry::new(vec![runtime]).unwrap());
@@ -810,10 +986,12 @@ pub(crate) fn query_service(fakes: ServiceFakes) -> QueryService {
 /// Builds one explain service whose tests can replace one collaborator at a time.
 pub(crate) fn explain_service(fakes: ServiceFakes) -> ExplainService {
     let mut parts = FakeParts::new(Dialect::MySql);
+    parts.capabilities = fakes.capabilities;
     parts.limits = fakes.limits;
     parts.analyzer = fakes.analyzer;
     parts.executor = fakes.executor;
     parts.explainer = fakes.explainer;
+    parts.inspector = fakes.inspector;
     let runtime = Arc::new(runtime_from(parts));
     let registry: Arc<dyn ConnectionRegistry> =
         Arc::new(StaticConnectionRegistry::new(vec![runtime]).unwrap());
@@ -824,6 +1002,18 @@ pub(crate) fn explain_service(fakes: ServiceFakes) -> ExplainService {
         fakes.redactor,
         fakes.shutdown,
     )
+}
+
+/// Builds one schema service whose tests can replace one collaborator at a time.
+pub(crate) fn schema_service(fakes: ServiceFakes) -> SchemaService {
+    let mut parts = FakeParts::new(Dialect::MySql);
+    parts.capabilities = fakes.capabilities;
+    parts.limits = fakes.limits;
+    parts.inspector = fakes.inspector;
+    let runtime = Arc::new(runtime_from(parts));
+    let registry: Arc<dyn ConnectionRegistry> =
+        Arc::new(StaticConnectionRegistry::new(vec![runtime]).unwrap());
+    SchemaService::new(registry, engine(), fakes.redactor, fakes.shutdown)
 }
 
 /// Builds a query service whose only connection has no free query slot.
