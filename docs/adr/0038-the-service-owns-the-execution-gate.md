@@ -40,3 +40,9 @@ replace database privileges as the final write boundary (ADR-0016).
 `AuditOutcome::NotStarted` exists because the attempt now provably precedes permit
 acquisition. An authorized statement can therefore end at `server_busy` without ever
 reaching the database, and its audit outcome must not claim that execution failed.
+
+A recorded attempt is guaranteed a terminal outcome only for a request future that is
+polled to completion: dropping one between the attempt and its outcome releases the
+permit through `Drop` but writes no outcome and raises no alarm, and Milestone 12's
+per-request task — `AGENTS.md`'s "run each request in its own task" — is what supplies
+that guarantee.
