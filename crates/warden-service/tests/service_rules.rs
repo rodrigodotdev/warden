@@ -13,6 +13,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use proc_macro2::{TokenStream, TokenTree};
 use syn::visit::Visit;
 use tokio_util::sync::CancellationToken;
 use warden_core::connection::{ConnectionMetadata, ConnectionName, Environment};
@@ -98,6 +99,39 @@ fn item_attributes(item: &syn::Item) -> &[syn::Attribute] {
     }
 }
 
+fn impl_item_attributes(item: &syn::ImplItem) -> &[syn::Attribute] {
+    match item {
+        syn::ImplItem::Const(item) => &item.attrs,
+        syn::ImplItem::Fn(item) => &item.attrs,
+        syn::ImplItem::Type(item) => &item.attrs,
+        syn::ImplItem::Macro(item) => &item.attrs,
+        syn::ImplItem::Verbatim(_) => &[],
+        _ => &[],
+    }
+}
+
+fn trait_item_attributes(item: &syn::TraitItem) -> &[syn::Attribute] {
+    match item {
+        syn::TraitItem::Const(item) => &item.attrs,
+        syn::TraitItem::Fn(item) => &item.attrs,
+        syn::TraitItem::Type(item) => &item.attrs,
+        syn::TraitItem::Macro(item) => &item.attrs,
+        syn::TraitItem::Verbatim(_) => &[],
+        _ => &[],
+    }
+}
+
+fn foreign_item_attributes(item: &syn::ForeignItem) -> &[syn::Attribute] {
+    match item {
+        syn::ForeignItem::Fn(item) => &item.attrs,
+        syn::ForeignItem::Static(item) => &item.attrs,
+        syn::ForeignItem::Type(item) => &item.attrs,
+        syn::ForeignItem::Macro(item) => &item.attrs,
+        syn::ForeignItem::Verbatim(_) => &[],
+        _ => &[],
+    }
+}
+
 fn gated_call(method: &str) -> Option<&'static str> {
     GATED_CALLS.iter().copied().find(|call| {
         call.strip_prefix('.')
@@ -114,6 +148,111 @@ fn path_ends_with(path: &syn::Path, expected: &str) -> bool {
 
 fn type_ends_with(ty: &syn::Type, expected: &str) -> bool {
     matches!(ty, syn::Type::Path(path) if path_ends_with(&path.path, expected))
+}
+
+fn punct_is(token: Option<&TokenTree>, expected: char) -> bool {
+    matches!(token, Some(TokenTree::Punct(punctuation)) if punctuation.as_char() == expected)
+}
+
+fn macro_path_marker_before(tokens: &[TokenTree], index: usize) -> bool {
+    punct_is(
+        index.checked_sub(1).and_then(|index| tokens.get(index)),
+        '.',
+    ) || (punct_is(
+        index.checked_sub(1).and_then(|index| tokens.get(index)),
+        ':',
+    ) && punct_is(
+        index.checked_sub(2).and_then(|index| tokens.get(index)),
+        ':',
+    ))
+}
+
+fn scan_macro_tokens(tokens: TokenStream, analysis: &mut SourceAnalysis) {
+    fn collect_identifiers(tokens: &[TokenTree], identifiers: &mut Vec<String>) {
+        for token in tokens {
+            match token {
+                TokenTree::Group(group) => {
+                    let nested = group.stream().into_iter().collect::<Vec<_>>();
+                    collect_identifiers(&nested, identifiers);
+                }
+                TokenTree::Ident(identifier) => identifiers.push(identifier.to_string()),
+                // Literals are intentionally atomic: text that looks like Rust inside a
+                // string, raw string, byte string, or character must never trigger R5.
+                TokenTree::Literal(_) | TokenTree::Punct(_) => {}
+            }
+        }
+    }
+
+    fn has_generated_public_error_impl(identifiers: &[String]) -> bool {
+        identifiers
+            .iter()
+            .enumerate()
+            .filter(|(_, identifier)| identifier.as_str() == "impl")
+            .any(|(impl_index, _)| {
+                identifiers[impl_index + 1..]
+                    .iter()
+                    .position(|identifier| identifier == "PublicError")
+                    .map(|index| impl_index + 1 + index)
+                    .and_then(|public_error_index| {
+                        identifiers[public_error_index + 1..]
+                            .iter()
+                            .position(|identifier| identifier == "for")
+                            .map(|index| public_error_index + 1 + index)
+                    })
+                    .is_some_and(|for_index| {
+                        identifiers[for_index + 1..]
+                            .iter()
+                            .any(|identifier| identifier == "ServiceBuildError")
+                    })
+            })
+    }
+
+    fn parsed_item_implements_public_error_for_service_build(item: &syn::Item) -> bool {
+        if is_cfg_test(item_attributes(item)) {
+            return false;
+        }
+        match item {
+            syn::Item::Impl(item) => {
+                item.trait_
+                    .as_ref()
+                    .is_some_and(|(_, path, _)| path_ends_with(path, "PublicError"))
+                    && type_ends_with(item.self_ty.as_ref(), "ServiceBuildError")
+            }
+            syn::Item::Mod(module) => module.content.as_ref().is_some_and(|(_, items)| {
+                items
+                    .iter()
+                    .any(parsed_item_implements_public_error_for_service_build)
+            }),
+            _ => false,
+        }
+    }
+
+    let tokens = tokens.into_iter().collect::<Vec<_>>();
+    for (index, token) in tokens.iter().enumerate() {
+        match token {
+            TokenTree::Group(group) => scan_macro_tokens(group.stream(), analysis),
+            TokenTree::Ident(identifier) if macro_path_marker_before(&tokens, index) => {
+                analysis.calls.push(identifier.to_string());
+            }
+            TokenTree::Ident(_) | TokenTree::Literal(_) | TokenTree::Punct(_) => {}
+        }
+    }
+
+    let mut identifiers = Vec::new();
+    collect_identifiers(&tokens, &mut identifiers);
+    let parsed_items = syn::parse2::<syn::File>(tokens.iter().cloned().collect());
+    let implements_public_error = match parsed_items {
+        Ok(file) => file
+            .items
+            .iter()
+            .any(parsed_item_implements_public_error_for_service_build),
+        // Macro DSLs need not be Rust syntax. For those only, conservatively
+        // recognize the ordered impl/trait/for/type identifiers.
+        Err(_) => has_generated_public_error_impl(&identifiers),
+    };
+    if implements_public_error {
+        analysis.implements_public_error_for_service_build = true;
+    }
 }
 
 #[derive(Default)]
@@ -135,18 +274,61 @@ impl<'ast> Visit<'ast> for SourceAnalysis {
         syn::visit::visit_item(self, node);
     }
 
+    fn visit_impl_item(&mut self, node: &'ast syn::ImplItem) {
+        if is_cfg_test(impl_item_attributes(node)) {
+            return;
+        }
+        syn::visit::visit_impl_item(self, node);
+    }
+
+    fn visit_trait_item(&mut self, node: &'ast syn::TraitItem) {
+        if is_cfg_test(trait_item_attributes(node)) {
+            return;
+        }
+        syn::visit::visit_trait_item(self, node);
+    }
+
+    fn visit_foreign_item(&mut self, node: &'ast syn::ForeignItem) {
+        if is_cfg_test(foreign_item_attributes(node)) {
+            return;
+        }
+        syn::visit::visit_foreign_item(self, node);
+    }
+
+    fn visit_local(&mut self, node: &'ast syn::Local) {
+        if is_cfg_test(&node.attrs) {
+            return;
+        }
+        syn::visit::visit_local(self, node);
+    }
+
+    fn visit_stmt_macro(&mut self, node: &'ast syn::StmtMacro) {
+        if is_cfg_test(&node.attrs) {
+            return;
+        }
+        syn::visit::visit_stmt_macro(self, node);
+    }
+
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
         self.calls.push(node.method.to_string());
         syn::visit::visit_expr_method_call(self, node);
     }
 
-    fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
-        if let syn::Expr::Path(path) = node.func.as_ref()
-            && let Some(segment) = path.path.segments.last()
+    fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
+        if (node.qself.is_some() || node.path.segments.len() > 1)
+            && let Some(segment) = node.path.segments.last()
         {
             self.calls.push(segment.ident.to_string());
         }
-        syn::visit::visit_expr_call(self, node);
+        syn::visit::visit_expr_path(self, node);
+    }
+
+    fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        // Syn cannot parse arbitrary macro input as Rust AST. Token trees still
+        // preserve the punctuation needed to distinguish `.executor` and
+        // `Type::executor` from an unrelated local identifier named `executor`.
+        scan_macro_tokens(node.tokens.clone(), self);
+        syn::visit::visit_macro(self, node);
     }
 
     fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
@@ -499,4 +681,100 @@ fn testing_file_exclusion_requires_a_cfg_test_module_link() {
 fn test_support_file_is_cfg_test_linked_by_the_real_crate_root() {
     let source = fs::read_to_string(src_dir().join("lib.rs")).unwrap();
     assert!(cfg_test_modules(&source).contains("testing"));
+}
+
+#[test]
+fn syntax_guard_detects_gated_calls_inside_macro_token_trees() {
+    let source = r#"
+        async fn waits(runtime: &ConnectionRuntime) {
+            tokio::select! {
+                note = "ConnectionRuntime::executor(runtime)" => note,
+                permit = runtime /* gap */ . acquire_query_permit /* gap */ () => permit,
+            }
+        }
+    "#;
+    assert_eq!(gated_calls(source), vec![".acquire_query_permit()"]);
+}
+
+#[test]
+fn syntax_guard_detects_parenthesized_and_aliased_function_item_paths() {
+    let source = r#"
+        fn bypasses(runtime: &ConnectionRuntime) {
+            (ConnectionRuntime::executor)(runtime);
+            let run = ConnectionRuntime::explainer;
+            run(runtime);
+        }
+    "#;
+    assert_eq!(gated_calls(source), vec![".executor()", ".explainer()"]);
+}
+
+#[test]
+fn startup_error_guard_detects_an_impl_generated_inside_a_macro() {
+    let source = r#"
+        generate! {
+            impl warden_core::error::PublicError for crate::error::ServiceBuildError {
+                fn public_code(&self) -> PublicErrorCode { code() }
+            }
+        }
+    "#;
+    assert!(implements_public_error_for_service_build(source));
+}
+
+#[test]
+fn macro_scan_ignores_local_gated_names_and_non_target_impls() {
+    let source = r#"
+        passthrough! {
+            let executor = callback;
+            executor(runtime);
+            let note = "runtime.explainer()";
+        }
+
+        generate! {
+            impl<T: PublicError> InternalTrait for ServiceBuildError {
+                fn internal(&self) {}
+            }
+        }
+    "#;
+    assert!(gated_calls(source).is_empty());
+    assert!(!implements_public_error_for_service_build(source));
+}
+
+#[test]
+fn cfg_test_associated_items_are_ignored_but_production_siblings_are_scanned() {
+    let source = r#"
+        impl Service {
+            #[cfg(test)]
+            fn direct_port_test(runtime: &ConnectionRuntime) {
+                runtime.executor();
+            }
+
+            fn production(runtime: &ConnectionRuntime) {
+                runtime.explainer();
+            }
+        }
+
+        trait ServicePort {
+            #[cfg(test)]
+            fn test_only(runtime: &ConnectionRuntime) {
+                runtime.acquire_query_permit();
+            }
+
+            fn production(runtime: &ConnectionRuntime) {
+                runtime.explainer();
+            }
+        }
+    "#;
+    assert_eq!(gated_calls(source), vec![".explainer()", ".explainer()"]);
+}
+
+#[test]
+fn cfg_test_local_statements_are_ignored_but_production_siblings_are_scanned() {
+    let source = r#"
+        fn production(runtime: &ConnectionRuntime) {
+            #[cfg(test)]
+            let _test_only = runtime.executor();
+            runtime.explainer();
+        }
+    "#;
+    assert_eq!(gated_calls(source), vec![".explainer()"]);
 }

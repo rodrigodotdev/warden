@@ -38,3 +38,6 @@ tokio = { workspace = true, features = ["macros", "rt", "test-util"] }
 # Mechanical guards inspect Rust syntax rather than text, so comments, literals,
 # formatting, UFCS, and nested modules cannot bypass or falsely trigger them.
 syn = { workspace = true }
+# `syn::Macro` deliberately leaves its body as a token stream. The guards walk
+# those token trees to cover macro-generated gated calls and startup error impls.
+proc-macro2 = "1"
