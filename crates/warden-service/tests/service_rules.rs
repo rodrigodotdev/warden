@@ -13,7 +13,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use proc_macro2::{TokenStream, TokenTree};
+use proc_macro2::{Ident, TokenStream, TokenTree};
 use syn::visit::Visit;
 use tokio_util::sync::CancellationToken;
 use warden_core::connection::{ConnectionMetadata, ConnectionName, Environment};
@@ -140,10 +140,18 @@ fn gated_call(method: &str) -> Option<&'static str> {
     })
 }
 
+fn normalized_identifier(identifier: &Ident) -> String {
+    let identifier = identifier.to_string();
+    identifier
+        .strip_prefix("r#")
+        .unwrap_or(&identifier)
+        .to_owned()
+}
+
 fn path_ends_with(path: &syn::Path, expected: &str) -> bool {
     path.segments
         .last()
-        .is_some_and(|segment| segment.ident == expected)
+        .is_some_and(|segment| normalized_identifier(&segment.ident) == expected)
 }
 
 fn type_ends_with(ty: &syn::Type, expected: &str) -> bool {
@@ -202,7 +210,7 @@ fn macro_stream_generates_public_error_impl(tokens: &[TokenTree]) -> bool {
             }
             TokenTree::Ident(identifier) if inside_impl && generic_depth == 0 => {
                 saw_trait_identifier = true;
-                last_trait_is_public_error = identifier == "PublicError";
+                last_trait_is_public_error = normalized_identifier(identifier) == "PublicError";
             }
             TokenTree::Group(_)
             | TokenTree::Ident(_)
@@ -223,7 +231,7 @@ fn scan_macro_tokens(tokens: TokenStream, analysis: &mut SourceAnalysis) {
         match token {
             TokenTree::Group(group) => scan_macro_tokens(group.stream(), analysis),
             TokenTree::Ident(identifier) => {
-                let identifier = identifier.to_string();
+                let identifier = normalized_identifier(identifier);
                 // Macro expansion can correlate definitions and invocations that no
                 // individual token stream can prove safe. Startup-only errors therefore
                 // stay in explicit Rust, where the exact impl visitor can reason about them.
@@ -296,7 +304,7 @@ impl<'ast> Visit<'ast> for SourceAnalysis {
     }
 
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
-        self.calls.push(node.method.to_string());
+        self.calls.push(normalized_identifier(&node.method));
         syn::visit::visit_expr_method_call(self, node);
     }
 
@@ -304,7 +312,7 @@ impl<'ast> Visit<'ast> for SourceAnalysis {
         if (node.qself.is_some() || node.path.segments.len() > 1)
             && let Some(segment) = node.path.segments.last()
         {
-            self.calls.push(segment.ident.to_string());
+            self.calls.push(normalized_identifier(&segment.ident));
         }
         syn::visit::visit_expr_path(self, node);
     }
@@ -736,6 +744,64 @@ fn startup_error_guard_rejects_an_alias_passed_to_a_public_error_impl_macro() {
 }
 
 #[test]
+fn startup_error_guard_normalizes_raw_public_error_in_macro_impl_heads() {
+    let source = r#"
+        type StartupError = ServiceBuildError;
+
+        macro_rules! expose {
+            ($ty:ty) => {
+                impl r#PublicError for $ty {}
+            };
+        }
+
+        expose!(StartupError);
+    "#;
+    assert!(implements_public_error_for_service_build(source));
+}
+
+#[test]
+fn startup_error_guard_normalizes_raw_service_build_error_in_macro_tokens() {
+    let source = "passthrough!(r#ServiceBuildError);";
+    assert!(implements_public_error_for_service_build(source));
+}
+
+#[test]
+fn gated_call_guard_normalizes_raw_method_and_ufcs_identifiers_in_macros() {
+    let source = r#"
+        passthrough! {
+            runtime.r#executor();
+            ConnectionRuntime::r#explainer(runtime);
+            runtime.r#acquire_query_permit();
+        }
+    "#;
+    assert_eq!(
+        gated_calls(source),
+        vec![".executor()", ".explainer()", ".acquire_query_permit()"]
+    );
+}
+
+#[test]
+fn gated_call_guard_normalizes_raw_method_and_ufcs_identifiers_in_explicit_rust() {
+    let source = r#"
+        fn bypasses(runtime: &ConnectionRuntime) {
+            runtime.r#executor();
+            ConnectionRuntime::r#explainer(runtime);
+            runtime.r#acquire_query_permit();
+        }
+    "#;
+    assert_eq!(
+        gated_calls(source),
+        vec![".executor()", ".explainer()", ".acquire_query_permit()"]
+    );
+}
+
+#[test]
+fn startup_error_guard_normalizes_raw_identifiers_in_explicit_impls() {
+    let source = "impl r#PublicError for r#ServiceBuildError {}";
+    assert!(implements_public_error_for_service_build(source));
+}
+
+#[test]
 fn startup_error_guard_allows_explicit_non_impl_uses_and_literals() {
     let source = r#"
         type StartupError = ServiceBuildError;
@@ -762,18 +828,25 @@ fn startup_error_guard_ignores_macros_without_a_public_error_impl_and_literals()
     let source = r#"
         macro_rules! internal_impl {
             ($ty:ty) => {
-                impl<T: PublicError> InternalTrait for $ty {}
+                impl<T: r#PublicError> InternalTrait for $ty {}
             };
         }
 
         macro_rules! accepts_public_error {
             () => {
-                fn accepts(_: PublicError) {}
+                fn accepts(_: r#PublicError) {}
             };
         }
 
+        passthrough! {
+            let r#executor = callback;
+            r#executor(runtime);
+            r#InternalTrait;
+        }
         describe!("impl PublicError for ServiceBuildError");
+        describe!("impl r#PublicError for r#ServiceBuildError");
     "#;
+    assert!(gated_calls(source).is_empty());
     assert!(!implements_public_error_for_service_build(source));
 }
 
