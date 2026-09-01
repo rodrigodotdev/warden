@@ -26,7 +26,7 @@
 //! ADR-0032 made the concurrency permit a parameter, so execution cannot begin
 //! without one — but a `&QueryPermit` carries no connection identity, and nothing
 //! ordered it against the audit attempt (`docs/open-questions.md` item 14).
-//! [`crate::pipeline`]'s gate closes both gaps: its single constructor records the
+//! `crate::pipeline`'s gate closes both gaps: its single constructor records the
 //! attempt and then acquires the permit from the same [`ConnectionRuntime`] it will
 //! dispatch to, and it is the only place in this crate allowed to name
 //! `executor()`, `explainer()`, or `acquire_query_permit()` (ADR-0038).
