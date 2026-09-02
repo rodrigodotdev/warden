@@ -1,0 +1,716 @@
+[
+  {
+    "name": "describe_schema",
+    "description": "Returns the columns, keys, and indexes of relations `search_schema` found.\nRun this after `search_schema`, naming at most 20 tables per call, each written\nas `schema.table` or as a bare `table`. Every relation comes back with its\ncolumns, its primary key, its foreign keys, and its indexes. A relation marked\n`truncated` had metadata left out by a bound or by the database privileges the\nread-only role holds: what is present is accurate, but it is not everything.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "connection": {
+          "description": "The connection to describe.",
+          "type": "string"
+        },
+        "tables": {
+          "description": "Tables to describe, as `schema.table` or a bare `table`; at most 20 per call.",
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "connection",
+        "tables"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$defs": {
+        "ColumnDetail": {
+          "description": "One column of a discovered relation.",
+          "properties": {
+            "comment": {
+              "description": "The bounded column comment, when one exists.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "database_type": {
+              "description": "The database type name.",
+              "type": "string"
+            },
+            "default": {
+              "description": "The bounded column default, when one exists.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "name": {
+              "description": "The column name.",
+              "type": "string"
+            },
+            "nullable": {
+              "description": "Whether the column accepts `NULL`.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "name",
+            "database_type",
+            "nullable"
+          ],
+          "type": "object"
+        },
+        "ForeignKeySummary": {
+          "description": "A foreign-key constraint.",
+          "properties": {
+            "columns": {
+              "description": "The referencing columns.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "name": {
+              "description": "The constraint name, when the engine reports one.",
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "referenced_columns": {
+              "description": "The referenced columns, positionally aligned with `columns`.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "referenced_schema": {
+              "description": "The referenced schema.",
+              "type": "string"
+            },
+            "referenced_table": {
+              "description": "The referenced table.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "columns",
+            "referenced_schema",
+            "referenced_table",
+            "referenced_columns"
+          ],
+          "type": "object"
+        },
+        "IndexSummary": {
+          "description": "An index on a discovered relation.",
+          "properties": {
+            "columns": {
+              "description": "The indexed columns, in order.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "name": {
+              "description": "The index name.",
+              "type": "string"
+            },
+            "primary": {
+              "description": "Whether the index backs the primary key.",
+              "type": "boolean"
+            },
+            "unique": {
+              "description": "Whether the index enforces uniqueness.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "name",
+            "columns",
+            "unique",
+            "primary"
+          ],
+          "type": "object"
+        },
+        "SchemaSummary": {
+          "description": "One schema and the relations the role may see.",
+          "properties": {
+            "name": {
+              "description": "The schema name.",
+              "type": "string"
+            },
+            "tables": {
+              "description": "The relations in it.",
+              "items": {
+                "$ref": "#/$defs/TableSummary"
+              },
+              "type": "array"
+            }
+          },
+          "required": [
+            "name",
+            "tables"
+          ],
+          "type": "object"
+        },
+        "TableSummary": {
+          "description": "A discovered relation.",
+          "properties": {
+            "columns": {
+              "description": "Its columns, in ordinal order.",
+              "items": {
+                "$ref": "#/$defs/ColumnDetail"
+              },
+              "type": "array"
+            },
+            "foreign_keys": {
+              "description": "Foreign keys declared on this relation.",
+              "items": {
+                "$ref": "#/$defs/ForeignKeySummary"
+              },
+              "type": "array"
+            },
+            "indexes": {
+              "description": "Indexes on this relation.",
+              "items": {
+                "$ref": "#/$defs/IndexSummary"
+              },
+              "type": "array"
+            },
+            "kind": {
+              "$ref": "#/$defs/WireTableKind",
+              "description": "What kind of relation it is."
+            },
+            "name": {
+              "description": "The relation name.",
+              "type": "string"
+            },
+            "primary_key": {
+              "description": "Primary-key column names, in key order.",
+              "items": {
+                "type": "string"
+              },
+              "type": "array"
+            },
+            "truncated": {
+              "description": "Whether any of this relation's metadata was left out.\n\nSet when a bound cuts a list or catalog text, when an engine reports a key part\nwithout a column name, and when a foreign-key target is hidden by policy or\ndatabase privileges. Warden omits unavailable metadata rather than inventing or\nexposing it, and says the result is partial.",
+              "type": "boolean"
+            }
+          },
+          "required": [
+            "name",
+            "kind",
+            "columns",
+            "primary_key",
+            "foreign_keys",
+            "indexes",
+            "truncated"
+          ],
+          "type": "object"
+        },
+        "WireTableKind": {
+          "description": "What kind of relation a discovered object is, as a closed wire enum.\n\nMirrors [`TableKind`]'s variant names exactly, so its own\n`#[serde(rename_all = \"snake_case\")]` reproduces `TableKind`'s spelling by\nconstruction rather than by a hand-copied match arm that could drift from it. The\ncore enum has no `Display` to delegate to instead.",
+          "oneOf": [
+            {
+              "const": "table",
+              "description": "A base table.",
+              "type": "string"
+            },
+            {
+              "const": "view",
+              "description": "A view.",
+              "type": "string"
+            },
+            {
+              "const": "materialized_view",
+              "description": "A materialized view.",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "schemas": {
+          "description": "The described schemas.",
+          "items": {
+            "$ref": "#/$defs/SchemaSummary"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "schemas"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "explain",
+    "description": "Returns the engine's plan for a statement without executing it.\nThe statement is planned, never run. Every policy `query` applies is applied\nhere too, because planning is real work on the server rather than a dry run.\nThe plan is the engine's own document: its costs are that engine's units, and\nthey are not comparable between dialects.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "connection": {
+          "description": "The connection to plan against; determines the dialect and placeholder syntax.",
+          "type": "string"
+        },
+        "parameters": {
+          "description": "Values bound to the statement's placeholders, in the statement's own order.",
+          "items": {
+            "description": "One placeholder value. Containers are not accepted: pass a scalar per placeholder in the statement's own order.",
+            "type": [
+              "string",
+              "number",
+              "boolean",
+              "null"
+            ]
+          },
+          "type": "array"
+        },
+        "sql": {
+          "description": "The statement to plan. Never executed.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "connection",
+        "sql"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$defs": {
+        "PlanSummaryOutput": {
+          "description": "The engine-independent part of a plan.\n\nThere is no cost field, for the same reason `warden-core`'s own [`PlanSummary`] has\nnone: MySQL and PostgreSQL cost units are not comparable (`docs/architecture.md`\nsection 11).",
+          "properties": {
+            "estimated_rows": {
+              "description": "The planner's row estimate, when it reports one.\n\nPostgreSQL fills this; MySQL leaves it `null` rather than borrowing one of its\nown per-step estimates, which would be Warden stating a number the server never\nstated (`docs/architecture.md` section 11; `docs/open-questions.md` item 20).",
+              "format": "uint64",
+              "minimum": 0,
+              "type": [
+                "integer",
+                "null"
+              ]
+            }
+          },
+          "type": "object"
+        },
+        "WireDialect": {
+          "description": "The dialect, as a closed wire enum rather than an open `String`.\n\n[`Dialect`] is a closed set, so the derived schema can state the two legal values\n(`docs/mcp.md` section 1.2 treats the derived schema as a verifiable contract, not\nprose) instead of an unconstrained string a client cannot validate against. The\nvariant names are chosen so `#[serde(rename_all = \"snake_case\")]` reproduces\n`Dialect`'s own `#[serde(rename_all = \"lowercase\")]` spelling exactly: `Mysql` has no\ninternal case transition, so snake_case lowers it to `\"mysql\"`, matching\n`Dialect::as_str()`; likewise `Postgresql` to `\"postgresql\"`.",
+          "oneOf": [
+            {
+              "const": "mysql",
+              "description": "MySQL. Placeholders are positional `?`.",
+              "type": "string"
+            },
+            {
+              "const": "postgresql",
+              "description": "PostgreSQL. Placeholders are numbered `$1`.",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "dialect": {
+          "$ref": "#/$defs/WireDialect",
+          "description": "The dialect that produced the plan."
+        },
+        "plan": {
+          "description": "The engine's own plan document, passed through unchanged."
+        },
+        "summary": {
+          "$ref": "#/$defs/PlanSummaryOutput",
+          "description": "The comparable summary."
+        }
+      },
+      "required": [
+        "dialect",
+        "summary",
+        "plan"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "list_connections",
+    "description": "Lists the connections this server can reach, with the dialect each one speaks.\nCall this first. The connection you pick decides which SQL dialect the `query`\nand `explain` tools accept and which placeholder syntax they take: `?` on MySQL\nand `$1` on PostgreSQL. The response carries public metadata only — never a\nhost, a user, or a connection string.",
+    "inputSchema": {
+      "properties": {},
+      "type": "object"
+    },
+    "outputSchema": {
+      "$defs": {
+        "ConnectionSummary": {
+          "description": "One configured connection.\n\nNo field a DSN could hide in: this mirrors [`ConnectionMetadata`], which cannot hold\none either (SPEC section 6, invariant 20).",
+          "properties": {
+            "database": {
+              "description": "The default database or catalog, for the agent's orientation.",
+              "type": "string"
+            },
+            "dialect": {
+              "$ref": "#/$defs/WireDialect",
+              "description": "The dialect; determines placeholder syntax."
+            },
+            "environment": {
+              "description": "The deployment environment, e.g. `\"production\"`.\n\nA `String`, not a closed wire enum like `dialect`: the core\n[`warden_core::connection::Environment`] it comes from has an open\n`Other(String)` variant for operator-defined environments, so no closed schema\ncould represent every legal value.",
+              "type": "string"
+            },
+            "name": {
+              "description": "The name an agent passes to every tool.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "name",
+            "dialect",
+            "environment",
+            "database"
+          ],
+          "type": "object"
+        },
+        "WireDialect": {
+          "description": "The dialect, as a closed wire enum rather than an open `String`.\n\n[`Dialect`] is a closed set, so the derived schema can state the two legal values\n(`docs/mcp.md` section 1.2 treats the derived schema as a verifiable contract, not\nprose) instead of an unconstrained string a client cannot validate against. The\nvariant names are chosen so `#[serde(rename_all = \"snake_case\")]` reproduces\n`Dialect`'s own `#[serde(rename_all = \"lowercase\")]` spelling exactly: `Mysql` has no\ninternal case transition, so snake_case lowers it to `\"mysql\"`, matching\n`Dialect::as_str()`; likewise `Postgresql` to `\"postgresql\"`.",
+          "oneOf": [
+            {
+              "const": "mysql",
+              "description": "MySQL. Placeholders are positional `?`.",
+              "type": "string"
+            },
+            {
+              "const": "postgresql",
+              "description": "PostgreSQL. Placeholders are numbered `$1`.",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "connections": {
+          "description": "Every connection this deployment is configured to reach.",
+          "items": {
+            "$ref": "#/$defs/ConnectionSummary"
+          },
+          "type": "array"
+        }
+      },
+      "required": [
+        "connections"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "query",
+    "description": "Runs a single read-only `SELECT` and returns the rows it produced.\nOnly a single `SELECT` is accepted, read-only CTEs included. `INSERT`, `UPDATE`,\n`DELETE`, DDL, and several statements in one call are rejected, and so are\n`SHOW`, `EXPLAIN`, and `SET`: planning has the `explain` tool, and the other two\nare unavailable here. Placeholders are dialect-native — `?` on MySQL, `$1` on\nPostgreSQL — with one value per placeholder, in the statement's own order.\nResults are bounded: when the response reports `truncated`, refine the statement\n— a narrower projection, a filter, a smaller `LIMIT` — rather than repeating it\nunchanged.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "connection": {
+          "description": "The configured connection to run against; determines the dialect and\nplaceholder syntax. See `list_connections`.",
+          "type": "string"
+        },
+        "parameters": {
+          "description": "Values bound to the statement's placeholders, in the statement's own order.\nOmit for a statement with no placeholders.",
+          "items": {
+            "description": "One placeholder value. Containers are not accepted: pass a scalar per placeholder in the statement's own order.",
+            "type": [
+              "string",
+              "number",
+              "boolean",
+              "null"
+            ]
+          },
+          "type": "array"
+        },
+        "sql": {
+          "description": "The statement to execute, using the connection's own placeholder syntax.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "connection",
+        "sql"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$defs": {
+        "ColumnSummary": {
+          "description": "One column's metadata.",
+          "properties": {
+            "database_type": {
+              "description": "The database type name, preserved so the agent keeps the original meaning.",
+              "type": "string"
+            },
+            "name": {
+              "description": "The name the database reported, duplicates included.",
+              "type": "string"
+            },
+            "nullable": {
+              "description": "Nullability, when the driver reports it.",
+              "type": [
+                "boolean",
+                "null"
+              ]
+            }
+          },
+          "required": [
+            "name",
+            "database_type"
+          ],
+          "type": "object"
+        },
+        "StatsSummary": {
+          "description": "Counters for one execution.",
+          "properties": {
+            "bytes": {
+              "description": "Normalized size of the result in bytes.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "duration_ms": {
+              "description": "Wall-clock execution time, in whole milliseconds.",
+              "format": "uint64",
+              "minimum": 0,
+              "type": "integer"
+            },
+            "rows_returned": {
+              "description": "Rows returned after any truncation.",
+              "format": "uint",
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "rows_returned",
+            "bytes",
+            "duration_ms"
+          ],
+          "type": "object"
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "columns": {
+          "description": "Column metadata, in positional order.",
+          "items": {
+            "$ref": "#/$defs/ColumnSummary"
+          },
+          "type": "array"
+        },
+        "rows": {
+          "description": "Rows, each positionally aligned with `columns`.",
+          "items": {
+            "items": {
+              "description": "One normalized cell. An integer outside ±2^53 arrives as a decimal string so no client rounds it; the column's own type is in `columns[i].database_type`.",
+              "type": [
+                "integer",
+                "string",
+                "number",
+                "boolean",
+                "null",
+                "array",
+                "object"
+              ]
+            },
+            "type": "array"
+          },
+          "type": "array"
+        },
+        "stats": {
+          "$ref": "#/$defs/StatsSummary",
+          "description": "Counters for this execution."
+        },
+        "truncated": {
+          "description": "Whether a limit stopped collection early. Refine the query rather than repeat it.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "columns",
+        "rows",
+        "truncated",
+        "stats"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": false,
+      "openWorldHint": false
+    }
+  },
+  {
+    "name": "search_schema",
+    "description": "Finds relations by name, before you write a statement against them.\nRun `search_schema` before `query`: it is how you discover the relation names\nthis connection actually has. Its `query` argument accepts several free-text\nterms in one string, separated by whitespace. Results are bounded and ranked by\nhow each relation matched, so even a broad search returns the best matches\nrather than the whole catalog; narrow the terms when what you need is not among\nthem. Follow it with `describe_schema` for the columns and keys of the relations\nyou picked.",
+    "inputSchema": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "additionalProperties": false,
+      "properties": {
+        "connection": {
+          "description": "The connection to search.",
+          "type": "string"
+        },
+        "limit": {
+          "description": "The largest number of matches to return. Defaults to 20 when omitted.",
+          "format": "uint",
+          "minimum": 0,
+          "type": [
+            "integer",
+            "null"
+          ]
+        },
+        "query": {
+          "description": "Free-text search terms, separated by whitespace.",
+          "type": "string"
+        }
+      },
+      "required": [
+        "connection",
+        "query"
+      ],
+      "type": "object"
+    },
+    "outputSchema": {
+      "$defs": {
+        "MatchSummary": {
+          "description": "One search hit.",
+          "properties": {
+            "kind": {
+              "$ref": "#/$defs/WireTableKind",
+              "description": "What kind of relation it is."
+            },
+            "reason": {
+              "$ref": "#/$defs/WireMatchReason",
+              "description": "Why it matched: `\"exact_table\"`, `\"table_prefix\"`, `\"table_substring\"`,\n`\"column_match\"`, `\"schema_name\"`, or `\"description\"`, in ranking order."
+            },
+            "schema": {
+              "description": "The schema holding the object.",
+              "type": "string"
+            },
+            "table": {
+              "description": "The object's name.",
+              "type": "string"
+            }
+          },
+          "required": [
+            "schema",
+            "table",
+            "kind",
+            "reason"
+          ],
+          "type": "object"
+        },
+        "WireMatchReason": {
+          "description": "Why a search hit ranked where it did, as a closed wire enum.\n\nMirrors [`MatchReason`]'s variant names exactly, for the same reason\n[`WireTableKind`] mirrors [`TableKind`]'s.",
+          "oneOf": [
+            {
+              "const": "exact_table",
+              "description": "The table name matched exactly.",
+              "type": "string"
+            },
+            {
+              "const": "table_prefix",
+              "description": "The table name started with the term.",
+              "type": "string"
+            },
+            {
+              "const": "table_substring",
+              "description": "The table name contained the term.",
+              "type": "string"
+            },
+            {
+              "const": "column_match",
+              "description": "A column name matched.",
+              "type": "string"
+            },
+            {
+              "const": "schema_name",
+              "description": "The schema name matched.",
+              "type": "string"
+            },
+            {
+              "const": "description",
+              "description": "A configured human description matched.",
+              "type": "string"
+            }
+          ]
+        },
+        "WireTableKind": {
+          "description": "What kind of relation a discovered object is, as a closed wire enum.\n\nMirrors [`TableKind`]'s variant names exactly, so its own\n`#[serde(rename_all = \"snake_case\")]` reproduces `TableKind`'s spelling by\nconstruction rather than by a hand-copied match arm that could drift from it. The\ncore enum has no `Display` to delegate to instead.",
+          "oneOf": [
+            {
+              "const": "table",
+              "description": "A base table.",
+              "type": "string"
+            },
+            {
+              "const": "view",
+              "description": "A view.",
+              "type": "string"
+            },
+            {
+              "const": "materialized_view",
+              "description": "A materialized view.",
+              "type": "string"
+            }
+          ]
+        }
+      },
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "properties": {
+        "matches": {
+          "description": "Hits in ranking order.",
+          "items": {
+            "$ref": "#/$defs/MatchSummary"
+          },
+          "type": "array"
+        },
+        "truncated": {
+          "description": "Whether the limit stopped collection early.",
+          "type": "boolean"
+        }
+      },
+      "required": [
+        "matches",
+        "truncated"
+      ],
+      "type": "object"
+    },
+    "annotations": {
+      "readOnlyHint": true,
+      "destructiveHint": false,
+      "idempotentHint": true,
+      "openWorldHint": false
+    }
+  }
+]

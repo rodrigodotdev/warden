@@ -79,7 +79,7 @@ where
         // a shutdown and not a startup failure. `rmcp` reports it on the same channel as a
         // broken handshake, and only here is it distinguished from one.
         Err(ServerInitializeError::Cancelled) => return Ok(()),
-        Err(error) => return Err(StdioError::Start(error.to_string())),
+        Err(cause) => return Err(StdioError::Start(cause.to_string())),
     };
     let reason = service
         .waiting()
