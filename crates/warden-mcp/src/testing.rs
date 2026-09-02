@@ -41,13 +41,21 @@ use warden_ports::{
 };
 use warden_service::{RedactionSettings, ServiceParts, Services, StaticConnectionRegistry};
 
-/// The one connection every fixture registry holds.
+/// The connection every fixture registry holds.
 pub(crate) const CONNECTION: &str = "production-db";
+
+/// A second, always-healthy connection, for tests that need a surviving sibling.
+pub(crate) const HEALTHY_CONNECTION: &str = "healthy-db";
 
 /// The fixture connection's public metadata.
 pub(crate) fn connection(dialect: Dialect) -> ConnectionMetadata {
+    connection_named(CONNECTION, dialect)
+}
+
+/// The same metadata under another name, so one registry can hold two connections.
+pub(crate) fn connection_named(name: &str, dialect: Dialect) -> ConnectionMetadata {
     ConnectionMetadata {
-        name: CONNECTION.parse().unwrap(),
+        name: name.parse().unwrap(),
         dialect,
         environment: Environment::Production,
         database: "app".to_owned(),
@@ -430,18 +438,31 @@ pub(crate) fn services() -> Arc<Services> {
 
 /// The same services with exactly one port replaced.
 pub(crate) fn services_from(parts: FakeParts) -> Arc<Services> {
-    let runtime = ConnectionRuntime::new(ConnectionRuntimeParts {
-        metadata: parts.metadata,
-        capabilities: parts.capabilities,
-        limits: parts.limits,
-        analyzer: parts.analyzer,
-        executor: parts.executor,
-        inspector: parts.inspector,
-        explainer: parts.explainer,
-    })
-    .unwrap();
+    services_over(vec![parts])
+}
+
+/// Services whose [`CONNECTION`] panics and whose [`HEALTHY_CONNECTION`] does not.
+///
+/// Per-request containment is a property of *one* server: what it buys is that a call
+/// whose adapter panicked leaves the server that made it able to answer the next call,
+/// on this connection and on its siblings. A second, freshly built server would prove
+/// only that the process survived, which returning from the first call already proves.
+pub(crate) fn services_with_a_panicking_connection() -> Arc<Services> {
+    let healthy = FakeParts {
+        metadata: connection_named(HEALTHY_CONNECTION, Dialect::MySql),
+        ..FakeParts::new()
+    };
+    services_over(vec![FakeParts::panicking(), healthy])
+}
+
+/// Builds the services over one registry holding every supplied connection.
+fn services_over(connections: Vec<FakeParts>) -> Arc<Services> {
+    let runtimes = connections
+        .into_iter()
+        .map(|parts| Arc::new(runtime_from(parts)))
+        .collect();
     let registry: Arc<dyn ConnectionRegistry> =
-        Arc::new(StaticConnectionRegistry::new(vec![Arc::new(runtime)]).unwrap());
+        Arc::new(StaticConnectionRegistry::new(runtimes).unwrap());
     Arc::new(
         Services::new(ServiceParts {
             registry,
@@ -452,4 +473,18 @@ pub(crate) fn services_from(parts: FakeParts) -> Arc<Services> {
         })
         .unwrap(),
     )
+}
+
+/// A runtime over one connection's four fake ports.
+fn runtime_from(parts: FakeParts) -> ConnectionRuntime {
+    ConnectionRuntime::new(ConnectionRuntimeParts {
+        metadata: parts.metadata,
+        capabilities: parts.capabilities,
+        limits: parts.limits,
+        analyzer: parts.analyzer,
+        executor: parts.executor,
+        inspector: parts.inspector,
+        explainer: parts.explainer,
+    })
+    .unwrap()
 }
