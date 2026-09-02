@@ -9,7 +9,7 @@ The client, not the server, determines a session's effective version: `rmcp`'s
 `negotiate_protocol_version` echoes any version the server lists as supported, and the
 SDK's default `supported_protocol_versions` lists all five revisions it knows, from
 `2024-11-05` through `2026-07-28`. Warden has implemented and tested none of the older
-four.
+three — `2024-11-05`, `2025-03-26`, and `2025-06-18`.
 
 Worse than the over-claim is what happens to a version nobody supports. M0.5 requested
 `1999-01-01` and the server answered `2025-11-25` — `ProtocolVersion::LATEST` — with no
