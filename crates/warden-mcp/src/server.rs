@@ -353,8 +353,10 @@ impl WardenServer {
 ///
 /// The SDK's default is every version it knows, which for `rmcp` 3.1 is five revisions from
 /// `2024-11-05` onward. Advertising a revision Warden has neither implemented nor tested is
-/// a claim it cannot keep, so this list is narrowed to the two that carry structured tool
-/// output — the mechanism ADR-0040 depends on (`docs/mcp.md` preamble, ADR-0041).
+/// a claim it cannot keep, so this list holds only the two Warden has implemented and
+/// tested. Both carry structured tool output, the mechanism ADR-0040 depends on — a
+/// property they share with `2025-06-18` rather than what sets them apart from it
+/// (`docs/mcp.md` preamble, ADR-0041).
 pub const WARDEN_PROTOCOL_VERSIONS: &[ProtocolVersion] =
     &[ProtocolVersion::V_2025_11_25, ProtocolVersion::V_2026_07_28];
 
@@ -640,7 +642,7 @@ mod tests {
 
     #[test]
     fn warden_advertises_only_the_versions_it_implements() {
-        // docs/mcp.md's preamble defers this to M12: the SDK default advertises four
+        // docs/mcp.md's preamble defers this to M12: the SDK default advertises three
         // revisions Warden has neither implemented nor tested.
         assert_eq!(
             WARDEN_PROTOCOL_VERSIONS,
