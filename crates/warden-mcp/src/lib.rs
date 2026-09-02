@@ -33,6 +33,7 @@ mod identity;
 mod input;
 mod output;
 mod server;
+mod stdio;
 
 #[cfg(test)]
 mod testing;
@@ -46,4 +47,5 @@ pub use output::{
     QueryOutput, SchemaSummary, SearchOutput, StatsSummary, TableSummary, WireDialect,
     WireMatchReason, WireTableKind,
 };
-pub use server::WardenServer;
+pub use server::{SERVER_INSTRUCTIONS, WARDEN_PROTOCOL_VERSIONS, WardenServer};
+pub use stdio::{StdioError, serve_stdio};
