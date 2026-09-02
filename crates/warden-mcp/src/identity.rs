@@ -9,11 +9,10 @@
 //! validated by the newtype, falling back to [`UNKNOWN_CLIENT`] rather than failing an
 //! otherwise valid request.
 //!
-//! `for_request` has no caller yet: Task 6's `ServerHandler` invokes it per call. `dead_code`
-//! is a plain rustc lint, not one of `AGENTS.md`'s mechanically enforced rules, so silencing
-//! it here for code this task's own tests already exercise is the narrow, reviewable
-//! exception rather than a rule bypass.
-#![allow(dead_code)]
+//! Every item below has no caller yet: Task 6's `ServerHandler` invokes `for_request`
+//! per call. Each carries its own `#[expect(dead_code, ..)]` rather than a module-wide
+//! allow, so the moment Task 6 wires one in, the unfulfilled expectation fails the
+//! `-D warnings` gate and forces its removal.
 
 use rmcp::service::{RequestContext as RmcpRequestContext, RoleServer};
 use uuid::Uuid;
@@ -21,15 +20,33 @@ use warden_core::context::{ClientName, PrincipalId, RequestContext, RequestId};
 use warden_core::error::PublicErrorCode;
 
 /// stdio's one fixed principal. No tool input can influence it (`docs/mcp.md` section 8).
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "consumed by Task 6's ServerHandler via for_request"
+    )
+)]
 pub(crate) const STDIO_PRINCIPAL: &str = "local-stdio";
 
 /// The recorded client name when the peer's own name is absent or invalid.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "consumed by Task 6's ServerHandler via for_request/client_name"
+    )
+)]
 pub(crate) const UNKNOWN_CLIENT: &str = "unknown-client";
 
 /// Builds this call's identity from the transport's context.
 ///
 /// The request id, principal, and client name are all constructed here rather than
 /// read from anything the agent controls (`docs/mcp.md` section 8).
+#[expect(
+    dead_code,
+    reason = "consumed by Task 6's ServerHandler; no test constructs an rmcp RequestContext yet"
+)]
 pub(crate) fn for_request(
     context: &RmcpRequestContext<RoleServer>,
 ) -> Result<RequestContext, PublicErrorCode> {
@@ -38,7 +55,7 @@ pub(crate) fn for_request(
         .parse()
         .map_err(|_| PublicErrorCode::InternalError)?;
     let client_info = context.client_info();
-    let client = client_name(client_info.as_ref().map(|info| info.name.as_str()));
+    let client = client_name(client_info.as_ref().map(|info| info.name.as_str()))?;
     Ok(RequestContext::new(request_id, principal, client))
 }
 
@@ -48,6 +65,13 @@ pub(crate) fn for_request(
 /// fallible, so this returns `internal_error` on the structurally impossible failure
 /// rather than calling `expect` on the request path (`AGENTS.md`). The test below is
 /// what keeps that branch unreachable in practice.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "consumed by Task 6's ServerHandler via for_request"
+    )
+)]
 pub(crate) fn generate_request_id() -> Result<RequestId, PublicErrorCode> {
     Uuid::new_v4()
         .to_string()
@@ -59,21 +83,25 @@ pub(crate) fn generate_request_id() -> Result<RequestId, PublicErrorCode> {
 ///
 /// The name is untrusted MCP input, so a name the newtype refuses — too long, or
 /// carrying a control character that could inject a fake stderr record — must not fail
-/// an otherwise valid request; it is simply not recorded.
-fn client_name(name: Option<&str>) -> ClientName {
-    name.and_then(|value| value.parse::<ClientName>().ok())
-        .unwrap_or_else(unknown_client)
-}
-
-/// The validated [`UNKNOWN_CLIENT`] fallback.
-///
-/// `UNKNOWN_CLIENT` is a fixed, non-empty, printable-ASCII literal within
-/// `MAX_CLIENT_NAME_LEN`, so `ClientName`'s validator cannot refuse it; the sibling
-/// test `a_hostile_client_name_never_reaches_a_log_line` is what keeps this recursive
-/// branch unreachable in practice, exactly as the test above does for
-/// [`generate_request_id`].
-fn unknown_client() -> ClientName {
-    UNKNOWN_CLIENT.parse().unwrap_or_else(|_| unknown_client())
+/// an otherwise valid request; [`UNKNOWN_CLIENT`] is recorded instead. The fallback
+/// conversion is itself fallible in principle (`UNKNOWN_CLIENT`'s validation could stop
+/// holding), so this returns `Result` rather than looping or recursing to manufacture a
+/// value with no failure path — the same `internal_error`-on-impossible-failure shape
+/// [`generate_request_id`] uses, and composes into [`for_request`] with one `?`.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "consumed by Task 6's ServerHandler via for_request"
+    )
+)]
+fn client_name(name: Option<&str>) -> Result<ClientName, PublicErrorCode> {
+    match name.and_then(|value| value.parse::<ClientName>().ok()) {
+        Some(client) => Ok(client),
+        None => UNKNOWN_CLIENT
+            .parse()
+            .map_err(|_| PublicErrorCode::InternalError),
+    }
 }
 
 #[cfg(test)]
@@ -102,16 +130,32 @@ mod tests {
     #[test]
     fn a_hostile_client_name_never_reaches_a_log_line() {
         // ClientName is untrusted and printable-ASCII only, so a name carrying a
-        // newline falls back rather than injecting a fake stderr record.
+        // newline falls back rather than injecting a fake stderr record. The fallback
+        // itself always succeeds (proved here 1,000 times over, mirroring the
+        // generate_request_id test above), which is what keeps client_name's own
+        // internal_error branch unreachable in practice.
         assert_eq!(
-            client_name(Some("Claude Code 2.0")).as_str(),
+            client_name(Some("Claude Code 2.0")).unwrap().as_str(),
             "Claude Code 2.0"
         );
         assert_eq!(
-            client_name(Some("warden\nERROR fake")).as_str(),
+            client_name(Some("warden\nERROR fake")).unwrap().as_str(),
             UNKNOWN_CLIENT
         );
-        assert_eq!(client_name(Some(&"x".repeat(200))).as_str(), UNKNOWN_CLIENT);
-        assert_eq!(client_name(None).as_str(), UNKNOWN_CLIENT);
+        assert_eq!(
+            client_name(Some(&"x".repeat(200))).unwrap().as_str(),
+            UNKNOWN_CLIENT
+        );
+        assert_eq!(client_name(None).unwrap().as_str(), UNKNOWN_CLIENT);
+    }
+
+    #[test]
+    fn the_unknown_client_fallback_always_succeeds() {
+        // client_name's fallback conversion is fallible in principle; this is what
+        // keeps its internal_error branch unreachable in practice, exactly as the
+        // generate_request_id test above does for that function's own guard.
+        for _ in 0..1_000 {
+            assert!(client_name(None).is_ok());
+        }
     }
 }

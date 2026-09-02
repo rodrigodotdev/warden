@@ -10,6 +10,8 @@
 //! instead — never a `warden-core` or `warden-service` error type directly, which
 //! would leak internal detail past the boundary [`crate::error`] owns.
 
+use std::fmt;
+
 use rmcp::schemars::JsonSchema;
 use serde::Deserialize;
 use warden_core::error::{PublicError, PublicErrorCode};
@@ -30,9 +32,29 @@ pub const DEFAULT_SEARCH_LIMIT: usize = 20;
 /// `docs/data-model.md` section 3.1's exactness rule itself, rather than deriving a
 /// schema from [`ParameterValue`], which lives in `warden-core` and takes serde and
 /// nothing else (`docs/architecture.md` section 3).
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(transparent)]
 pub struct ParameterInput(serde_json::Value);
+
+/// Prints shape, never content. Parameters are not logged by default (SPEC section
+/// 6, invariant 23); mirrors `warden_core::parameter::ParameterValue`'s own hand-written
+/// `Debug`, so a `tracing::debug!(?input, ..)` on `QueryInput`/`ExplainInput` — both of
+/// which carry a `Vec<ParameterInput>` and derive `Debug` — cannot reintroduce the leak
+/// that impl closes.
+impl fmt::Debug for ParameterInput {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.0 {
+            serde_json::Value::Null => f.write_str("Null"),
+            serde_json::Value::Bool(_) => f.write_str("Bool(<redacted>)"),
+            serde_json::Value::Number(_) => f.write_str("Number(<redacted>)"),
+            serde_json::Value::String(value) => {
+                write!(f, "String(<redacted {} bytes>)", value.len())
+            }
+            serde_json::Value::Array(_) => f.write_str("Array(<redacted>)"),
+            serde_json::Value::Object(_) => f.write_str("Object(<redacted>)"),
+        }
+    }
+}
 
 impl JsonSchema for ParameterInput {
     fn schema_name() -> std::borrow::Cow<'static, str> {
@@ -58,44 +80,21 @@ impl JsonSchema for ParameterInput {
 impl TryFrom<ParameterInput> for ParameterValue {
     type Error = PublicErrorCode;
 
-    /// Maps `null`, a boolean, a string, and an integer that fits `i64` or `u64`
-    /// directly; a decimal number routes through [`ParameterValue::float`], which
-    /// enforces `docs/data-model.md` section 3.1's ±2^53 exactness rule; an array or
-    /// object is refused as [`PublicErrorCode::QueryParseError`].
+    /// Delegates to [`ParameterValue`]'s own `Deserialize`, which already implements
+    /// `docs/data-model.md` section 3.1's number classification: an integer that
+    /// fits `i64` or `u64` remains exact, and every other number — decimal **and**
+    /// exponent syntax alike — routes through `ParameterValue::float`, which refuses
+    /// an integral magnitude at or above 2^53 regardless of which syntax produced
+    /// it. An array or object is refused the same way `warden-core` refuses one.
     ///
-    /// Exponent-notation numbers (`1e300`) are the one case that bypasses the
-    /// exactness guard: that syntax states its own order of magnitude rather than
-    /// approximating an integer literal, so there is no lost integer to protect
-    /// against. A plain decimal at the same magnitude (`9007199254740994.0`) still
-    /// goes through [`ParameterValue::float`] and is refused, because that shape is
-    /// exactly what a JSON encoder produces when it silently rounds an out-of-range
-    /// integer into a float.
+    /// This delegates rather than re-implementing the classification so the
+    /// workspace keeps exactly one number classifier
+    /// (`warden-core/src/parameter.rs`'s `from_json_number`); a second copy at this
+    /// boundary is exactly the kind of drift that let `1e300` and `9007199254740994.0`
+    /// disagree in an earlier version of this conversion.
     fn try_from(input: ParameterInput) -> Result<Self, Self::Error> {
-        match input.0 {
-            serde_json::Value::Null => Ok(Self::Null),
-            serde_json::Value::Bool(value) => Ok(Self::Bool(value)),
-            serde_json::Value::String(value) => Ok(Self::String(value)),
-            serde_json::Value::Number(number) => parameter_from_number(&number),
-            serde_json::Value::Array(_) | serde_json::Value::Object(_) => {
-                Err(PublicErrorCode::QueryParseError)
-            }
-        }
+        serde_json::from_value(input.0).map_err(|_| PublicErrorCode::QueryParseError)
     }
-}
-
-/// Classifies one JSON number the way [`TryFrom<ParameterInput>`] documents.
-fn parameter_from_number(number: &serde_json::Number) -> Result<ParameterValue, PublicErrorCode> {
-    if let Some(value) = number.as_u64() {
-        return Ok(ParameterValue::U64(value));
-    }
-    if let Some(value) = number.as_i64() {
-        return Ok(ParameterValue::I64(value));
-    }
-    let value = number.as_f64().ok_or(PublicErrorCode::QueryParseError)?;
-    if number.to_string().contains(['e', 'E']) {
-        return Ok(ParameterValue::F64(value));
-    }
-    ParameterValue::float(value).map_err(|_| PublicErrorCode::QueryParseError)
 }
 
 /// Builds the size-validated statement `query` and `explain` share.
@@ -285,6 +284,16 @@ mod tests {
     }
 
     #[test]
+    fn parameter_input_debug_never_prints_a_value() {
+        // Finding 3: derived Debug over the raw serde_json::Value would put every
+        // bound parameter into a tracing::debug!(?input, ..) line in plaintext.
+        let secret: ParameterInput = serde_json::from_value(serde_json::json!("hunter2")).unwrap();
+        let rendered = format!("{secret:?}");
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        assert_eq!(rendered, "String(<redacted 7 bytes>)");
+    }
+
+    #[test]
     fn a_misspelled_argument_is_refused_rather_than_defaulted() {
         assert!(
             query_input(serde_json::json!({
@@ -326,13 +335,19 @@ mod tests {
 
     #[test]
     fn a_float_json_cannot_carry_exactly_is_refused_rather_than_rounded() {
-        // ParameterValue::float owns this rule (docs/data-model.md section 3.1); this
-        // test proves the MCP boundary routes through it instead of casting.
+        // ParameterValue::float owns this rule (docs/data-model.md section 3.1): an
+        // integral magnitude at or above 2^53 is refused in decimal AND exponent
+        // syntax alike. This test proves the MCP boundary routes through that one
+        // classifier instead of forking it, so the two syntaxes cannot disagree.
         let parameter: ParameterInput = serde_json::from_value(serde_json::json!(1e300)).unwrap();
-        assert!(ParameterValue::try_from(parameter).is_ok());
-        let parameter: ParameterInput =
-            serde_json::from_value(serde_json::json!(9_007_199_254_740_994.0_f64)).unwrap();
         assert!(ParameterValue::try_from(parameter).is_err());
+
+        let decimal: ParameterInput =
+            serde_json::from_value(serde_json::json!(9_007_199_254_740_994.0_f64)).unwrap();
+        let exponent: ParameterInput =
+            serde_json::from_value(serde_json::json!(9.007199254740994e15)).unwrap();
+        assert!(ParameterValue::try_from(decimal).is_err());
+        assert!(ParameterValue::try_from(exponent).is_err());
     }
 
     #[test]
