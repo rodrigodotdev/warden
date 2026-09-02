@@ -1,0 +1,51 @@
+version = 1
+
+[[connections]]
+name = "production-mysql"
+dialect = "mysql"
+environment = "production"
+database = "app"
+dsn_env = "WARDEN_PRODUCTION_MYSQL_DSN"
+policy = "production"
+
+[[connections]]
+name = "production-postgres"
+dialect = "postgresql"
+environment = "production"
+database = "analytics"
+dsn_file = "/run/secrets/warden-pg-dsn"
+policy = "production"
+search_path = ["app", "public"]
+
+[policies.production]
+query_timeout = "5s"
+max_queue_wait = "2s"
+max_rows = 200
+max_value_bytes = 65536
+max_result_bytes = 262144
+max_concurrent_queries = 3
+allow_locking_reads = false
+allow_unknown_functions = false
+deny_tables = ["app.audit_log"]
+
+[policies.production.agent_pool]
+max_connections = 5
+min_connections = 0
+acquire_timeout = "3s"
+
+[policies.production.control_pool]
+max_connections = 2
+min_connections = 1
+acquire_timeout = "3s"
+
+[redaction]
+columns = [
+  "*.password",
+  "*.password_hash",
+  "*.access_token",
+  "*.refresh_token",
+  "*.secret",
+]
+
+[audit]
+mode = "fingerprint"

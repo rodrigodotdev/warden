@@ -12,3 +12,11 @@ publish = false
 workspace = true
 
 [dependencies]
+# `docs/architecture.md` section 3: this crate gets serde, toml, secrecy and core
+# metadata. Not policy, not service, not a driver — the composition root maps this
+# crate's output into those.
+warden-core = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+secrecy = { workspace = true }
+thiserror = { workspace = true }

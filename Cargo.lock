@@ -3041,6 +3041,13 @@ dependencies = [
 [[package]]
 name = "warden-config"
 version = "0.1.0"
+dependencies = [
+ "secrecy",
+ "serde",
+ "thiserror",
+ "toml",
+ "warden-core",
+]
 
 [[package]]
 name = "warden-core"
