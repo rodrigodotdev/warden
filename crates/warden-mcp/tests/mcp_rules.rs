@@ -5,10 +5,16 @@
 //! already use, so a comment mentioning `structured_error` or `format!` cannot satisfy or
 //! trip a check that is really about code. Five rules live here:
 //!
-//! - `src/error.rs` is the only file that builds a failed [`rmcp::model::CallToolResult`].
+//! - `src/error.rs` is the only file that builds a failed [`rmcp::model::CallToolResult`]:
+//!   no other file mentions `structured_error`, assigns `is_error`, or calls
+//!   `CallToolResult::error` — the SDK's other failing constructor, which takes free-form
+//!   `ContentBlock` content rather than a fixed `PublicErrorCode`.
 //! - No tool path formats an error: `src/server.rs` and `src/stdio.rs` never call `format!`,
-//!   never call `.to_string()` on a binding named `error` or `source`, and never interpolate
-//!   `{error}` / `{err}` / `{e}` (`docs/security.md` section 10).
+//!   never call `.to_string()` on a binding named `error`, `source`, `err`, `e`, or `cause`,
+//!   and never interpolate `{error}` / `{err}` / `{e}` (`docs/security.md` section 10). This
+//!   check is a name-based heuristic backstop, not a proof — see the note on
+//!   [`ErrorFormattingScan`] for exactly what it cannot see and why the gap is closed
+//!   elsewhere.
 //! - `error.rs`'s `public_message` match has exactly `PublicErrorCode::ALL.len()` arms and no
 //!   wildcard (ADR-0021).
 //! - No adapter, driver, or parser identifier — `sqlx`, `sqlparser`, `warden_mysql`,
@@ -94,6 +100,43 @@ fn sets_is_error(source: &str) -> bool {
     visitor.0
 }
 
+/// Whether `source` calls `CallToolResult::error(content: Vec<ContentBlock>)` — the SDK's
+/// *other* failing constructor (`rmcp` 3.1.4, `src/model.rs`). Unlike [`crate::error::failure`],
+/// which takes only a [`warden_core::error::PublicErrorCode`], `CallToolResult::error` takes
+/// free-form content: a call site is a call site that could thread a driver message straight
+/// through, exactly the shape `docs/security.md` section 10 forbids. Neither `sets_is_error`
+/// nor the `structured_error` text search sees this: the constructor sets `is_error` inside
+/// its own body, not at the call site, and it shares no name with `structured_error`.
+fn calls_call_tool_result_error(source: &str) -> bool {
+    #[derive(Default)]
+    struct CallsCallToolResultError(bool);
+
+    impl<'ast> Visit<'ast> for CallsCallToolResultError {
+        fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+            if let syn::Expr::Path(path) = node.func.as_ref() {
+                let segments: Vec<String> = path
+                    .path
+                    .segments
+                    .iter()
+                    .map(|segment| segment.ident.to_string())
+                    .collect();
+                if segments.len() >= 2
+                    && segments[segments.len() - 2] == "CallToolResult"
+                    && segments[segments.len() - 1] == "error"
+                {
+                    self.0 = true;
+                }
+            }
+            syn::visit::visit_expr_call(self, node);
+        }
+    }
+
+    let file = syn::parse_file(source).expect("source must parse");
+    let mut visitor = CallsCallToolResultError::default();
+    visitor.visit_file(&file);
+    visitor.0
+}
+
 #[test]
 fn only_error_rs_builds_a_failed_result() {
     let error_rs = crate_src().join("error.rs");
@@ -108,6 +151,9 @@ fn only_error_rs_builds_a_failed_result() {
         }
         if sets_is_error(&source) {
             violations.push(format!("{} sets is_error", path.display()));
+        }
+        if calls_call_tool_result_error(&source) {
+            violations.push(format!("{} calls CallToolResult::error", path.display()));
         }
     }
 
@@ -154,6 +200,34 @@ fn macro_carries_forbidden_interpolation(tokens: proc_macro2::TokenStream) -> bo
     })
 }
 
+/// The local-variable spellings a caught error, or its source, conventionally takes in
+/// this codebase and in Rust generally. Not exhaustive — `syn` carries no type
+/// information, so this check cannot know that a binding *is* an error without knowing
+/// its name — which is exactly why it is a heuristic backstop and not a proof: see
+/// [`ErrorFormattingScan`]'s own doc comment for what closes the gap this leaves open.
+const ERROR_LIKE_BINDING_NAMES: &[&str] = &["error", "source", "err", "e", "cause"];
+
+/// A name-based heuristic backstop for "no tool path formats an error"
+/// (`docs/security.md` section 10), not a proof of it.
+///
+/// `syn` has no type information, so this cannot know whether a `.to_string()` receiver
+/// actually holds an error — only whether it is *named* like one
+/// ([`ERROR_LIKE_BINDING_NAMES`]). A binding named `payload` or `detail` that happens to
+/// hold a driver error would slip past it, and it catches nothing at all when the leak
+/// doesn't take this exact shape (a `.to_string()` call, or `format!`/interpolation on
+/// one of the four literal placeholder spellings [`macro_carries_forbidden_interpolation`]
+/// checks for).
+///
+/// What actually closes the route is structural, not this scan: [`crate::error::failure`]
+/// — the one function in `error.rs` that builds a failed [`rmcp::model::CallToolResult`]
+/// — takes a [`warden_core::error::PublicErrorCode`] and nothing else, so there is no
+/// parameter here a driver string could thread through even if this scan were disabled.
+/// The widened `only_error_rs_builds_a_failed_result` (this file, Rule 1) is what keeps a
+/// second failing call site — including `CallToolResult::error`, whose `content` argument
+/// *is* free-form — from ever being built outside that one function. This scan exists for
+/// the case neither of those reaches: a message built by hand and returned through some
+/// other path a future refactor might add, where an error-shaped name is the only signal
+/// available at all.
 #[derive(Default)]
 struct ErrorFormattingScan {
     format_macro: bool,
@@ -173,9 +247,12 @@ impl<'ast> Visit<'ast> for ErrorFormattingScan {
     }
 
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
-        let receiver_is_error_or_source = matches!(node.receiver.as_ref(), syn::Expr::Path(path)
-            if path.path.get_ident().is_some_and(|ident| ident == "error" || ident == "source"));
-        if node.method == "to_string" && receiver_is_error_or_source {
+        let receiver_is_error_like = matches!(node.receiver.as_ref(), syn::Expr::Path(path)
+        if path.path.get_ident().is_some_and(|ident| {
+            let ident = ident.to_string();
+            ERROR_LIKE_BINDING_NAMES.contains(&ident.as_str())
+        }));
+        if node.method == "to_string" && receiver_is_error_like {
             self.to_string_on_error_binding = true;
         }
         syn::visit::visit_expr_method_call(self, node);
@@ -202,8 +279,8 @@ fn no_tool_path_formats_an_error() {
         );
         assert!(
             !scan.to_string_on_error_binding,
-            "{file} calls .to_string() on a binding named `error` or `source`; that is \
-             the shape a leaked driver message would take"
+            "{file} calls .to_string() on a binding named one of {ERROR_LIKE_BINDING_NAMES:?}; \
+             that is the shape a leaked driver message would take"
         );
         assert!(
             !scan.forbidden_interpolation,
@@ -335,7 +412,12 @@ fn no_adapter_driver_or_parser_name_appears_in_src() {
 fn no_tool_description_names_a_dialect_specific_tool() {
     // docs/mcp.md section 1: the selected connection chooses the backend, and adding
     // PostgreSQL must never create a second set of tool names.
-    for tool in WardenServer::tool_router().list_all() {
+    let tools = WardenServer::tool_router().list_all();
+    assert!(
+        !tools.is_empty(),
+        "the tool router returned no tools; the loop below would pass vacuously"
+    );
+    for tool in tools {
         let description = tool.description.as_deref().unwrap_or_default();
         for forbidden in ["mysql_query", "postgres_query"] {
             assert!(
@@ -386,6 +468,31 @@ fn the_scans_detect_the_violations_they_exist_to_catch() {
     assert!(names_word("use sqlx::MySqlPool;", "sqlx"));
     assert!(!names_word("postgresqlx", "sqlx"));
     assert!(!names_word("PgPoolOptions", "PgPool"));
+
+    assert!(calls_call_tool_result_error(
+        r#"fn production() -> CallToolResult { CallToolResult::error(vec![]) }"#
+    ));
+    assert!(!calls_call_tool_result_error(
+        r#"fn production() -> CallToolResult { CallToolResult::structured(v) }"#
+    ));
+
+    // The widened receiver set (Rule 2, finding 2): `err`, `e`, and `cause` must be
+    // caught exactly like `error` and `source` always were, since these are the
+    // ordinary Rust spellings a future edit would reach for without meaning to evade
+    // anything.
+    for binding in ["error", "source", "err", "e", "cause"] {
+        let scan = error_formatting_scan(&format!(
+            "fn production() {{ let {binding} = build(); let _ = {binding}.to_string(); }}"
+        ));
+        assert!(scan.to_string_on_error_binding, "{binding} was not caught");
+    }
+    let scan = error_formatting_scan(
+        "fn production() { let payload = build(); let _ = payload.to_string(); }",
+    );
+    assert!(
+        !scan.to_string_on_error_binding,
+        "an unrelated binding name must not be flagged"
+    );
 
     assert!(
         source_files().iter().any(|path| path.ends_with("error.rs")),
