@@ -32,15 +32,25 @@
 //! precisely the hole ADR-0038 names. Every request is already bounded by
 //! `warden_service::RequestBudget::total`, so the exposure is one budget, not an
 //! unbounded wait. Open question 23 carries the seam to the milestone that needs it.
+//!
+//! # The protocol Warden speaks
+//!
+//! The [`ServerHandler`] impl below advertises [`WARDEN_PROTOCOL_VERSIONS`] and nothing
+//! else, and refuses anything outside it at `initialize` instead of substituting a version
+//! the client never asked for. ADR-0041 records why, and `stdio.rs` is where a session
+//! built on it actually runs.
 
 use std::future::Future;
 use std::sync::Arc;
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::CallToolResult;
+use rmcp::model::{
+    CallToolResult, ErrorData, Implementation, InitializeRequestParams, InitializeResult,
+    ProtocolVersion, ServerCapabilities, ServerInfo,
+};
 use rmcp::service::RequestContext as McpRequestContext;
-use rmcp::{RoleServer, tool, tool_router};
+use rmcp::{RoleServer, ServerHandler, tool, tool_router};
 use warden_core::context::RequestContext;
 use warden_core::error::{PublicError, PublicErrorCode};
 use warden_service::Services;
@@ -68,7 +78,7 @@ impl std::fmt::Debug for WardenServer {
     }
 }
 
-#[tool_router]
+#[tool_router(router = build_tool_router)]
 impl WardenServer {
     /// Wires the tools to the services the composition root assembled.
     #[must_use]
@@ -77,6 +87,18 @@ impl WardenServer {
             services,
             tool_router: Self::tool_router(),
         }
+    }
+
+    /// The five tool descriptors, built without a running server.
+    ///
+    /// `#[tool_router]` emits its constructor with neither a visibility of its own nor a
+    /// doc comment, so `build_tool_router` stays module-private and this is the documented
+    /// public name for it. It is public because `tests/tool_schema.rs` snapshots the
+    /// descriptors from outside the crate: a schema an agent depends on is exactly the
+    /// thing that must not drift unnoticed (`AGENTS.md`, test rules).
+    #[must_use]
+    pub fn tool_router() -> ToolRouter<Self> {
+        Self::build_tool_router()
     }
 
     /// Lists the connections this server can reach, with the dialect each one speaks.
@@ -327,6 +349,73 @@ impl WardenServer {
     }
 }
 
+/// The protocol revisions Warden implements and has tested.
+///
+/// The SDK's default is every version it knows, which for `rmcp` 3.1 is five revisions from
+/// `2024-11-05` onward. Advertising a revision Warden has neither implemented nor tested is
+/// a claim it cannot keep, so this list is narrowed to the two that carry structured tool
+/// output — the mechanism ADR-0040 depends on (`docs/mcp.md` preamble, ADR-0041).
+pub const WARDEN_PROTOCOL_VERSIONS: &[ProtocolVersion] =
+    &[ProtocolVersion::V_2025_11_25, ProtocolVersion::V_2026_07_28];
+
+/// What the client is told before it calls anything.
+pub const SERVER_INSTRUCTIONS: &str = "\
+Warden is a read-only SQL gateway. Start with list_connections to see which databases \
+are reachable and which dialect each one speaks, then search_schema to find relations, \
+then describe_schema for their columns and keys, then query. Every statement is parsed \
+and policy-checked before it runs, results are bounded, and a denial names a code rather \
+than a rule. Warden never returns credentials or connection strings.";
+
+/// The refusal a client gets for a revision Warden does not speak.
+///
+/// The supported list travels in the error's `data` so the client can retry with a version
+/// both sides actually implement, rather than being told only that it failed.
+fn version_error(requested: &ProtocolVersion) -> ErrorData {
+    ErrorData::unsupported_protocol_version(requested.clone(), WARDEN_PROTOCOL_VERSIONS)
+}
+
+#[rmcp::tool_handler(router = self.tool_router)]
+impl ServerHandler for WardenServer {
+    fn get_info(&self) -> ServerInfo {
+        // `InitializeResult` is `#[non_exhaustive]`, so it is built through its constructor
+        // and then filled in rather than written as a literal.
+        let mut info = InitializeResult::new(ServerCapabilities::builder().enable_tools().build());
+        info.protocol_version = ProtocolVersion::V_2026_07_28;
+        info.server_info = Implementation::new("warden", env!("CARGO_PKG_VERSION"));
+        info.instructions = Some(SERVER_INSTRUCTIONS.to_owned());
+        info
+    }
+
+    fn supported_protocol_versions(&self) -> std::borrow::Cow<'static, [ProtocolVersion]> {
+        std::borrow::Cow::Borrowed(WARDEN_PROTOCOL_VERSIONS)
+    }
+
+    /// Refuses a version Warden does not speak instead of silently substituting one.
+    ///
+    /// The SDK's `negotiate_protocol_version` echoes a supported version and otherwise logs
+    /// a `warn!` the client cannot see and returns the server's own default. Milestone 0.5
+    /// measured that: requesting `1999-01-01` produced `2025-11-25` and no error. A client
+    /// that believes it negotiated one revision and got another is exactly the silent
+    /// mismatch a security gateway must not create (ADR-0041).
+    async fn initialize(
+        &self,
+        request: InitializeRequestParams,
+        context: McpRequestContext<RoleServer>,
+    ) -> Result<InitializeResult, ErrorData> {
+        if !WARDEN_PROTOCOL_VERSIONS.contains(&request.protocol_version) {
+            return Err(version_error(&request.protocol_version));
+        }
+        // Copied from the SDK's own default `initialize`: it is what later makes
+        // `RequestContext::client_info()` return the client's name for
+        // `identity::client_name`, and dropping it would blank every audit record's
+        // client field.
+        context.peer.set_peer_info(request.clone());
+        let mut info = self.get_info();
+        info.protocol_version = request.protocol_version;
+        Ok(info)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -547,5 +636,51 @@ mod tests {
                 assert!(!tool.name.contains(dialect), "{}", tool.name);
             }
         }
+    }
+
+    #[test]
+    fn warden_advertises_only_the_versions_it_implements() {
+        // docs/mcp.md's preamble defers this to M12: the SDK default advertises four
+        // revisions Warden has neither implemented nor tested.
+        assert_eq!(
+            WARDEN_PROTOCOL_VERSIONS,
+            [ProtocolVersion::V_2025_11_25, ProtocolVersion::V_2026_07_28]
+        );
+        let server = WardenServer::new(testing::services());
+        assert_eq!(
+            ServerHandler::supported_protocol_versions(&server).as_ref(),
+            WARDEN_PROTOCOL_VERSIONS
+        );
+    }
+
+    #[test]
+    fn the_advertised_default_is_the_newest_version_warden_implements() {
+        let server = WardenServer::new(testing::services());
+        let info = ServerHandler::get_info(&server);
+        assert_eq!(info.protocol_version, ProtocolVersion::V_2026_07_28);
+        assert!(info.capabilities.tools.is_some());
+        assert_eq!(info.server_info.name, "warden");
+        assert!(
+            info.instructions
+                .is_some_and(|text| text.contains("list_connections"))
+        );
+    }
+
+    #[test]
+    fn a_version_warden_does_not_speak_is_an_error_and_not_a_substitution() {
+        // The SDK's negotiate_protocol_version has no error hook and silently falls back;
+        // M0.5 measured that (docs/mcp.md preamble). Overriding `initialize` is the hook,
+        // and it is what rmcp itself already does for per-request version validation.
+        let rejected = version_error(&ProtocolVersion::V_2024_11_05);
+        assert_eq!(
+            rejected.code,
+            rmcp::model::ErrorCode::UNSUPPORTED_PROTOCOL_VERSION
+        );
+        let data = rejected.data.unwrap();
+        assert_eq!(data["requested"], serde_json::json!("2024-11-05"));
+        assert_eq!(
+            data["supported"],
+            serde_json::json!(["2025-11-25", "2026-07-28"])
+        );
     }
 }
