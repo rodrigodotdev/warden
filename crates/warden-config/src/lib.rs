@@ -38,3 +38,25 @@ pub use model::{
     AuditEntry, AuditMode, Config, ConnectionEntry, PolicyProfile, PoolProfile, RedactionEntry,
     RedactionStrategyEntry, SUPPORTED_VERSION, TlsEntry,
 };
+pub use resolve::{ResolvedConfig, ResolvedConnection, ResolvedPolicy};
+pub use secrets::SecretSource;
+
+use std::path::Path;
+
+/// Reads, parses, and resolves a configuration file.
+///
+/// The one entry point the composition root needs. Errors name the file, never its
+/// contents: a configuration file holds no secret, but the environment and files it
+/// points at do, and a reader should not have to reason about which is which.
+///
+/// # Errors
+///
+/// Returns [`ConfigError`] when the file cannot be read, does not parse, declares an
+/// unsupported version, or fails any rule in `docs/operations.md` section 3.2.
+pub fn load_from_path(path: &Path) -> Result<ResolvedConfig, ConfigError> {
+    let text = std::fs::read_to_string(path).map_err(|error| ConfigError::Unreadable {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    Config::from_toml_str(&text)?.resolve()
+}
