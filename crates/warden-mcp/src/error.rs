@@ -21,15 +21,18 @@
 //! block costs nothing and helps a client that reads only text.
 //!
 //! `failure` and `public_message` have no caller yet: Task 5 wires them into the five
-//! `#[tool]` methods. `dead_code` is a plain rustc lint, not one of `AGENTS.md`'s
-//! mechanically enforced rules, so silencing it here for code this task's own tests
-//! already exercise is the narrow, reviewable exception rather than a rule bypass.
-#![allow(dead_code)]
+//! `#[tool]` methods. Each carries its own `#[expect(dead_code, ..)]` rather than a
+//! module-wide allow, so the moment Task 5 wires one in, the unfulfilled expectation
+//! fails the `-D warnings` gate and forces its removal.
 
 use rmcp::model::CallToolResult;
 use warden_core::error::PublicErrorCode;
 
 /// Builds the failed result for one public code.
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "consumed by Task 5's #[tool] methods")
+)]
 pub(crate) fn failure(code: PublicErrorCode) -> CallToolResult {
     CallToolResult::structured_error(serde_json::json!({
         "error": { "code": code.as_str(), "message": public_message(code) }
@@ -40,6 +43,10 @@ pub(crate) fn failure(code: PublicErrorCode) -> CallToolResult {
 ///
 /// The match is exhaustive with no wildcard: a new code must not compile until someone has
 /// written the sentence an agent will read (ADR-0021).
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "consumed by Task 5's #[tool] methods via failure")
+)]
 pub(crate) fn public_message(code: PublicErrorCode) -> &'static str {
     match code {
         PublicErrorCode::ConnectionNotFound => {
