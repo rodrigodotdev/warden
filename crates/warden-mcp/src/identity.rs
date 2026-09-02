@@ -9,10 +9,8 @@
 //! validated by the newtype, falling back to [`UNKNOWN_CLIENT`] rather than failing an
 //! otherwise valid request.
 //!
-//! Every item below has no caller yet: Task 6's `ServerHandler` invokes `for_request`
-//! per call. Each carries its own `#[expect(dead_code, ..)]` rather than a module-wide
-//! allow, so the moment Task 6 wires one in, the unfulfilled expectation fails the
-//! `-D warnings` gate and forces its removal.
+//! [`for_request`] is called by every one of `server.rs`'s five `#[tool]` methods, and
+//! everything else here exists to serve it.
 
 use rmcp::service::{RequestContext as RmcpRequestContext, RoleServer};
 use uuid::Uuid;
@@ -20,33 +18,15 @@ use warden_core::context::{ClientName, PrincipalId, RequestContext, RequestId};
 use warden_core::error::PublicErrorCode;
 
 /// stdio's one fixed principal. No tool input can influence it (`docs/mcp.md` section 8).
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed by Task 6's ServerHandler via for_request"
-    )
-)]
 pub(crate) const STDIO_PRINCIPAL: &str = "local-stdio";
 
 /// The recorded client name when the peer's own name is absent or invalid.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed by Task 6's ServerHandler via for_request/client_name"
-    )
-)]
 pub(crate) const UNKNOWN_CLIENT: &str = "unknown-client";
 
 /// Builds this call's identity from the transport's context.
 ///
 /// The request id, principal, and client name are all constructed here rather than
 /// read from anything the agent controls (`docs/mcp.md` section 8).
-#[expect(
-    dead_code,
-    reason = "consumed by Task 6's ServerHandler; no test constructs an rmcp RequestContext yet"
-)]
 pub(crate) fn for_request(
     context: &RmcpRequestContext<RoleServer>,
 ) -> Result<RequestContext, PublicErrorCode> {
@@ -65,13 +45,6 @@ pub(crate) fn for_request(
 /// fallible, so this returns `internal_error` on the structurally impossible failure
 /// rather than calling `expect` on the request path (`AGENTS.md`). The test below is
 /// what keeps that branch unreachable in practice.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed by Task 6's ServerHandler via for_request"
-    )
-)]
 pub(crate) fn generate_request_id() -> Result<RequestId, PublicErrorCode> {
     Uuid::new_v4()
         .to_string()
@@ -88,13 +61,6 @@ pub(crate) fn generate_request_id() -> Result<RequestId, PublicErrorCode> {
 /// holding), so this returns `Result` rather than looping or recursing to manufacture a
 /// value with no failure path — the same `internal_error`-on-impossible-failure shape
 /// [`generate_request_id`] uses, and composes into [`for_request`] with one `?`.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed by Task 6's ServerHandler via for_request"
-    )
-)]
 fn client_name(name: Option<&str>) -> Result<ClientName, PublicErrorCode> {
     match name.and_then(|value| value.parse::<ClientName>().ok()) {
         Some(client) => Ok(client),

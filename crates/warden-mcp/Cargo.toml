@@ -31,6 +31,12 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+# Ports and policy are a *dev* dependency only. `docs/architecture.md` section 3 keeps
+# the production edge at core + service + rmcp; the fakes in `src/testing.rs` have to
+# implement the port traits and build a real `PolicyEngine`, and `tests/architecture.rs`
+# excludes dev-dependency edges from the graph it enforces for exactly this kind of case.
+warden-ports = { workspace = true }
+warden-policy = { workspace = true }
 tokio = { workspace = true, features = [
   "macros",
   "rt-multi-thread",

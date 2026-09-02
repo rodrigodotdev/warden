@@ -3078,6 +3078,8 @@ dependencies = [
  "tracing",
  "uuid",
  "warden-core",
+ "warden-policy",
+ "warden-ports",
  "warden-service",
 ]
 
