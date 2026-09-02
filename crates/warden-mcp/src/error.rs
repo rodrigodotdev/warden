@@ -20,10 +20,13 @@
 //! code and a fixed sentence — no database content at all — so repeating it in a text
 //! block costs nothing and helps a client that reads only text.
 //!
-//! `failure` and `public_message` have no caller yet: Task 5 wires them into the five
-//! `#[tool]` methods. Each carries its own `#[expect(dead_code, ..)]` rather than a
-//! module-wide allow, so the moment Task 5 wires one in, the unfulfilled expectation
-//! fails the `-D warnings` gate and forces its removal.
+//! `failure` and `public_message` have no live caller yet. `output.rs`'s
+//! `ToolResponse::into_result` already calls `failure` in its serialization-failure
+//! branch, but `ToolResponse` itself is not wired into any tool method until Task 5, so
+//! the call is not yet reachable either. Each function below carries its own
+//! `#[expect(dead_code, ..)]` rather than a module-wide allow, so the moment Task 5 wires
+//! one in, the unfulfilled expectation fails the `-D warnings` gate and forces its
+//! removal.
 
 use rmcp::model::CallToolResult;
 use warden_core::error::PublicErrorCode;
@@ -31,7 +34,10 @@ use warden_core::error::PublicErrorCode;
 /// Builds the failed result for one public code.
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "consumed by Task 5's #[tool] methods")
+    expect(
+        dead_code,
+        reason = "reachable once Task 5 wires ToolResponse into a #[tool] method"
+    )
 )]
 pub(crate) fn failure(code: PublicErrorCode) -> CallToolResult {
     CallToolResult::structured_error(serde_json::json!({
@@ -45,7 +51,10 @@ pub(crate) fn failure(code: PublicErrorCode) -> CallToolResult {
 /// written the sentence an agent will read (ADR-0021).
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "consumed by Task 5's #[tool] methods via failure")
+    expect(
+        dead_code,
+        reason = "reachable once Task 5 wires ToolResponse into a #[tool] method, via failure"
+    )
 )]
 pub(crate) fn public_message(code: PublicErrorCode) -> &'static str {
     match code {

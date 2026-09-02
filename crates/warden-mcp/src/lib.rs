@@ -31,7 +31,13 @@
 mod error;
 mod identity;
 mod input;
+mod output;
 
 pub use input::{
     DEFAULT_SEARCH_LIMIT, DescribeInput, ExplainInput, ParameterInput, QueryInput, SearchInput,
+};
+pub use output::{
+    CellValue, ColumnDetail, ColumnSummary, ConnectionSummary, ConnectionsOutput, DescribeOutput,
+    ExplainOutput, ForeignKeySummary, IndexSummary, MatchSummary, PlanDocument, PlanSummaryOutput,
+    QueryOutput, SchemaSummary, SearchOutput, StatsSummary, TableSummary,
 };
