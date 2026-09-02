@@ -3066,6 +3066,20 @@ dependencies = [
 [[package]]
 name = "warden-mcp"
 version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "rmcp",
+ "serde",
+ "serde_json",
+ "syn 2.0.119",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "tracing",
+ "uuid",
+ "warden-core",
+ "warden-service",
+]
 
 [[package]]
 name = "warden-mysql"

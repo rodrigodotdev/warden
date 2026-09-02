@@ -12,3 +12,29 @@ publish = false
 workspace = true
 
 [dependencies]
+# docs/architecture.md section 3: mcp -> core + service + rmcp. Never an adapter,
+# never sqlx, never sqlparser. `warden-service` re-exports the two `warden-ports`
+# types this crate names, so it needs no direct port dependency either.
+warden-core = { workspace = true }
+warden-service = { workspace = true }
+rmcp = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+# `rt` for the per-request task (docs/architecture.md section 8, ADR-0038); `time` is
+# what `warden-service` deadlines are measured on. No `macros`: the runtime is started
+# by the binary, not here.
+tokio = { workspace = true, features = ["rt", "time"] }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+# Request ids are generated, never taken from the agent-controlled JSON-RPC id.
+uuid = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = [
+  "macros",
+  "rt-multi-thread",
+  "test-util",
+] }
+syn = { workspace = true }
+proc-macro2 = { workspace = true }
