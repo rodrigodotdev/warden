@@ -32,6 +32,10 @@ mod error;
 mod identity;
 mod input;
 mod output;
+mod server;
+
+#[cfg(test)]
+mod testing;
 
 pub use input::{
     DEFAULT_SEARCH_LIMIT, DescribeInput, ExplainInput, ParameterInput, QueryInput, SearchInput,
@@ -42,3 +46,4 @@ pub use output::{
     QueryOutput, SchemaSummary, SearchOutput, StatsSummary, TableSummary, WireDialect,
     WireMatchReason, WireTableKind,
 };
+pub use server::WardenServer;

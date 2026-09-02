@@ -135,13 +135,6 @@ impl From<MatchReason> for WireMatchReason {
 ///
 /// A summary is read by the agent on every call; six characters of correct English is
 /// worth a shared helper instead of six inline `if`s that can drift.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "reachable once Task 5 wires ToolResponse into a #[tool] method"
-    )
-)]
 fn count_phrase(count: usize, singular: &str, plural: &str) -> String {
     if count == 1 {
         format!("1 {singular}")
@@ -155,17 +148,9 @@ fn count_phrase(count: usize, singular: &str, plural: &str) -> String {
 /// `summary` is the one line that reaches `content`; `into_result` is the one place that
 /// builds the result, so no `#[tool]` method can accidentally duplicate a row into text.
 ///
-/// Every impl below satisfies this trait already, but nothing calls `into_result` or
-/// `summary` outside this module's own tests yet: Task 5 wires the five `#[tool]` methods
-/// to it. The dead-code guard is on the trait alone, not each impl, because an unused
-/// trait already carries every method that only exists to satisfy it.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "consumed by Task 5's #[tool] methods via ToolResponse::into_result"
-    )
-)]
+/// All five of `server.rs`'s runners return through `into_result`, and none of them
+/// builds a [`CallToolResult`] itself — which is what keeps the duplicated-document
+/// leak ADR-0040 forbids out of every tool at once rather than one tool at a time.
 pub(crate) trait ToolResponse: serde::Serialize {
     /// One line stating counts and flags. Never a value (ADR-0040).
     fn summary(&self) -> String;
