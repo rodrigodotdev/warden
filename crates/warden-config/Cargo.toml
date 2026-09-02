@@ -20,3 +20,8 @@ serde = { workspace = true }
 toml = { workspace = true }
 secrecy = { workspace = true }
 thiserror = { workspace = true }
+
+[dev-dependencies]
+# Mechanical guards inspect Rust syntax rather than text, so comments, literals, and
+# formatting cannot bypass or falsely trigger them.
+syn = { workspace = true }

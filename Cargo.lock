@@ -3044,6 +3044,7 @@ version = "0.1.0"
 dependencies = [
  "secrecy",
  "serde",
+ "syn 2.0.119",
  "thiserror",
  "toml",
  "warden-core",
