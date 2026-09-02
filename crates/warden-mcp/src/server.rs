@@ -17,6 +17,12 @@
 //! contain a row value, and Milestone 13 owns the payload-free hook that records the
 //! location instead.
 //!
+//! What the spawn buys is containment, not a complete record of the request that
+//! panicked. ADR-0038's consequences say so directly: it keeps an ordinary request on
+//! the path that writes its outcome *and* contains a panic to the one request that
+//! raised it, but a task that panics still leaves its audit attempt without a terminal
+//! outcome. Closing that last gap is not this milestone's.
+//!
 //! # Client cancellation is not wired through, deliberately
 //!
 //! rmcp hands each call a `CancellationToken` that fires on a `notifications/cancelled`,
@@ -450,19 +456,41 @@ mod tests {
         // Decision 8: each request runs in its own task, so a panic is a JoinError here
         // rather than the end of the process — which for stdio would be the end of the
         // session (docs/security.md section 14).
-        let server = WardenServer::new(testing::services_from(testing::FakeParts::panicking()));
+        let server = WardenServer::new(testing::services_with_a_panicking_connection());
         let result = server
-            .run_query(identity(), query_input("production-db", "SELECT 1"))
+            .run_query(identity(), query_input(testing::CONNECTION, "SELECT 1"))
             .await;
         assert_eq!(
-            result.structured_content.unwrap()["error"]["code"],
+            result.structured_content.clone().unwrap()["error"]["code"],
             serde_json::json!("internal_error")
         );
-        // Still alive, still answering.
-        let server = WardenServer::new(testing::services());
+
+        // The payload is never read, so what the panicking adapter put in it reaches no
+        // agent. A payload can hold a row value, which is why Decision 8 forbids reading
+        // one and Milestone 13 records the location instead; this is what would catch a
+        // `run_in_task` that starts formatting the `JoinError` it caught.
+        let rendered = serde_json::to_string(&result).unwrap();
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+
+        // Containment is a claim about *this* server: the same instance still serves the
+        // sibling connection whose adapter did not panic...
+        let healthy = server
+            .run_query(
+                identity(),
+                query_input(testing::HEALTHY_CONNECTION, "SELECT id FROM orders"),
+            )
+            .await;
+        assert_eq!(healthy.is_error, Some(false));
+        assert!(healthy.structured_content.unwrap()["rows"].is_array());
+
+        // ...and still answers on the connection that panicked, rather than hanging on a
+        // permit the lost task never released.
+        let again = server
+            .run_query(identity(), query_input(testing::CONNECTION, "SELECT 1"))
+            .await;
         assert_eq!(
-            server.run_list_connections(identity()).await.is_error,
-            Some(false)
+            again.structured_content.unwrap()["error"]["code"],
+            serde_json::json!("internal_error")
         );
     }
 
