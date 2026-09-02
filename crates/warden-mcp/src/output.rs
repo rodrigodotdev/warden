@@ -22,6 +22,7 @@ use std::fmt;
 use rmcp::model::{CallToolResult, ContentBlock};
 use rmcp::schemars::JsonSchema;
 use warden_core::connection::ConnectionMetadata;
+use warden_core::dialect::Dialect;
 use warden_core::explain::{PlanSummary, QueryPlan};
 use warden_core::result::{QueryStats, ResultColumn, ResultSet, ResultValue};
 use warden_core::schema::{
@@ -29,29 +30,104 @@ use warden_core::schema::{
     SchemaSearchResult, Table, TableKind,
 };
 
-/// Mirrors [`TableKind`]'s own `Serialize` spelling by hand.
+/// The dialect, as a closed wire enum rather than an open `String`.
 ///
-/// The core enum has no `Display`; only a derived `#[serde(rename_all = "snake_case")]`.
-/// The match is exhaustive and unaliased so a new variant fails to compile here rather
-/// than silently falling back to a stale spelling.
-fn table_kind_str(kind: TableKind) -> &'static str {
-    match kind {
-        TableKind::Table => "table",
-        TableKind::View => "view",
-        TableKind::MaterializedView => "materialized_view",
+/// [`Dialect`] is a closed set, so the derived schema can state the two legal values
+/// (`docs/mcp.md` section 1.2 treats the derived schema as a verifiable contract, not
+/// prose) instead of an unconstrained string a client cannot validate against. The
+/// variant names are chosen so `#[serde(rename_all = "snake_case")]` reproduces
+/// `Dialect`'s own `#[serde(rename_all = "lowercase")]` spelling exactly: `Mysql` has no
+/// internal case transition, so snake_case lowers it to `"mysql"`, matching
+/// `Dialect::as_str()`; likewise `Postgresql` to `"postgresql"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(crate = "rmcp::schemars")]
+pub enum WireDialect {
+    /// MySQL. Placeholders are positional `?`.
+    Mysql,
+    /// PostgreSQL. Placeholders are numbered `$1`.
+    Postgresql,
+}
+
+impl WireDialect {
+    /// The same spelling this type serializes as, for use inside a `summary()` string.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Mysql => "mysql",
+            Self::Postgresql => "postgresql",
+        }
     }
 }
 
-/// Mirrors [`MatchReason`]'s own `Serialize` spelling by hand, for the same reason
-/// [`table_kind_str`] does.
-fn match_reason_str(reason: MatchReason) -> &'static str {
-    match reason {
-        MatchReason::ExactTable => "exact_table",
-        MatchReason::TablePrefix => "table_prefix",
-        MatchReason::TableSubstring => "table_substring",
-        MatchReason::ColumnMatch => "column_match",
-        MatchReason::SchemaName => "schema_name",
-        MatchReason::Description => "description",
+impl From<Dialect> for WireDialect {
+    fn from(dialect: Dialect) -> Self {
+        match dialect {
+            Dialect::MySql => Self::Mysql,
+            Dialect::PostgreSql => Self::Postgresql,
+        }
+    }
+}
+
+/// What kind of relation a discovered object is, as a closed wire enum.
+///
+/// Mirrors [`TableKind`]'s variant names exactly, so its own
+/// `#[serde(rename_all = "snake_case")]` reproduces `TableKind`'s spelling by
+/// construction rather than by a hand-copied match arm that could drift from it. The
+/// core enum has no `Display` to delegate to instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(crate = "rmcp::schemars")]
+pub enum WireTableKind {
+    /// A base table.
+    Table,
+    /// A view.
+    View,
+    /// A materialized view.
+    MaterializedView,
+}
+
+impl From<TableKind> for WireTableKind {
+    fn from(kind: TableKind) -> Self {
+        match kind {
+            TableKind::Table => Self::Table,
+            TableKind::View => Self::View,
+            TableKind::MaterializedView => Self::MaterializedView,
+        }
+    }
+}
+
+/// Why a search hit ranked where it did, as a closed wire enum.
+///
+/// Mirrors [`MatchReason`]'s variant names exactly, for the same reason
+/// [`WireTableKind`] mirrors [`TableKind`]'s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+#[schemars(crate = "rmcp::schemars")]
+pub enum WireMatchReason {
+    /// The table name matched exactly.
+    ExactTable,
+    /// The table name started with the term.
+    TablePrefix,
+    /// The table name contained the term.
+    TableSubstring,
+    /// A column name matched.
+    ColumnMatch,
+    /// The schema name matched.
+    SchemaName,
+    /// A configured human description matched.
+    Description,
+}
+
+impl From<MatchReason> for WireMatchReason {
+    fn from(reason: MatchReason) -> Self {
+        match reason {
+            MatchReason::ExactTable => Self::ExactTable,
+            MatchReason::TablePrefix => Self::TablePrefix,
+            MatchReason::TableSubstring => Self::TableSubstring,
+            MatchReason::ColumnMatch => Self::ColumnMatch,
+            MatchReason::SchemaName => Self::SchemaName,
+            MatchReason::Description => Self::Description,
+        }
     }
 }
 
@@ -139,9 +215,14 @@ pub struct ConnectionsOutput {
 pub struct ConnectionSummary {
     /// The name an agent passes to every tool.
     pub name: String,
-    /// The dialect, `"mysql"` or `"postgresql"`; determines placeholder syntax.
-    pub dialect: String,
-    /// The deployment environment, e.g. `"production"` or an operator-defined name.
+    /// The dialect; determines placeholder syntax.
+    pub dialect: WireDialect,
+    /// The deployment environment, e.g. `"production"`.
+    ///
+    /// A `String`, not a closed wire enum like `dialect`: the core
+    /// [`warden_core::connection::Environment`] it comes from has an open
+    /// `Other(String)` variant for operator-defined environments, so no closed schema
+    /// could represent every legal value.
     pub environment: String,
     /// The default database or catalog, for the agent's orientation.
     pub database: String,
@@ -151,7 +232,7 @@ impl From<&ConnectionMetadata> for ConnectionSummary {
     fn from(metadata: &ConnectionMetadata) -> Self {
         Self {
             name: metadata.name.to_string(),
-            dialect: metadata.dialect.as_str().to_owned(),
+            dialect: WireDialect::from(metadata.dialect),
             environment: metadata.environment.to_string(),
             database: metadata.database.clone(),
         }
@@ -348,7 +429,7 @@ impl ToolResponse for QueryOutput {
 #[schemars(crate = "rmcp::schemars")]
 pub struct ExplainOutput {
     /// The dialect that produced the plan.
-    pub dialect: String,
+    pub dialect: WireDialect,
     /// The comparable summary.
     pub summary: PlanSummaryOutput,
     /// The engine's own plan document, passed through unchanged.
@@ -404,7 +485,7 @@ impl JsonSchema for PlanDocument {
 impl From<&QueryPlan> for ExplainOutput {
     fn from(plan: &QueryPlan) -> Self {
         Self {
-            dialect: plan.dialect.as_str().to_owned(),
+            dialect: WireDialect::from(plan.dialect),
             summary: PlanSummaryOutput::from(&plan.summary),
             plan: PlanDocument(plan.plan.clone()),
         }
@@ -425,8 +506,8 @@ impl ExplainOutput {
 impl ToolResponse for ExplainOutput {
     fn summary(&self) -> String {
         match self.summary_estimated_rows() {
-            Some(rows) => format!("{} plan, estimated rows: {rows}", self.dialect),
-            None => format!("{} plan", self.dialect),
+            Some(rows) => format!("{} plan, estimated rows: {rows}", self.dialect.as_str()),
+            None => format!("{} plan", self.dialect.as_str()),
         }
     }
 }
@@ -453,10 +534,11 @@ pub struct MatchSummary {
     pub schema: String,
     /// The object's name.
     pub table: String,
-    /// What kind of relation it is: `"table"`, `"view"`, or `"materialized_view"`.
-    pub kind: String,
-    /// Why it matched.
-    pub reason: String,
+    /// What kind of relation it is.
+    pub kind: WireTableKind,
+    /// Why it matched: `"exact_table"`, `"table_prefix"`, `"table_substring"`,
+    /// `"column_match"`, `"schema_name"`, or `"description"`, in ranking order.
+    pub reason: WireMatchReason,
 }
 
 impl From<&SchemaMatch> for MatchSummary {
@@ -464,8 +546,8 @@ impl From<&SchemaMatch> for MatchSummary {
         Self {
             schema: hit.schema.clone(),
             table: hit.table.clone(),
-            kind: table_kind_str(hit.kind).to_owned(),
-            reason: match_reason_str(hit.reason).to_owned(),
+            kind: WireTableKind::from(hit.kind),
+            reason: WireMatchReason::from(hit.reason),
         }
     }
 }
@@ -517,8 +599,8 @@ pub struct SchemaSummary {
 pub struct TableSummary {
     /// The relation name.
     pub name: String,
-    /// What kind of relation it is: `"table"`, `"view"`, or `"materialized_view"`.
-    pub kind: String,
+    /// What kind of relation it is.
+    pub kind: WireTableKind,
     /// Its columns, in ordinal order.
     pub columns: Vec<ColumnDetail>,
     /// Primary-key column names, in key order.
@@ -621,7 +703,12 @@ impl From<&Table> for TableSummary {
     fn from(table: &Table) -> Self {
         Self {
             name: table.name.clone(),
-            kind: table_kind_str(table.kind).to_owned(),
+            // `table.schema` is deliberately dropped: both inspectors set it from the
+            // same variable they group relations by (`warden-mysql/src/inspector.rs`'s
+            // `describe_one` and `warden-postgres/src/inspector.rs`'s equivalent), so it
+            // is invariantly equal to the containing `SchemaSummary.name` and repeating
+            // it here would be redundant wire noise.
+            kind: WireTableKind::from(table.kind),
             columns: table.columns.iter().map(ColumnDetail::from).collect(),
             primary_key: table.primary_key.clone(),
             foreign_keys: table
@@ -730,41 +817,78 @@ mod tests {
         }
     }
 
+    /// The `summary()` table's other documented example: `"postgresql plan, estimated
+    /// rows: 1200"`.
+    fn postgres_plan() -> QueryPlan {
+        QueryPlan {
+            dialect: Dialect::PostgreSql,
+            summary: PlanSummary {
+                estimated_rows: Some(1200),
+            },
+            plan: serde_json::json!({ "Node Type": "Seq Scan" }),
+        }
+    }
+
     fn description() -> SchemaDescription {
         SchemaDescription {
             schemas: vec![warden_core::schema::Schema {
                 name: "app".to_owned(),
-                tables: vec![Table {
-                    schema: "app".to_owned(),
-                    name: "orders".to_owned(),
-                    kind: TableKind::Table,
-                    columns: vec![ColumnDescription {
-                        name: "id".to_owned(),
-                        database_type: "bigint".to_owned(),
-                        nullable: false,
-                        default: None,
-                        comment: None,
-                    }],
-                    primary_key: vec!["id".to_owned()],
-                    foreign_keys: Vec::new(),
-                    indexes: Vec::new(),
-                    truncated: false,
-                }],
+                tables: vec![
+                    Table {
+                        schema: "app".to_owned(),
+                        name: "orders".to_owned(),
+                        kind: TableKind::Table,
+                        columns: vec![ColumnDescription {
+                            name: "id".to_owned(),
+                            database_type: "bigint".to_owned(),
+                            nullable: false,
+                            default: None,
+                            comment: None,
+                        }],
+                        primary_key: vec!["id".to_owned()],
+                        foreign_keys: Vec::new(),
+                        indexes: Vec::new(),
+                        truncated: false,
+                    },
+                    // A second table so `DescribeOutput::summary` exercises the plural
+                    // "tables" path, not only "1 table".
+                    Table {
+                        schema: "app".to_owned(),
+                        name: "order_items".to_owned(),
+                        kind: TableKind::Table,
+                        columns: Vec::new(),
+                        primary_key: Vec::new(),
+                        foreign_keys: Vec::new(),
+                        indexes: Vec::new(),
+                        truncated: false,
+                    },
+                ],
             }],
         }
     }
 
     fn truncated_search() -> SchemaSearchResult {
         SchemaSearchResult {
-            matches: vec![SchemaMatch {
-                schema: "app".to_owned(),
-                table: "orders".to_owned(),
-                kind: TableKind::Table,
-                // MatchReason::ExactTable is the only reachable variant from a real
-                // search; its own Serialize spells this "exact_table"
-                // (`crates/warden-core/src/schema.rs`), which `match_reason_str` mirrors.
-                reason: MatchReason::ExactTable,
-            }],
+            matches: vec![
+                SchemaMatch {
+                    schema: "app".to_owned(),
+                    table: "orders".to_owned(),
+                    kind: TableKind::Table,
+                    // MatchReason::ExactTable is the ranking-order-first variant; its own
+                    // Serialize spells this "exact_table"
+                    // (`crates/warden-core/src/schema.rs`), which `WireMatchReason`
+                    // mirrors by using the same variant name.
+                    reason: MatchReason::ExactTable,
+                },
+                // A second hit so `SearchOutput::summary` exercises the plural
+                // "matches" path, not only "1 match".
+                SchemaMatch {
+                    schema: "app".to_owned(),
+                    table: "order_items".to_owned(),
+                    kind: TableKind::Table,
+                    reason: MatchReason::TablePrefix,
+                },
+            ],
             truncated: true,
         }
     }
@@ -899,5 +1023,62 @@ mod tests {
         ] {
             assert_eq!(schema["type"], serde_json::json!("object"), "{schema}");
         }
+    }
+
+    #[test]
+    fn count_phrase_uses_the_singular_only_for_exactly_one() {
+        // The mechanism every summary's pluralization shares: zero and two both take
+        // the plural form, and only one takes the singular. Exercised once here for
+        // every caller instead of per noun, since it is the same code path regardless
+        // of which words a call site supplies.
+        assert_eq!(count_phrase(0, "row", "rows"), "0 rows");
+        assert_eq!(count_phrase(1, "row", "rows"), "1 row");
+        assert_eq!(count_phrase(2, "row", "rows"), "2 rows");
+    }
+
+    #[test]
+    fn cell_value_debug_never_prints_a_value() {
+        // Mirrors crate::input::ParameterInput's own test for the same hand-written
+        // Debug impl (input.rs's `parameter_input_debug_never_prints_a_value`): the
+        // redaction is a deliberate deviation from "every output type derives Debug",
+        // and nothing else in this module would fail if someone replaced it with
+        // `#[derive(Debug)]`.
+        let secret = to_cell(&ResultValue::String("hunter2".to_owned()));
+        let rendered = format!("{secret:?}");
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        assert_eq!(rendered, "String(<redacted 7 bytes>)");
+    }
+
+    #[test]
+    fn every_summary_matches_the_documented_format() {
+        // The brief's own table (task-4-brief.md, Step 3), pinned exactly. A substring
+        // check like `contains("1 row")` still passes if a summary starts naming a
+        // column or a connection; only the full string actually constrains "counts and
+        // flags, never a value".
+        assert_eq!(
+            ConnectionsOutput::from_metadata(&[metadata()]).summary(),
+            "1 connection"
+        );
+        assert_eq!(
+            ConnectionsOutput::from_metadata(&[metadata(), metadata()]).summary(),
+            "2 connections"
+        );
+        assert_eq!(
+            QueryOutput::from(&result_set_with_secret()).summary(),
+            "1 row, 2 columns, truncated: false, 41 bytes, 12 ms"
+        );
+        assert_eq!(
+            ExplainOutput::from(&postgres_plan()).summary(),
+            "postgresql plan, estimated rows: 1200"
+        );
+        assert_eq!(ExplainOutput::from(&mysql_plan()).summary(), "mysql plan");
+        assert_eq!(
+            SearchOutput::from(&truncated_search()).summary(),
+            "2 matches, truncated: true"
+        );
+        assert_eq!(
+            DescribeOutput::from(&description()).summary(),
+            "1 schema, 2 tables"
+        );
     }
 }

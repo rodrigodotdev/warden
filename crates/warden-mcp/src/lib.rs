@@ -39,5 +39,6 @@ pub use input::{
 pub use output::{
     CellValue, ColumnDetail, ColumnSummary, ConnectionSummary, ConnectionsOutput, DescribeOutput,
     ExplainOutput, ForeignKeySummary, IndexSummary, MatchSummary, PlanDocument, PlanSummaryOutput,
-    QueryOutput, SchemaSummary, SearchOutput, StatsSummary, TableSummary,
+    QueryOutput, SchemaSummary, SearchOutput, StatsSummary, TableSummary, WireDialect,
+    WireMatchReason, WireTableKind,
 };
