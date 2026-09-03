@@ -38,7 +38,10 @@
 //! under the limits carried by the `AuthorizedQuery` this crate authorized
 //! (`docs/architecture.md` section 8, step 8). It does not sanitize errors for the
 //! wire either; it returns typed errors whose [`warden_core::error::PublicError`]
-//! code Milestone 12 maps at the MCP boundary.
+//! code `crates/warden-mcp/src/error.rs` turns into a `CallToolResult` at the MCP
+//! boundary. That module is the only one in `warden-mcp` that builds a failed result,
+//! and it takes a code rather than a message, so nothing this crate returns can carry a
+//! driver string across (`docs/security.md` section 10).
 
 use std::fmt;
 use std::sync::Arc;

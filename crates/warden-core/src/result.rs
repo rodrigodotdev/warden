@@ -382,8 +382,11 @@ pub(crate) fn json_value_bytes(document: &serde_json::Value) -> usize {
 ///
 /// Most MCP clients are JavaScript and would silently round a larger integer, and a
 /// silently wrong `bigint` is unacceptable in an investigation tool
-/// (`docs/data-model.md` section 8.1, rule 6). Milestone 12 must declare the
-/// affected fields as `["integer", "string"]` in the tool output schema.
+/// (`docs/data-model.md` section 8.1, rule 6). `warden_mcp::CellValue` declares this in
+/// the tool output schema, listing `"integer"` and `"string"` among the types a cell may
+/// take. Its `JsonSchema` impl is hand-written for exactly this reason: no Rust type
+/// expresses "an integer outside ±2^53 arrives as a decimal string", so a derived schema
+/// would claim `integer` alone and be wrong for the values that matter most.
 impl Serialize for ResultValue {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         match self {

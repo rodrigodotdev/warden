@@ -163,8 +163,8 @@ the one a release artifact is built from, so a notice copied into a builder stag
 discarded with it does not count — copies either `LICENSES` or that exact notice path
 to `/opt/warden/LICENSES`. A destination merely named `LICENSES`, an unrelated file
 under `LICENSES/`, and a non-normalized source such as `./LICENSES` all fail.
-Milestone 12 packaging must copy that directory to that destination in each release
-artifact.
+Milestone 12 added no packaging, so no build file exercises that rule yet; section 12.5
+carries the obligation for whichever milestone adds the first one.
 
 > **PENDING:** the project license is not selected, which blocks the `deny.toml`
 > license allowlist. This is a product choice between Apache-2.0, with its patent
@@ -202,15 +202,14 @@ max_result_bytes = 262144
 max_concurrent_queries = 3
 allow_locking_reads = false
 allow_unknown_functions = false
+schemas = ["app"]
+allow_tables = ["app.orders", "app.customers", "app.invoices"]
+deny_tables = ["app.audit_log"]
 
 [policies.production.agent_pool]
 max_connections = 5
 min_connections = 0
 acquire_timeout = "3s"
-statement_cache_capacity = 0
-# Only PostgreSQL needs `persistent_statements`; the MySQL driver closes each
-# statement after execution. The adapters diverge; see section 4.
-persistent_statements = false
 
 [policies.production.control_pool]
 max_connections = 2
@@ -224,6 +223,25 @@ columns = ["*.password", "*.password_hash", "*.access_token", "*.refresh_token",
 mode = "fingerprint"
 ```
 
+This is the file Warden parses. `crates/warden-config/tests/fixtures/example.toml` is a
+near-copy of it that the crate's own tests read back, and a separate test asserts that the
+two keys named below are refused. Two things about the example are worth stating rather
+than inferring.
+
+**`statement_cache_capacity` and `persistent_statements` are not configuration keys.**
+Earlier revisions of this example showed both under `agent_pool`. ADR-0025 owns both
+values — the agent pool disables statement caching, and PostgreSQL additionally marks
+agent statements non-persistent — and ADR-0026 says an invariant has no configuration key,
+so `deny_unknown_fields` refuses them and startup names the field. Section 4 is where the
+adapters' divergence is described; it is not something an operator sets.
+
+**Object rules live in the policy profile.** `schemas`, `allow_tables`, and `deny_tables`
+sit beside the relaxations they belong with. All three are optional: an absent `schemas`
+or `allow_tables` restricts nothing, and `deny_tables` wins over `allow_tables`. They
+reduce attack surface and improve error messages; they are **not** the read-scope
+boundary, which is the role's `SELECT` privilege alone (`docs/security.md` section 5,
+ADR-0023).
+
 ### 3.1 Structural rules
 
 **`allow_multiple_statements` does not exist.** One statement is an invariant (SPEC
@@ -231,8 +249,19 @@ section 6, invariant 2), and invariants have no configuration keys. A boolean th
 become `true` would be exactly the bypass flag prohibited by SPEC section 9.
 
 `allow_locking_reads` and `allow_unknown_functions` remain configurable because they
-represent legitimate tradeoffs, but `warden check` warns when a `production` profile
-enables either.
+represent legitimate tradeoffs, but `warden check` warns when either is enabled while a
+`production` connection is served.
+
+**Profiles may differ in capacity; they may not differ in policy (ADR-0039).** A profile
+carries both halves an operator thinks of together, but only the first is per connection.
+Limits and pool capacity — `query_timeout`, `max_rows`, `max_concurrent_queries`, the two
+pool tables — are taken from each connection's own profile. The relaxations and the object
+rules are process-wide, because `warden_service::Services` holds one `Arc<PolicyEngine>`.
+Startup therefore **fails**, naming both profiles, when two referenced profiles disagree
+about `allow_locking_reads`, `allow_unknown_functions`, or any object rule. Silently
+applying one profile's policy to a connection that asked for another would be the worst
+available outcome. A deployment that genuinely needs a policy per connection is open
+question 22, not a configuration this build can express.
 
 **Every configuration struct uses `#[serde(deny_unknown_fields)]`.** Without it, a
 misspelled `allow_locking_read` is silently ignored and falls back to the default. The
@@ -795,20 +824,42 @@ mcp.tool.query
     └── audit.outcome
 ```
 
-The child labels are code paths today: connection resolution, analysis, policy,
-attempt and outcome writes, permit acquisition, the adapter's read-only transaction
-and execution/normalization, and service-layer redaction all exist. They are not
-tracing spans yet. Milestone 13 adds the tracing instrumentation for those paths;
-`mcp.tool.query` also depends on Milestone 12's MCP handler. Do not interpret this
-tree as claiming either spans or an MCP entry point already exists.
+The child labels are code paths, and `mcp.tool.query`'s entry point exists as of
+Milestone 12: `warden-mcp`'s five `#[tool]` methods, four of which run in their own
+spawned task (`docs/security.md` section 14).
+Connection resolution, analysis, policy, attempt and outcome writes, permit acquisition,
+the adapter's read-only transaction and execution/normalization, and service-layer
+redaction all exist too. **None of them is a tracing span yet.** Milestone 13 adds the
+instrumentation; do not read this tree as claiming any span already exists.
 
 ### 10.2 Fields
 
-Allowed: `request_id`, `principal_id`, `connection`, `dialect`, `environment`,
-`operation`, `statement_kind`, `policy_outcome`, `rows`, `result_bytes`,
-`duration_ms`, and `queue_wait_ms`.
+Reconciled with `src/audit.rs` in Milestone 12: the list below is what the code emits,
+not a wish. The added names were reviewed and carry nothing sensitive.
 
-Forbidden by default: `raw_sql`, `raw_parameters`, `password`, and `dsn`.
+The Milestone 12 audit sink emits, per attempt: `attempt_id`, `request_id`,
+`principal_id`, `client`, `connection`, `dialect`, `environment`, `statement_kind`,
+`fingerprint`, and `deny_codes`. Per outcome: `attempt_id`, `outcome`, `duration_ms`,
+`rows`, `result_bytes`, and `error_code`. `src/audit.rs` declares both lists as constants
+and its own test asserts the emitted field names against them, so a renamed field fails
+the build rather than silently drifting from this section.
+
+Four of those are new since the list this section first carried, and each is safe by
+construction: `attempt_id` is a generated identifier and the only thing that makes the two
+lines readable as one record; `client` is a validated `ClientName` of printable ASCII;
+`fingerprint` is `v1:<sha256>` and not reversible; and `deny_codes` is a comma-joined list
+of `&'static str` codes — never `DenyReason::internal_detail`, which names the object or
+function that tripped a rule and stays off every surface but a durable audit record
+(`docs/security.md` section 6). `error_code` is a `PublicErrorCode`, the same closed set
+section 10 of `docs/security.md` fixes. `outcome` is this section's former
+`policy_outcome` under the name `warden_ports::AuditOutcome` actually uses.
+
+`operation` and `queue_wait_ms` remain allowed and are not emitted yet: nothing carries
+them into `AuditAttempt` or `AuditOutcomeEvent`.
+
+Forbidden by default: `raw_sql`, `raw_parameters`, `password`, and `dsn`. `AuditAttempt`
+has no field any of them could occupy, which is the structural half of the guarantee; the
+constants above are the half a rename could break.
 
 ### 10.3 Metrics
 
@@ -834,15 +885,40 @@ fixed, safe adapter query through `control_pool`.
 ## 11. CLI
 
 ```text
-warden serve --transport stdio
-warden serve --transport http
-warden check
+warden serve --transport stdio    # shipped in Milestone 12
+warden serve --transport http     # Milestone 14; parsed and refused by name today
+warden check                      # shipped in Milestone 12
 warden version
+warden help
 ```
 
-`warden check` validates configuration, secret references, connectivity, safely
-testable read-only expectations, and server settings. It **never executes arbitrary
-user SQL**. It warns when stdio serves a `production` profile (`docs/mcp.md` section 7).
+`--config <path>` selects the configuration file for `serve` and `check`, and defaults to
+`warden.toml` in the working directory. `--transport http` is not silently ignored: it
+parses and exits with the usage code, naming the transport this build does not serve.
+
+`warden check` is everything `warden serve` would do, minus serving. It loads and
+validates the configuration, resolves every secret reference, opens every connection with
+the same eager connect `serve` performs, runs each adapter's fixed readiness probe on
+`control_pool` (section 10.4), reads the session settings back on **both** pools to catch
+a pooler or proxy that discarded the connection-time options (section 5.2), and closes
+every pool it opened before it returns. It **never executes arbitrary user SQL**: it takes
+no query permit and dispatches no query, so the only statements it causes are those two
+fixed adapter ones.
+
+One failing connection does not stop the others — an operator fixing a deployment wants
+every broken connection named in one run — and the count of failures decides the exit
+code.
+
+It also warns, without failing, about two deployment choices: a connection whose
+`environment` is `production` served over stdio (`docs/mcp.md` section 7), and
+`allow_locking_reads` or `allow_unknown_functions` enabled while such a connection is
+served (section 3.1). A warning describes a deployment an operator may have chosen, so the
+exit code stays 0 and the last line says so.
+
+**The report goes to stderr, not stdout.** `warden check`'s answer is its exit code and
+the lines explain it; stdout carries MCP and nothing else (`docs/mcp.md` section 5.1), and
+a command whose output habit differs from `serve`'s is a command that eventually prints
+into a protocol stream. `version` and `help`, which serve nothing, write to stdout.
 
 Avoid a heavyweight CLI framework until argument complexity justifies one.
 
@@ -928,9 +1004,24 @@ x86_64, and an OCI image. The selected SQL stack requires neither `libmysqlclien
 
 ### 12.5 Container
 
+**Milestone 12 ships no `Dockerfile`, `Containerfile`, or release archive.** The
+distributable artifact is still the source repository. This section is therefore a
+checklist for the day a container image appears, not a description of one that exists;
+read every requirement below as binding on that future image.
+
 Run as non-root; embed no secrets; use a read-only root filesystem where practical; a
 minimal image; explicit CA certificates; minimal egress; no shell in the final image
 where practical; and database access restricted to configured endpoints.
+
+**Copy `LICENSES` to `/opt/warden/LICENSES` in the final build stage.** The
+`webpki-roots` root store Warden redistributes carries a notice that must accompany it
+(section 2.7). `tests/architecture.rs` already enforces this: it parses any `Dockerfile`
+or `Containerfile` that appears and fails unless the **final** stage copies either
+`LICENSES` or that exact notice path to that destination — a notice copied into a builder
+stage and discarded with it does not count, and neither does a destination merely named
+`LICENSES`, an unrelated file under `LICENSES/`, or a non-normalized source such as
+`./LICENSES`. The rule is live today against a file that does not yet exist, which is why
+adding one cannot forget it.
 
 ### 12.6 Network
 

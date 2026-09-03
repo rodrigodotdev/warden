@@ -157,12 +157,58 @@ otherwise, none blocks M0–M5.
     into an execution milestone would have widened the guard's scope without a
     measurement behind it.
 
+20. **Should MySQL's `PlanSummary` carry a row estimate?** Milestone 10 leaves
+    `estimated_rows` empty on MySQL. `EXPLAIN FORMAT=JSON` reports
+    `rows_examined_per_scan` and `rows_produced_per_join` per table and per join
+    step under `query_block`, and states no figure for the statement as a whole:
+    a single-table plan has one obvious candidate, a nested loop has one per step,
+    and `UNION`, `ordering_operation`, `grouping_operation` and
+    `materialized_from_subquery` each change the shape again. Filling the field only
+    where the shape is obvious would leave an agent unable to distinguish "this
+    engine reports no estimate" from "this plan was too complex to summarize", which
+    is worse than a consistently empty field. Deciding otherwise means walking the
+    document per shape, with a fuzzing obligation over database-controlled JSON, in
+    exchange for a number the full document already contains. Decide it against
+    measured demand.
+
 21. **Should schema reads produce an audit event?** `AuditAttempt` is
     statement-shaped: it requires a `StatementKind`, fingerprint, and denial reasons.
     Milestone 11 deliberately records no schema event rather than invent a statement
     kind or fingerprint that does not describe the catalog read. A denied
-    `describe_schema` is therefore unaudited today. Milestone 13 owns the event-shape
-    and policy decision.
+    `describe_schema` is therefore unaudited today. Milestone 12 changed nothing here:
+    it exposed `search_schema` and `describe_schema` over MCP and wired the Milestone 12
+    tracing sink beneath them, but `SchemaService` still records no attempt and no
+    outcome, so putting the tools in an agent's hands widened who can reach an unaudited
+    catalog read without changing the question. Milestone 13 owns the event-shape and
+    policy decision.
+
+22. **Should each connection have its own policy engine?** ADR-0039 made a policy
+    disagreement between two referenced profiles a startup failure, because
+    `warden_service::Services` holds one `Arc<PolicyEngine>` while limits and pools live
+    on each `ConnectionRuntime`. Object rules are the part that chafes: an allowlist
+    naturally names tables in one database, so a deployment serving two unrelated
+    databases must either give both the same rules or run two Warden processes. The limit
+    will be felt by the second real deployment, not the first. Resolving it means a
+    `PolicyEngine` per `ConnectionRuntime` and a service layer that resolves one per
+    request rather than holding one — a change to the shape of `Services`, not a
+    configuration key. Decide it against a deployment that needs it.
+
+23. **Should client cancellation reach the running query?** rmcp hands each tool call a
+    `CancellationToken` that fires on `notifications/cancelled`, and `warden-service`
+    derives its per-request token from the process-wide shutdown token it was built with,
+    offering no seam to pass another in. Aborting the spawned task instead would release
+    the permit and write no outcome, which is exactly the hole ADR-0038 names. Every
+    request is already bounded by `warden_service::RequestBudget::total`, so the exposure
+    is one budget rather than an unbounded wait. Milestone 14, where long-lived HTTP
+    requests make it matter, should add the seam rather than the abort.
+
+24. **Should `InputLimits` be configurable?** `warden-core` calls them configurable and no
+    configuration key exposes them. Milestone 12 passes `InputLimits::default()` — the
+    64 KiB statement and 100-parameter figures of `docs/data-model.md` section 2 —
+    explicitly to `QueryRequest::new`, which takes them as a parameter rather than
+    defaulting internally, so no call site can quietly use a looser bound. Add the key
+    when a deployment needs a different one, not before; a limit with a key nobody sets
+    is a limit nobody has reviewed.
 
 ## 3. Future work deliberately outside v0.x
 
@@ -231,17 +277,3 @@ PostgreSQL twin, one Testcontainers container per engine lives in
 `crates/warden-mysql/src/container_tests`, `crates/warden-postgres/src/container_tests`,
 and `tests/mcp_database.rs`, and a validated TLS handshake lives in `warden-mysql`'s
 connection tests (`docs/operations.md` section 8).
-
-20. **Should MySQL's `PlanSummary` carry a row estimate?** Milestone 10 leaves
-    `estimated_rows` empty on MySQL. `EXPLAIN FORMAT=JSON` reports
-    `rows_examined_per_scan` and `rows_produced_per_join` per table and per join
-    step under `query_block`, and states no figure for the statement as a whole:
-    a single-table plan has one obvious candidate, a nested loop has one per step,
-    and `UNION`, `ordering_operation`, `grouping_operation` and
-    `materialized_from_subquery` each change the shape again. Filling the field only
-    where the shape is obvious would leave an agent unable to distinguish "this
-    engine reports no estimate" from "this plan was too complex to summarize", which
-    is worse than a consistently empty field. Deciding otherwise means walking the
-    document per shape, with a fuzzing obligation over database-controlled JSON, in
-    exchange for a number the full document already contains. Decide it against
-    measured demand.
