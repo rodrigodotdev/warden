@@ -48,4 +48,4 @@ pub use output::{
     WireMatchReason, WireTableKind,
 };
 pub use server::{SERVER_INSTRUCTIONS, WARDEN_PROTOCOL_VERSIONS, WardenServer};
-pub use stdio::{StdioError, serve_stdio};
+pub use stdio::{StdioError, serve_duplex, serve_stdio};
