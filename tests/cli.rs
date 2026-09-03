@@ -2,7 +2,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 fn warden(args: &[&str]) -> std::process::Output {
     // `RUST_LOG` inherited from the developer's shell would put log lines on stderr and
@@ -82,4 +84,46 @@ fn logging_goes_to_stderr_so_stdout_stays_a_protocol_stream() {
     );
     let stderr = String::from_utf8(out.stderr).unwrap();
     assert!(stderr.contains("warden starting"), "stderr: {stderr}");
+}
+
+/// Writes a configuration file to a unique path and returns it.
+///
+/// The subprocess needs a real path, and the workspace has no temporary-file
+/// dependency; a name carrying the process id and a counter keeps concurrent test
+/// binaries from colliding. Callers remove the file when the assertion is done.
+fn write_temp_config(contents: &str) -> PathBuf {
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+
+    let path = std::env::temp_dir().join(format!(
+        "warden-cli-{}-{}.toml",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::write(&path, contents).expect("failed to write the temporary configuration");
+    path
+}
+
+#[test]
+fn an_unusable_configuration_fails_serve_with_a_diagnostic_and_a_silent_stdout() {
+    // stdout is the MCP transport. A startup failure that printed to it would corrupt
+    // the stream for a client that had already connected (docs/mcp.md section 5.1).
+    let output = warden(&["serve", "--config", "/nonexistent/warden.toml"]);
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty(), "stdout: {:?}", output.stdout);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("/nonexistent/warden.toml"));
+}
+
+#[test]
+fn check_reports_a_configuration_error_and_exits_non_zero() {
+    let path = write_temp_config("version = 99\n");
+    let output = warden(&["check", "--config", path.to_str().unwrap()]);
+    let _ = std::fs::remove_file(&path);
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("version"));
+}
+
+#[test]
+fn an_unknown_subcommand_still_exits_with_the_usage_code() {
+    assert_eq!(warden(&["serv"]).status.code(), Some(2));
 }

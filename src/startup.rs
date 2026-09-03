@@ -73,10 +73,6 @@ use crate::audit::TracingAuditSink;
 /// shutdown has to close them and `warden check` has to probe them
 /// (`docs/architecture.md` section 13, `docs/operations.md` section 11), and a
 /// `ConnectionRuntime` deliberately exposes neither.
-#[expect(
-    dead_code,
-    reason = "Task 9's `warden serve` and `warden check` are the callers"
-)]
 #[derive(Debug)]
 pub(crate) struct Deployment {
     services: Arc<Services>,
@@ -90,13 +86,11 @@ impl Deployment {
     /// Takes `&self` and returns a fresh server: the transport owns the
     /// [`WardenServer`], the deployment owns everything under it, and only the latter
     /// knows how to shut down.
-    #[expect(dead_code, reason = "Task 9's `warden serve` is the caller")]
     pub(crate) fn server(&self) -> WardenServer {
         WardenServer::new(Arc::clone(&self.services))
     }
 
     /// Every connection's pools, in configuration order.
-    #[expect(dead_code, reason = "Task 9's `warden check` is the caller")]
     pub(crate) fn pools(&self) -> &[PoolHandle] {
         &self.pools
     }
@@ -108,7 +102,6 @@ impl Deployment {
     /// pools, and never wait indefinitely. The bound is
     /// [`MAX_ADAPTER_CLEANUP`], the same figure `warden-service` budgets for an
     /// adapter's post-query cleanup, because that is what a draining pool is waiting on.
-    #[expect(dead_code, reason = "Task 9's `warden serve` is the caller")]
     pub(crate) async fn close(self) {
         self.shutdown.cancel();
         for pool in &self.pools {
@@ -132,10 +125,6 @@ impl Deployment {
 /// inventing one so the composition root could avoid a two-armed match would put a
 /// driver-shaped abstraction into `warden-ports`, where `docs/architecture.md`
 /// section 3 does not want one.
-#[expect(
-    dead_code,
-    reason = "Task 9's `warden check` is the caller of the probes"
-)]
 #[derive(Debug)]
 pub(crate) enum PoolHandle {
     /// A MySQL connection's agent and control pools.
@@ -156,10 +145,6 @@ pub(crate) enum PoolHandle {
 
 impl PoolHandle {
     /// The connection these pools belong to.
-    #[expect(
-        dead_code,
-        reason = "reachable only through `Deployment::close` and Task 9's `warden check`"
-    )]
     pub(crate) fn name(&self) -> &ConnectionName {
         match self {
             Self::MySql { name, .. } | Self::PostgreSql { name, .. } => name,
@@ -173,7 +158,6 @@ impl PoolHandle {
     /// Returns an operator-facing error naming the connection, caused by the adapter's
     /// own connect error — which never *displays* a host, user, or password. See the
     /// module header before rendering one any way but through `Display`.
-    #[expect(dead_code, reason = "Task 9's `warden check` is the caller")]
     pub(crate) async fn health_check(&self, deadline: Instant) -> Result<()> {
         match self {
             Self::MySql { name, pools } => pools
@@ -193,7 +177,6 @@ impl PoolHandle {
     ///
     /// Returns an operator-facing error naming the connection when a pooler or proxy
     /// discarded the connection-time setting (`docs/operations.md` section 5.2).
-    #[expect(dead_code, reason = "Task 9's `warden check` is the caller")]
     pub(crate) async fn verify_session_settings(&self, deadline: Instant) -> Result<()> {
         match self {
             Self::MySql { name, pools } => pools
@@ -208,10 +191,6 @@ impl PoolHandle {
     }
 
     /// Closes both pools, waiting for in-flight connections to return.
-    #[expect(
-        dead_code,
-        reason = "reachable only through `Deployment::close`, which Task 9 gives its first caller"
-    )]
     async fn close(&self) {
         match self {
             Self::MySql { pools, .. } => pools.close().await,
@@ -231,10 +210,6 @@ impl PoolHandle {
 /// Returns an operator-facing error naming the connection, the registry, the policy
 /// profile, or the redaction rules — whichever refused to be built. No message carries a
 /// DSN.
-#[expect(
-    dead_code,
-    reason = "Task 9's `warden serve` and `warden check` are the callers"
-)]
 pub(crate) async fn build(
     config: ResolvedConfig,
     shutdown: CancellationToken,
@@ -293,10 +268,6 @@ pub(crate) async fn build(
 }
 
 /// Opens one connection's pools and wires its four ports into a runtime.
-#[expect(
-    dead_code,
-    reason = "reachable only through `build`, which Task 9 gives its first caller"
-)]
 async fn build_connection(
     connection: ResolvedConnection,
 ) -> Result<(ConnectionRuntime, PoolHandle)> {
@@ -428,10 +399,6 @@ fn policy_settings(policy: &ResolvedPolicy) -> PolicySettings {
 ///
 /// Rules stay raw strings for the same reason object rules do: `Services::new` parses
 /// them once, so a malformed rule fails startup with a message naming it.
-#[expect(
-    dead_code,
-    reason = "reachable only through `build`, which Task 9 gives its first caller"
-)]
 fn redaction_settings(columns: Vec<String>, strategy: RedactionStrategyEntry) -> RedactionSettings {
     RedactionSettings {
         columns,
