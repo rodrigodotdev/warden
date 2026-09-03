@@ -225,7 +225,7 @@ mode = "fingerprint"
 
 This is the file Warden parses. `crates/warden-config/tests/fixtures/example.toml` is a
 near-copy of it that the crate's own tests read back, and a separate test asserts that the
-two keys named below are refused. Two things about the example are worth stating rather
+two keys named below are refused. Three things about the example are worth stating rather
 than inferring.
 
 **`statement_cache_capacity` and `persistent_statements` are not configuration keys.**
@@ -241,6 +241,13 @@ or `allow_tables` restricts nothing, and `deny_tables` wins over `allow_tables`.
 reduce attack surface and improve error messages; they are **not** the read-scope
 boundary, which is the role's `SELECT` privilege alone (`docs/security.md` section 5,
 ADR-0023).
+
+**`audit.mode` has no effect in this release.** `src/startup.rs` reads it and discards it,
+because Milestone 12's sink writes one shape of event and cannot fail; Milestone 13's
+persistent sink is what gives the mode meaning. The sink behaves as `fingerprint`
+whatever is written, so setting `none` does **not** reduce what is recorded. That
+direction is the safe one — it over-records rather than under-protects — but an operator
+who sets `none` expecting less should know it is inert until Milestone 13.
 
 ### 3.1 Structural rules
 

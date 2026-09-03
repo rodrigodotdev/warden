@@ -323,8 +323,8 @@ fn the_explainer_plans_only_an_authorized_statement() {
     );
     assert!(
         !declaration.contains("ExplainRequest"),
-        "ExplainRequest is the MCP-facing input Milestone 12 converts; the port \
-         takes authorized state"
+        "ExplainRequest is what warden_mcp::ExplainInput::into_request builds; the \
+         port takes authorized state, not a request"
     );
 }
 

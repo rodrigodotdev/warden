@@ -210,6 +210,21 @@ otherwise, none blocks M0–M5.
     when a deployment needs a different one, not before; a limit with a key nobody sets
     is a limit nobody has reviewed.
 
+25. **Should a malformed tool argument reach the agent as a `PublicErrorCode`?** rmcp
+    refuses an argument that fails `serde` deserialization before any Warden code runs,
+    and turns it into an in-band `isError: true` result carrying rmcp's own text: a fixed
+    prefix plus the whole `serde` message, which can name a field from Warden's input
+    schema, a field name the agent invented, or the agent's own submitted value. None of
+    it is new to the agent, and none of it can be database content, a driver message, or
+    a DSN, so `docs/security.md` section 10's prohibitions hold — but it is the one
+    agent-visible failure that is not one of the fourteen public codes, which the global
+    rule otherwise makes universal. Closing it means every tool taking a raw
+    `serde_json::Value` and hand-rolling deserialization so the failure can be mapped, a
+    structural change Milestone 12 declined to make at its end. Decide it in Milestone 13
+    or 14, alongside whichever of them next reworks the tool signatures;
+    `crates/warden-mcp/tests/protocol.rs` pins the current framing so an SDK change reads
+    as a decision point rather than a mystery failure.
+
 ## 3. Future work deliberately outside v0.x
 
 ### Adapters

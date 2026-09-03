@@ -508,12 +508,16 @@ anything a syntactic scan can prove.
 
 One documented gap: an argument that fails `serde` deserialization is refused by rmcp
 before Warden sees it, and the agent reads rmcp's own wording ("failed to deserialize
-parameters: missing field `sql`") rather than a `PublicErrorCode`. That text is limited to
-Warden's own schema field names, which are already public in the tool-schema snapshot — no
-user data, no driver message, no DSN — so this section's prohibitions hold. Intercepting
-it would mean every tool taking a raw `Value` and hand-rolling deserialization;
-`crates/warden-mcp/tests/protocol.rs` pins the current framing with a comment saying it
-pins the SDK's behaviour, not a Warden invariant.
+parameters: missing field `sql`") rather than a `PublicErrorCode`. rmcp forwards the whole
+`serde` message after its fixed prefix, so that text can name a field from Warden's own
+input schema, a field name the agent invented, or the agent's own submitted value
+(`invalid type: string "oops", expected a sequence`). None of it is new to the agent: the
+schema is already public in the tool-schema snapshot, and the rest is what the agent just
+sent. The refusal fires before any Warden code runs, so no database content, driver
+message, or DSN can be in it, and this section's prohibitions hold. Intercepting it would
+mean every tool taking a raw `Value` and hand-rolling deserialization; open question 25
+carries it, and `crates/warden-mcp/tests/protocol.rs` pins the current framing with a
+comment saying it pins the SDK's behaviour, not a Warden invariant.
 
 ## 11. Auditing
 
