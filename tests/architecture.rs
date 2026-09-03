@@ -15,7 +15,6 @@ use sha2::{Digest, Sha256};
 ///
 /// `sqlparser` is included beyond the explicit section 3 list because keeping parser
 /// ASTs inside adapters is sustainable only when the parser crate stays there too.
-/// The disposable `warden-tracer` intentionally depends on both SQLx and rmcp.
 const FORBIDDEN_EDGES: &[(&str, &[&str])] = &[
     ("warden-core", &["sqlx", "rmcp", "sqlparser"]),
     ("warden-policy", &["sqlx", "rmcp", "sqlparser"]),
@@ -38,8 +37,6 @@ const EXPECTED_MEMBERS: &[&str] = &[
     "warden-ports",
     "warden-postgres",
     "warden-service",
-    // Remove this entry with the disposable M0.5 crate after Milestone 12.
-    "warden-tracer",
 ];
 
 const WEBPKI_ROOTS_LICENSE: &str =

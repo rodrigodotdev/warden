@@ -221,14 +221,16 @@ separate work with their own limit model.
 
 ### Removing `warden-tracer`
 
-`crates/warden-tracer` is a disposable Milestone 0.5 tracer bullet. It validates rmcp
-3.x, SQLx 0.9, Testcontainers, and TLS before M6–M12 depend on those APIs. Remove it at
-the end of Milestone 12, once `warden-mcp`, `warden-mysql`, and `warden-postgres` cover
-the same ground using the real SPEC boundaries.
-
-`tests/architecture.rs` forces this decision through `EXPECTED_MEMBERS`: removing the
-crate without removing the list entry breaks the test. Also remove the `test:docker`
-mise task unless it already points to adapter integration tests.
+`crates/warden-tracer` was a disposable Milestone 0.5 tracer bullet. It validated rmcp
+3.x, SQLx 0.9, Testcontainers, and TLS before M6–M12 depended on those APIs, and it was
+removed in Milestone 12 once the production crates covered the same ground through the
+real SPEC boundaries: the rmcp handshake and tool calls now live in
+`crates/warden-mcp/tests/protocol.rs` and `tests/mcp_database.rs`, `SELECT 1` through
+`MySqlPool` and `PgPool` lives in `MySqlConnectionPools::health_check` and its
+PostgreSQL twin, one Testcontainers container per engine lives in
+`crates/warden-mysql/src/container_tests`, `crates/warden-postgres/src/container_tests`,
+and `tests/mcp_database.rs`, and a validated TLS handshake lives in `warden-mysql`'s
+connection tests (`docs/operations.md` section 8).
 
 20. **Should MySQL's `PlanSummary` carry a row estimate?** Milestone 10 leaves
     `estimated_rows` empty on MySQL. `EXPLAIN FORMAT=JSON` reports

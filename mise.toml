@@ -44,7 +44,6 @@ run = "cargo test --workspace"
 [tasks."test:docker"]
 description = "Run integration tests against real containers"
 run = [
-  "cargo test -p warden-tracer --features docker -- --nocapture",
   "cargo test -p warden-mysql --features docker -- --nocapture",
   "cargo test -p warden-postgres --features docker -- --nocapture",
   # The root package's end-to-end suite: Warden's own binary over stdio against both

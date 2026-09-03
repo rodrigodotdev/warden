@@ -3261,17 +3261,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "warden-tracer"
-version = "0.0.0"
-dependencies = [
- "rmcp",
- "serde_json",
- "sqlx",
- "testcontainers-modules",
- "tokio",
-]
-
-[[package]]
 name = "wasi"
 version = "0.11.1+wasi-snapshot-preview1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
