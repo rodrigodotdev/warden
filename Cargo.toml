@@ -200,6 +200,14 @@ tokio = { workspace = true, features = [
 # `AuditAttempt::timestamp` is the concrete `time::OffsetDateTime` the port exposes,
 # so the audit sink's own tests have to name it. Production code here never does.
 time = { workspace = true }
+# `tests/mcp_database.rs` provisions the fixture and the least-privileged role each
+# container test runs as, and then sends a write to that role with every Warden layer
+# removed — the second half of `AGENTS.md`'s rule that an integration test proves the
+# *database role* refuses a write, not only that policy does. A dev-dependency only:
+# `cargo metadata`'s normal-dependency graph, which `tests/architecture.rs` walks, is
+# unchanged, and the composition root already reaches this exact version through both
+# adapters, so nothing new is compiled.
+sqlx = { workspace = true }
 
 # Per-task panic containment depends on unwinding; see docs/security.md section 14.
 [profile.release]

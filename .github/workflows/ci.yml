@@ -78,9 +78,12 @@ jobs:
       # runner's full default thread count launched that many MySQL 8.4 containers
       # simultaneously, exhausting Docker and host resources for spurious
       # `PoolTimedOut` failures unrelated to the code under test. The same flag is
-      # applied to the other two crates in this step for consistency, since they
+      # applied to the other three crates in this step for consistency, since they
       # share this job's Docker daemon and host resources and the identical
-      # one-container-per-test pattern — not because either has hit the limit yet.
+      # one-container-per-test pattern — not because any has hit the limit yet. The
+      # root package's suite is the one with a second axis: each of its tests also
+      # spawns Warden's own binary as a child process for every exchange, so the flag
+      # bounds child processes as well as containers there.
       # timeout-minutes: 40 was checked against this milestone's growth, not left
       # untouched by oversight. Locally, `warden-mysql`'s full suite (121 tests, 37
       # of them container tests) finishes in about two minutes wall-clock at
@@ -94,6 +97,7 @@ jobs:
           cargo test -p warden-tracer --features docker -- --test-threads=4 --nocapture
           cargo test -p warden-mysql --features docker -- --test-threads=4 --nocapture
           cargo test -p warden-postgres --features docker -- --test-threads=4 --nocapture
+          cargo test -p warden --features docker -- --test-threads=4 --nocapture
         timeout-minutes: 40
 
   msrv:
