@@ -64,7 +64,9 @@ deny = [
     "tonic",
   ], reason = "ADR-0013 requires explicit BoxFuture for Warden ports. testcontainers and tonic use async-trait only inside warden-tracer dev dependencies and never enter production artifacts; this follows the sqlparser/stacker precedent in docs/operations.md section 2.4" },
   { crate = "rust_decimal", reason = "its 96-bit representation loses precision for large NUMERIC values; use bigdecimal (docs/operations.md section 2.2)" },
-  { crate = "lazy_static", reason = "use std::sync::LazyLock (Rust 1.80+); mutable global state is forbidden regardless (AGENTS.md, Request path)" },
+  { crate = "lazy_static", wrappers = [
+    "sharded-slab",
+  ], reason = "use std::sync::LazyLock (Rust 1.80+); mutable global state is forbidden regardless (AGENTS.md, Request path). `sharded-slab` is tracing-subscriber's span registry, reached through the `fmt` feature docs/operations.md section 10.3 requires the binary to use; the ban still covers every first-party use and every other path" },
 ]
 # `stacker`, pulled by sqlparser's default `recursive-protection`, contains `unsafe`.
 # Warden's policy covers first-party crates, not transitive dependencies; section 2.4
