@@ -56,6 +56,9 @@ const ROLE: &str = "warden_ro";
 /// the string the assertions search the wire for: a DSN password must never cross.
 const ROLE_PASSWORD: &str = "warden-ro-password";
 
+/// A password the role does not have, for the startup-failure test.
+const WRONG_PASSWORD: &str = "not-the-password";
+
 /// The environment variable each configuration names as its DSN source.
 const DSN_VARIABLE: &str = "WARDEN_E2E_DSN";
 
@@ -199,11 +202,21 @@ impl Fixture {
             .expect("failed to connect to the MySQL container as root");
         for statement in [
             "CREATE TABLE orders (id BIGINT PRIMARY KEY, status VARCHAR(32) NOT NULL, \
-             password VARCHAR(64) NOT NULL)",
-            "INSERT INTO orders (id, status, password) VALUES \
-             (1, 'shipped', 'hunter2'), (2, 'pending', 'hunter2'), (3, 'shipped', 'hunter2')",
+             password VARCHAR(64) NOT NULL)"
+                .to_owned(),
+            // `SECRET` is interpolated rather than written twice: a constant the seed did
+            // not actually store would turn every `!contains(SECRET)` assertion in this
+            // file into a guard on a string no database ever held.
+            format!(
+                "INSERT INTO orders (id, status, password) VALUES \
+                 (1, 'shipped', '{SECRET}'), (2, 'pending', '{SECRET}'), \
+                 (3, 'shipped', '{SECRET}')"
+            ),
         ] {
-            sqlx::query(statement).execute(&admin).await.unwrap();
+            sqlx::query(AssertSqlSafe(statement))
+                .execute(&admin)
+                .await
+                .unwrap();
         }
         // The grant is the shape `docs/security.md` section 4 recommends: `SELECT` on the
         // one table the agent needs and nothing else — no write privilege at all.
@@ -266,11 +279,19 @@ impl Fixture {
         .expect("failed to connect to the PostgreSQL container as the superuser");
         for statement in [
             "CREATE TABLE orders (id bigint PRIMARY KEY, status text NOT NULL, \
-             password text NOT NULL)",
-            "INSERT INTO orders (id, status, password) VALUES \
-             (1, 'shipped', 'hunter2'), (2, 'pending', 'hunter2'), (3, 'shipped', 'hunter2')",
+             password text NOT NULL)"
+                .to_owned(),
+            // Interpolated for the reason the MySQL seed above gives.
+            format!(
+                "INSERT INTO orders (id, status, password) VALUES \
+                 (1, 'shipped', '{SECRET}'), (2, 'pending', '{SECRET}'), \
+                 (3, 'shipped', '{SECRET}')"
+            ),
         ] {
-            sqlx::query(statement).execute(&admin).await.unwrap();
+            sqlx::query(AssertSqlSafe(statement))
+                .execute(&admin)
+                .await
+                .unwrap();
         }
         // The grant is the shape `docs/security.md` section 4.2 recommends: `CONNECT` on
         // the database, `USAGE` on the schema, `SELECT` on the one approved table, and no
@@ -428,11 +449,46 @@ impl Fixture {
 
     /// Runs `warden check` against this fixture's configuration.
     async fn run_check(&self) -> Output {
-        let mut command = self.command(["check"]);
+        self.run(&["check"]).await
+    }
+
+    /// Runs one subcommand to completion with no stdin, and returns its output.
+    ///
+    /// `Command::output` supplies a null stdin, which is what a startup-failure test
+    /// needs: a process that dies while resolving its configuration never reads the
+    /// descriptor, and writing to it would race a broken pipe against the assertion.
+    async fn run(&self, arguments: &[&str]) -> Output {
+        let mut command = self.command(arguments.iter().copied());
         tokio::time::timeout(PROCESS_TIMEOUT, command.kill_on_drop(true).output())
             .await
-            .expect("warden check did not finish within the process timeout")
-            .expect("failed to execute warden check")
+            .unwrap_or_else(|_elapsed| {
+                panic!("warden {arguments:?} did not finish within the process timeout")
+            })
+            .expect("failed to execute warden")
+    }
+
+    /// The same fixture with a DSN whose password is wrong.
+    ///
+    /// Only the DSN changes: the configuration file names an environment variable, so
+    /// nothing about the deployment differs except the secret behind it.
+    fn with_wrong_password(mut self) -> Self {
+        self.dsn = self.dsn.replace(ROLE_PASSWORD, WRONG_PASSWORD);
+        self
+    }
+
+    /// Every string a leaked DSN would put on the wire or in a diagnostic.
+    ///
+    /// Shared by the two tests that search for them so neither can drift from the other.
+    /// Which of them are *live* depends on the failure being provoked, and each caller
+    /// says which: only a connection-time failure has the role, the password, the host
+    /// and the port inside the error value at all.
+    fn dsn_tokens(&self) -> Vec<String> {
+        vec![
+            ROLE.to_owned(),
+            ROLE_PASSWORD.to_owned(),
+            self.host.clone(),
+            self.port.to_string(),
+        ]
     }
 
     /// Builds a child command for one subcommand, with the DSN and log filter in its
@@ -823,17 +879,83 @@ async fn a_driver_error_reaches_the_agent_as_a_code_and_nothing_else() {
     let response = fixture.call_query("SELECT * FROM no_such_relation").await;
     let rendered = serde_json::to_string(&response).unwrap();
     assert!(rendered.contains("query_execution_error"), "{rendered}");
-    for leaked in [
-        "no_such_relation",
-        "42P01",
-        ROLE,
-        ROLE_PASSWORD,
-        fixture.host.as_str(),
-        &fixture.port.to_string(),
-        "localhost",
-        "5432",
-    ] {
+
+    // The two tokens this failure actually carries: `ExecuteError::Database`'s only field
+    // is the driver's `Display`, asserted above to name the relation, and the SQLSTATE
+    // this server reports for it.
+    for leaked in ["no_such_relation", "42P01"] {
         assert!(!rendered.contains(leaked), "{leaked} leaked: {rendered}");
+    }
+    // The DSN tokens are checked here as a standing guard, not as a measurement: no
+    // `ExecuteError` variant carries a connection string, so a statement error could not
+    // leak one however badly this boundary broke.
+    // `a_startup_failure_leaks_no_dsn_and_leaves_stdout_untouched` is where the same list
+    // is live, because there the strings are inside the error value.
+    for leaked in fixture.dsn_tokens() {
+        assert!(!rendered.contains(&leaked), "{leaked} leaked: {rendered}");
+    }
+}
+
+#[tokio::test]
+async fn a_startup_failure_leaks_no_dsn_and_leaves_stdout_untouched() {
+    // The hardest leak class in this suite, and the only place it is reachable.
+    //
+    // `ConnectionError::Unavailable` — the wire's `connection_unavailable` — carries a
+    // `ConnectionName` and nothing else (`warden-ports/src/error.rs`), and pools connect
+    // eagerly so a misconfiguration fails at startup (`crates/warden-mysql/src/pool.rs`).
+    // A DSN that cannot authenticate therefore never reaches an MCP session at all: it
+    // surfaces as `ConnectError`, which is deliberately not a `PublicError` and whose
+    // `Driver` variant keeps sqlx's own text — the text that names the role Warden
+    // connected as. `src/main.rs`'s `report` and `src/check.rs`'s module header both
+    // state that rendering it with `Debug` instead of `Display` is what would put that
+    // into an operator's terminal and into whatever collects it. This is that assertion.
+    let fixture = Fixture::start(Engine::MySql).await.with_wrong_password();
+
+    // The driver's own message does name the role, so the assertions below guard strings
+    // that genuinely exist one layer down rather than strings that could never appear.
+    let driver = MySqlPool::connect(&fixture.dsn)
+        .await
+        .expect_err("the server accepted a wrong password");
+    assert!(
+        driver.to_string().contains(ROLE),
+        "the driver's own message no longer names the role: {driver}"
+    );
+
+    for arguments in [&["serve", "--transport", "stdio"][..], &["check"][..]] {
+        let output = fixture.run(arguments).await;
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+        assert!(
+            !output.status.success(),
+            "warden {arguments:?} succeeded against an unusable DSN; stderr={stderr}"
+        );
+        // A startup failure must not corrupt the stream a client may already be reading
+        // (docs/mcp.md section 5.1).
+        assert!(
+            output.stdout.is_empty(),
+            "warden {arguments:?} wrote to stdout: {:?}",
+            output.stdout
+        );
+        // Checked before the shape assertions below, so a leak is reported as a leak
+        // rather than as a missing sentence.
+        for leaked in fixture.dsn_tokens() {
+            assert!(
+                !stderr.contains(&leaked),
+                "warden {arguments:?} leaked {leaked}: {stderr}"
+            );
+        }
+        // The operator still gets a usable diagnostic: it names the connection that
+        // could not be opened, which is public metadata `list_connections` already
+        // returns, and it is `ConnectError`'s `Display` — the rendering that omits the
+        // driver detail — rather than its `Debug`.
+        assert!(
+            stderr.contains(NAME),
+            "warden {arguments:?} named no connection: {stderr}"
+        );
+        assert!(
+            stderr.contains("the database connection could not be established"),
+            "warden {arguments:?} did not report the sanitized connect failure: {stderr}"
+        );
     }
 }
 
@@ -854,14 +976,17 @@ async fn stdout_carries_protocol_only_and_the_process_exits_on_eof() {
     let (stdout, stderr, status) = fixture
         .run_to_completion(&with_ids(&[initialize(), initialized()]))
         .await;
-    for line in stdout.lines().filter(|line| !line.trim().is_empty()) {
-        serde_json::from_str::<Value>(line).unwrap_or_else(|error| {
-            panic!("stdout carried a non-protocol line ({error}): {line:?}")
-        });
-    }
+    // The same check every other exchange in this file runs, rather than a weaker
+    // re-implementation of it: a line like `{"foo":1}` is not protocol either.
+    let messages = parse_protocol(&stdout);
+    assert!(!messages.is_empty(), "stdout carried no response at all");
     assert!(status.success(), "exit status {status:?}; stderr={stderr}");
-    // The startup log lines exist — they just go to the other descriptor.
-    assert!(!stderr.is_empty(), "nothing was logged to stderr");
+    // The startup log lines exist — they just go to the other descriptor. Naming one
+    // rather than counting bytes: a panic message is also a non-empty stderr.
+    assert!(
+        stderr.contains("warden starting"),
+        "the startup log line is missing from stderr: {stderr}"
+    );
 }
 
 #[tokio::test]
