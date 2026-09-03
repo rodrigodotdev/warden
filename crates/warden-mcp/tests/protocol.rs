@@ -83,7 +83,11 @@ fn result_set() -> ResultSet {
             database_type: "BIGINT".to_owned(),
             nullable: Some(false),
         }],
-        rows: vec![vec![ResultValue::I64(1)]],
+        // A distinctive value, not `1`: a row count, a column count, and a cell value
+        // of `1` are indistinguishable in a summary string, so a summary that leaked
+        // the cell would look identical to one that only counted it. This value could
+        // never appear in a summary that only states counts and flags (ADR-0040).
+        rows: vec![vec![ResultValue::String(LEAKING_CELL_VALUE.to_owned())]],
         truncated: false,
         stats: QueryStats {
             rows_returned: 1,
@@ -92,6 +96,9 @@ fn result_set() -> ResultSet {
         },
     }
 }
+
+/// A cell value distinctive enough that it could not be confused with a count.
+const LEAKING_CELL_VALUE: &str = "sentinel-cell-value";
 
 fn plan() -> QueryPlan {
     QueryPlan {
@@ -179,18 +186,44 @@ impl QueryAnalyzer for FakeAnalyzer {
     }
 }
 
+/// A statement that trips [`FakeExecutor`] into returning a driver-shaped failure —
+/// `"SELECT..."` so `classify()` still lets it reach the executor at all; a boundary
+/// leak has to come from a call policy actually authorized, not from one denied before
+/// execution ever runs.
+const LEAKING_EXECUTION_SQL: &str = "SELECT 1 FROM leaky_sentinel_probe";
+
+/// The driver-shaped `detail` [`FakeExecutor`] returns for [`LEAKING_EXECUTION_SQL`] —
+/// the live leak vector `docs/security.md` section 10 exists to close.
+/// `ExecuteError::Database`'s own doc names it exactly: "a `sqlx` error can name the
+/// host, the user, the database, and the SQL."
+const LEAKING_EXECUTION_DETAIL: &str = "connection to postgres://warden:hunter2@localhost:5432/app failed while running DELETE FROM orders";
+
 #[derive(Debug, Default)]
 struct FakeExecutor;
 
 impl QueryExecutor for FakeExecutor {
     fn execute_read_only<'a>(
         &'a self,
-        _query: &'a AuthorizedQuery,
+        query: &'a AuthorizedQuery,
         _permit: &'a QueryPermit,
         _deadline: Instant,
         _cancel: CancellationToken,
     ) -> warden_ports::BoxFuture<'a, Result<ResultSet, ExecuteError>> {
-        Box::pin(async move { Ok(result_set()) })
+        Box::pin(async move {
+            if query.sql() == LEAKING_EXECUTION_SQL {
+                // The one call in this file that exercises the real leak vector:
+                // `ConnectionMetadata` cannot hold a connection string at all (it is
+                // structurally impossible, `warden-ports/src/registry.rs`), so the only
+                // way `no_response_ever_carries_a_connection_string` can mean anything
+                // is for something on the boundary to actually be handed a value that
+                // could leak.
+                Err(ExecuteError::Database {
+                    detail: LEAKING_EXECUTION_DETAIL.to_owned(),
+                })
+            } else {
+                Ok(result_set())
+            }
+        })
     }
 }
 
@@ -326,7 +359,10 @@ fn call(name: &str, arguments: Value) -> Value {
 }
 
 /// A session touching every response shape this file produces: every tool, a
-/// successful `query`, and a denied one. Used by the test that scans the whole
+/// successful `query`, a denied one, and — the one that actually gives the leak scan
+/// something to catch — a `query` whose adapter fails with a driver-shaped error whose
+/// `detail` names a host, a user, a password, and a SQL fragment
+/// (`ExecuteError::Database`'s own doc). Used by the test that scans the whole
 /// transcript for a leak rather than one field.
 ///
 /// Deliberately no `list_tools()`: every tool's JSON Schema carries a
@@ -353,6 +389,10 @@ fn full_session() -> Vec<Value> {
         call(
             "query",
             json!({ "connection": CONNECTION, "sql": "DELETE FROM orders" }),
+        ),
+        call(
+            "query",
+            json!({ "connection": CONNECTION, "sql": LEAKING_EXECUTION_SQL }),
         ),
         call(
             "explain",
@@ -383,9 +423,16 @@ async fn exchange(requests: &[Value]) -> Vec<Value> {
         shutdown.clone(),
     ));
 
+    // A request whose own `id` is JSON `null` is vanishingly unlikely from this file's
+    // helpers, but it is valid JSON-RPC, and treating it as a real id would let it
+    // collide under the literal string key `"null"` with any stray `id: null` response
+    // (the shape a top-level parse error uses) — masking exactly the kind of protocol
+    // bug this test exists to catch behind an unrelated "no response ever arrived"
+    // panic. Both ends of the id-matching below agree: neither stores nor looks up a
+    // null id.
     let ids: Vec<Value> = requests
         .iter()
-        .filter_map(|request| request.get("id").cloned())
+        .filter_map(|request| request.get("id").filter(|id| !id.is_null()).cloned())
         .collect();
 
     for request in requests {
@@ -423,8 +470,9 @@ async fn exchange(requests: &[Value]) -> Vec<Value> {
                 value["jsonrpc"], "2.0",
                 "a transport line was not JSON-RPC 2.0: {value}"
             );
-            if let Some(id) = value.get("id") {
-                responses.insert(id.to_string(), value);
+            if let Some(id) = value.get("id").filter(|id| !id.is_null()) {
+                let key = id.to_string();
+                responses.insert(key, value);
             }
         }
     };
@@ -440,15 +488,20 @@ async fn exchange(requests: &[Value]) -> Vec<Value> {
 
     drop(write_half);
     shutdown.cancel();
-    // Only a panic (a lost task) is treated as a bug here. A refused `initialize`
-    // legitimately ends `serve_duplex` with `Err(StdioError::Start(_))` even though the
-    // JSON-RPC error response was already written to the wire and read above — `serve`
-    // (`src/stdio.rs`) maps *any* handshake failure to `Start`, refusal included, so
-    // that Result is not a second signal this helper needs to check.
-    let _ = tokio::time::timeout(Duration::from_secs(5), serving)
+    // A refused `initialize` legitimately ends `serve_duplex` with
+    // `Err(StdioError::Start(_))` even though the JSON-RPC error response was already
+    // written to the wire and read above — `serve` (`src/stdio.rs`) maps any handshake
+    // failure, refusal included, to `Start`. That is the one Err this helper tolerates;
+    // anything else (a lost task, or an unexpected `Shutdown`) is a real bug and must
+    // still fail this test rather than being silently discarded.
+    match tokio::time::timeout(Duration::from_secs(5), serving)
         .await
         .expect("the server did not shut down within five seconds")
-        .expect("the serving task panicked");
+        .expect("the serving task panicked")
+    {
+        Ok(()) | Err(warden_mcp::StdioError::Start(_)) => {}
+        Err(unexpected) => panic!("serve_duplex ended unexpectedly: {unexpected}"),
+    }
 
     ids.into_iter()
         .map(|id| {
@@ -483,6 +536,13 @@ async fn an_unimplemented_version_is_refused_with_the_supported_list() {
     // substitution; this test is what keeps it from coming back.
     let response = &exchange(&[initialize("2024-11-05")]).await[0];
     assert!(response["result"].is_null(), "{response}");
+    // ADR-0041 names `unsupported_protocol_version` specifically, not merely "some
+    // error": without checking the code, a refusal that regressed to a generic
+    // `internal_error` carrying the same `data.supported` payload would still pass.
+    assert_eq!(
+        response["error"]["code"],
+        json!(rmcp::model::ErrorCode::UNSUPPORTED_PROTOCOL_VERSION.0)
+    );
     assert_eq!(
         response["error"]["data"]["supported"],
         json!(["2025-11-25", "2026-07-28"])
@@ -494,6 +554,24 @@ async fn tool_discovery_returns_five_annotated_tools_with_output_schemas() {
     let response = &exchange(&[initialize(LATEST), initialized(), list_tools()]).await[1];
     let tools = response["result"]["tools"].as_array().unwrap();
     assert_eq!(tools.len(), 5);
+    // The count alone would still pass a rename or a swap. Pin the actual names
+    // (`docs/mcp.md` section 1) so drift there shows up here, not just in
+    // `tests/tool_schema.rs`'s snapshot.
+    let mut names: Vec<&str> = tools
+        .iter()
+        .map(|tool| tool["name"].as_str().unwrap())
+        .collect();
+    names.sort_unstable();
+    assert_eq!(
+        names,
+        [
+            "describe_schema",
+            "explain",
+            "list_connections",
+            "query",
+            "search_schema"
+        ]
+    );
     for tool in tools {
         assert_eq!(tool["annotations"]["readOnlyHint"], json!(true), "{tool}");
         assert_eq!(
@@ -529,6 +607,15 @@ async fn a_successful_call_carries_data_in_structured_content_and_counts_in_text
         !text.contains('['),
         "the text block repeats the rows: {text}"
     );
+    // `text.contains("row")` and the missing `[` both hold for a summary that merely
+    // states counts; neither can tell a leaked value apart from a count when the
+    // fixture's only cell happens to equal the row count. This is the assertion that
+    // actually distinguishes them: the fixture's cell is `LEAKING_CELL_VALUE`, and it
+    // must never appear in the summary line.
+    assert!(
+        !text.contains(LEAKING_CELL_VALUE),
+        "the summary line names a value, not just a count: {text}"
+    );
 }
 
 #[tokio::test]
@@ -551,7 +638,7 @@ async fn a_denied_statement_is_an_error_result_the_agent_can_read() {
 }
 
 #[tokio::test]
-async fn a_malformed_argument_is_a_protocol_error_and_not_a_silent_default() {
+async fn a_malformed_argument_is_refused_loudly_and_not_a_silent_default() {
     // Not a top-level JSON-RPC `error`: rmcp 3.1.4's `into_tool_argument_error`
     // (`handler/server/router/tool.rs`) deliberately downgrades an INVALID_PARAMS
     // deserialization failure into an in-band `CallToolResult` with `isError: true`
@@ -569,6 +656,16 @@ async fn a_malformed_argument_is_a_protocol_error_and_not_a_silent_default() {
     assert!(response["error"].is_null(), "{response}");
     assert_eq!(response["result"]["isError"], json!(true), "{response}");
     let text = response["result"]["content"][0]["text"].as_str().unwrap();
+    // This pins rmcp's own free-text extractor message ("failed to deserialize
+    // parameters: missing field `sql`"), not a Warden `PublicErrorCode` — Warden does
+    // not intercept a `Parameters<T>` extraction failure before it reaches the agent.
+    // That is a deliberate, documented gap for this milestone (recorded in the task
+    // report): intercepting it would mean every tool taking a raw `Value` and
+    // hand-rolling deserialization, a structural change bigger than anything else M12
+    // takes on. The content is provably limited to Warden's own schema field names,
+    // already public in `tests/snapshots/tools.json`. If a future SDK change makes
+    // this assertion fail, that is a decision point (does the new message still
+    // satisfy "refused loudly, never defaulted"?), not a mystery regression.
     assert!(text.contains("sql"), "{text}");
 }
 
@@ -599,9 +696,12 @@ async fn every_tool_answers_over_the_wire() {
     requests.extend(calls);
     let responses = exchange(&requests).await;
     // `responses[0]` answers `initialize`, not a tool call: it has no `result.isError`
-    // at all, so checking every response uniformly would fail on that shape mismatch
-    // rather than on anything this test is actually about. Skip it and check the five
-    // tool-call responses that follow.
+    // at all, so checking that field uniformly across every response would fail on the
+    // shape mismatch rather than on anything this test is actually about. The
+    // `error.is_null()` half still applies to it, though — the handshake itself must
+    // not have failed — so it is checked here on its own before the loop skips ahead
+    // to the five tool-call responses that follow.
+    assert!(responses[0]["error"].is_null(), "{}", responses[0]);
     for response in &responses[1..] {
         assert!(response["error"].is_null(), "{response}");
         assert_eq!(response["result"]["isError"], json!(false), "{response}");
