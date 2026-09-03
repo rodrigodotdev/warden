@@ -3114,6 +3114,7 @@ dependencies = [
  "anyhow",
  "serde_json",
  "sha2 0.11.0",
+ "sqlx",
  "testcontainers-modules",
  "time",
  "tokio",
