@@ -78,7 +78,7 @@ jobs:
       # runner's full default thread count launched that many MySQL 8.4 containers
       # simultaneously, exhausting Docker and host resources for spurious
       # `PoolTimedOut` failures unrelated to the code under test. The same flag is
-      # applied to the other three crates in this step for consistency, since they
+      # applied to the other two crates in this step for consistency, since they
       # share this job's Docker daemon and host resources and the identical
       # one-container-per-test pattern — not because any has hit the limit yet. The
       # root package's suite is the one with a second axis: each of its tests also
@@ -87,14 +87,13 @@ jobs:
       # timeout-minutes: 40 was checked against this milestone's growth, not left
       # untouched by oversight. Locally, `warden-mysql`'s full suite (121 tests, 37
       # of them container tests) finishes in about two minutes wall-clock at
-      # `--test-threads=4` with an unthrottled Docker daemon; `warden-tracer` and
-      # `warden-postgres` run far fewer container tests each. Even a CI runner many
-      # times slower stays comfortably inside 40 minutes, so this budget is
-      # unchanged — unlike the coverage job below, which runs the same containers
-      # serially under LLVM instrumentation and needed a real increase.
+      # `--test-threads=4` with an unthrottled Docker daemon; `warden-postgres` runs
+      # far fewer container tests. Even a CI runner many times slower stays
+      # comfortably inside 40 minutes, so this budget is unchanged — unlike the
+      # coverage job below, which runs the same containers serially under LLVM
+      # instrumentation and needed a real increase.
       - name: Integration tests (Testcontainers)
         run: |
-          cargo test -p warden-tracer --features docker -- --test-threads=4 --nocapture
           cargo test -p warden-mysql --features docker -- --test-threads=4 --nocapture
           cargo test -p warden-postgres --features docker -- --test-threads=4 --nocapture
           cargo test -p warden --features docker -- --test-threads=4 --nocapture

@@ -1,7 +1,7 @@
 //! The MCP protocol, end to end, over an in-memory transport.
 //!
 //! rmcp's client is deliberately not used: every byte on the wire is under test, the same
-//! choice `crates/warden-tracer/tests/mcp_stdio.rs` made for Milestone 0.5. What this
+//! choice Milestone 0.5's disposable tracer bullet made for its own MCP test. What this
 //! cannot cover is the composition root and a real database; `tests/mcp_database.rs` at the
 //! workspace root does that with the real binary and real containers.
 //!

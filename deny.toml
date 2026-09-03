@@ -62,7 +62,7 @@ deny = [
   { crate = "async-trait", wrappers = [
     "testcontainers",
     "tonic",
-  ], reason = "ADR-0013 requires explicit BoxFuture for Warden ports. testcontainers and tonic use async-trait only inside warden-tracer dev dependencies and never enter production artifacts; this follows the sqlparser/stacker precedent in docs/operations.md section 2.4" },
+  ], reason = "ADR-0013 requires explicit BoxFuture for Warden ports. testcontainers and tonic use async-trait only inside the docker-feature dev dependencies of warden, warden-mysql, and warden-postgres, and never enter production artifacts; this follows the sqlparser/stacker precedent in docs/operations.md section 2.4" },
   { crate = "rust_decimal", reason = "its 96-bit representation loses precision for large NUMERIC values; use bigdecimal (docs/operations.md section 2.2)" },
   { crate = "lazy_static", wrappers = [
     "sharded-slab",
