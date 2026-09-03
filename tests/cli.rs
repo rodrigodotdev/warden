@@ -43,7 +43,12 @@ fn version_succeeds_and_writes_only_to_stdout() {
 
 #[test]
 fn unknown_command_exits_with_usage_code_and_keeps_stdout_clean() {
-    let out = warden(&["does-not-exist"]);
+    // `serv`, not `does-not-exist`, since the subcommand slot now quotes a token back
+    // only when it is one edit from a name Warden defines: a bare word in that position
+    // is as likely to be a pasted passphrase or token as a typo. The three properties
+    // this test was written for are unchanged — usage exit code, silent stdout, and a
+    // stderr line that names the mistyped command.
+    let out = warden(&["serv"]);
 
     assert_eq!(out.status.code(), Some(2), "usage-error exit code");
     assert!(
@@ -53,7 +58,22 @@ fn unknown_command_exits_with_usage_code_and_keeps_stdout_clean() {
         String::from_utf8_lossy(&out.stdout)
     );
     let stderr = String::from_utf8(out.stderr).unwrap();
-    assert!(stderr.contains("does-not-exist"), "stderr: {stderr}");
+    assert!(stderr.contains("serv"), "stderr: {stderr}");
+}
+
+#[test]
+fn a_bare_word_in_the_subcommand_slot_is_refused_without_reaching_stderr() {
+    // The other end of the same rule, at the process boundary: a supervisor collecting
+    // this binary's stderr must not end up holding a passphrase somebody pasted one
+    // argument too early.
+    let secret = "correct-horse-battery-staple";
+    let out = warden(&[secret]);
+
+    assert_eq!(out.status.code(), Some(2), "usage-error exit code");
+    assert!(out.stdout.is_empty(), "stdout: {:?}", out.stdout);
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    assert!(!stderr.contains(secret), "stderr: {stderr}");
+    assert!(stderr.contains("warden help"), "stderr: {stderr}");
 }
 
 #[test]
