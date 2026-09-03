@@ -642,8 +642,8 @@ mod tests {
 
     #[test]
     fn warden_advertises_only_the_versions_it_implements() {
-        // docs/mcp.md's preamble defers this to M12: the SDK default advertises three
-        // revisions Warden has neither implemented nor tested.
+        // docs/mcp.md's preamble records this decision (ADR-0041): the SDK default
+        // advertises three revisions Warden has neither implemented nor tested.
         assert_eq!(
             WARDEN_PROTOCOL_VERSIONS,
             [ProtocolVersion::V_2025_11_25, ProtocolVersion::V_2026_07_28]

@@ -347,9 +347,10 @@ impl JsonSchema for CellValue {
         // Hand-written because no Rust type expresses this union. `ResultValue`'s
         // `Serialize` quotes an `I64`/`U64` outside ±2^53 as a decimal string so a
         // JavaScript client cannot silently round it (`docs/data-model.md` section 8.1,
-        // rule 6), and `crates/warden-core/src/result.rs` asks Milestone 12 to declare the
-        // affected fields as both representations. A derived schema would claim `integer`
-        // alone and be wrong for exactly the values that matter most.
+        // rule 6), and `crates/warden-core/src/result.rs` records that this schema is
+        // where the affected fields are declared as both representations. A derived
+        // schema would claim `integer` alone and be wrong for the values that matter
+        // most.
         rmcp::schemars::json_schema!({
             "type": ["integer", "string", "number", "boolean", "null", "array", "object"],
             "description": "One normalized cell. An integer outside ±2^53 arrives as a \
