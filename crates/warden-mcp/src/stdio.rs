@@ -51,8 +51,15 @@ pub async fn serve_stdio(
 /// Splitting this from [`serve_stdio`] is what makes the transport testable without
 /// touching the process's real descriptors; [`serve_stdio`] is the one-line production
 /// caller that passes `rmcp::transport::stdio()` instead.
-#[cfg(test)]
-async fn serve_duplex<S>(
+///
+/// This is `pub` rather than `#[cfg(test)]`: `tests/protocol.rs` drives the real
+/// transport end to end, and an integration test in `tests/` cannot see an item behind
+/// this crate's own `#[cfg(test)]`. The milestone's fakes are likewise forbidden from
+/// living behind a Cargo feature instead, because feature unification would expose them
+/// to every crate in the workspace (`docs/architecture.md` section 4.3) — so the
+/// visibility of this function is what makes the transport testable from outside the
+/// crate, not a new escape hatch.
+pub async fn serve_duplex<S>(
     server: WardenServer,
     stream: S,
     shutdown: CancellationToken,
