@@ -65,19 +65,24 @@ pub(crate) enum Transport {
 
 /// Command-line parsing failures.
 ///
-/// A message may quote **Warden's own vocabulary and nothing else**: a subcommand name, a
-/// flag name, or a transport name, each of which has to be name-shaped
-/// ([`is_name_shaped`]) before it is quoted at all. Everything an operator types that is
-/// not one of those is a value, and on this command line a DSN is the value that matters,
-/// so an unrecognized value is reported without being echoed. `--flag=value` is split at
-/// the first `=` before any of this, which is what keeps the value half of an unknown
-/// `--dsn=<secret>` out of the message.
+/// A message may quote **Warden's own vocabulary and nothing else**, and each position has
+/// its own test for what that means. A flag is quoted only when it is written like one —
+/// [`is_flag_shaped`], where the leading dash is what an operator writes for a flag and
+/// never for a value. A subcommand is quoted only when it is a near miss of a name Warden
+/// defines ([`is_near_miss`]), because that slot takes a bare word and a bare word can be
+/// a passphrase, a token, a username, or a hostname. A transport name is quoted because
+/// nothing but a transport is ever written there. Everything else an operator types is a
+/// value — on this command line a DSN is the value that matters — and is refused without
+/// being echoed. `--flag=value` is split at the first `=` before any of this, which is what
+/// keeps the value half of an unknown `--dsn=<secret>` out of the message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CliError {
     /// No subcommand was provided.
     MissingCommand,
-    /// The subcommand does not exist. Contains only its name, never later arguments
-    /// that might contain a DSN.
+    /// The subcommand does not exist, and was close enough to one that does to be named.
+    ///
+    /// Contains that near miss alone — never a later argument, and never a bare word too
+    /// far from Warden's own vocabulary to be a typo of it.
     UnknownCommand(String),
     /// A flag this command accepts was given no value.
     MissingValue {
@@ -89,11 +94,12 @@ pub(crate) enum CliError {
         /// The flag as written, up to but not including any `=`.
         flag: String,
     },
-    /// An argument that is not name-shaped, so nothing about it can be quoted safely.
+    /// An argument nothing about which can be quoted safely.
     ///
-    /// A bare `warden serve postgres://user:password@host/db` lands here: the token is a
-    /// value, a value on this command line can be a DSN, and an operator's supervisor
-    /// collects stderr.
+    /// Both `warden serve postgres://user:password@host/db` and
+    /// `warden correct-horse-battery-staple` land here: each token is a value, a value on
+    /// this command line can be a DSN or a password, and an operator's supervisor collects
+    /// stderr.
     UnknownArgument,
     /// `--transport` named a transport this build does not serve.
     UnsupportedTransport {
@@ -152,12 +158,20 @@ where
         "help" | "--help" | "-h" => Ok(Command::Help),
         "serve" => parse_serve(args),
         "check" => parse_check(args),
-        // The subcommand position is as capable of holding a DSN as any other, so the
-        // same shape rule decides whether this one can be named.
-        other if is_name_shaped(other) => Err(CliError::UnknownCommand(other.to_owned())),
+        // The subcommand position holds a bare word, and a bare word is as likely to be a
+        // pasted secret as a typo. Only a near miss of a name Warden itself defines is
+        // quoted back; anything further away is refused without being repeated.
+        other if is_near_miss(other) => Err(CliError::UnknownCommand(other.to_owned())),
         _unquotable => Err(CliError::UnknownArgument),
     }
 }
+
+/// The subcommand names [`parse`] dispatches on, for near-miss reporting.
+///
+/// The flag spellings (`--version`, `-h`) are deliberately absent: they are flag-shaped,
+/// so a typo of one is already quotable through [`is_flag_shaped`] when it reaches a
+/// subcommand's flag loop, and a near miss of `-h` is one edit from most short words.
+const COMMANDS: [&str; 4] = ["serve", "check", "version", "help"];
 
 /// Parses `serve`'s `--config` and `--transport`, in either order.
 fn parse_serve<I>(mut args: I) -> Result<Command, CliError>
@@ -237,7 +251,7 @@ fn split_inline_value(argument: &str) -> (&str, Option<&str>) {
 /// is a value the operator supplied, and this command line's values include DSNs, so it
 /// is refused without being repeated into whatever collects stderr.
 fn unknown_argument(argument: &str) -> CliError {
-    if is_name_shaped(argument) {
+    if is_flag_shaped(argument) {
         CliError::UnknownFlag {
             flag: argument.to_owned(),
         }
@@ -246,20 +260,78 @@ fn unknown_argument(argument: &str) -> CliError {
     }
 }
 
-/// Whether a token has the shape of a name Warden itself could have defined.
+/// Whether a token is written the way a flag is: `^--?[A-Za-z][A-Za-z0-9-]*$`.
 ///
-/// An optional `-` or `--`, then an ASCII letter, then ASCII letters, digits, and dashes.
-/// `--dsn`, `-h`, and `check` pass; `postgres://user:password@host/db`,
-/// `/etc/warden.toml`, and any password that is not a bare word fail. It is a whitelist,
-/// so a token this cannot classify is one Warden does not quote.
-fn is_name_shaped(argument: &str) -> bool {
-    let name = argument
+/// The leading dash is required, and that is the whole point. Without it this admits any
+/// bare word of letters, digits, and dashes — which is what a dash-separated passphrase, a
+/// hex or base36 token, a single-word password, a bare username, and a single-label
+/// hostname all are. An operator never has to write a dash to type a secret, and always
+/// has to write one to type a flag, so the dash is the only part of the shape that
+/// separates Warden's vocabulary from an operator's values.
+fn is_flag_shaped(argument: &str) -> bool {
+    let Some(name) = argument
         .strip_prefix("--")
         .or_else(|| argument.strip_prefix('-'))
-        .unwrap_or(argument);
+    else {
+        return false;
+    };
     let mut characters = name.chars();
     matches!(characters.next(), Some(first) if first.is_ascii_alphabetic())
         && characters.all(|character| character.is_ascii_alphanumeric() || character == '-')
+}
+
+/// Whether a token is a plausible typo of a subcommand, and so safe to quote back.
+///
+/// The subcommand slot takes no dash, so [`is_flag_shaped`] cannot guard it and a bare
+/// word there is as likely to be a pasted secret as a typo. This is the narrower
+/// whitelist that keeps the diagnostic useful anyway: a token is quoted only when a single
+/// insertion, deletion, or substitution turns it into one of [`COMMANDS`]. `serv` is named;
+/// `correct-horse-battery-staple` is not.
+fn is_near_miss(argument: &str) -> bool {
+    COMMANDS
+        .iter()
+        .any(|command| within_one_edit(argument, command))
+}
+
+/// Whether one insertion, deletion, or substitution turns `candidate` into `command`.
+///
+/// Bytes rather than characters: every name in [`COMMANDS`] is ASCII, so a candidate that
+/// is not ASCII cannot be within one edit of any of them and is refused by the length and
+/// equality tests without ever being split into characters.
+fn within_one_edit(candidate: &str, command: &str) -> bool {
+    let (candidate, command) = (candidate.as_bytes(), command.as_bytes());
+    match candidate.len().abs_diff(command.len()) {
+        // The same length: at most one position may differ.
+        0 => {
+            candidate
+                .iter()
+                .zip(command)
+                .filter(|(left, right)| left != right)
+                .count()
+                <= 1
+        }
+        // One apart: deleting one byte from the longer must yield the shorter.
+        1 => {
+            let (longer, shorter) = if candidate.len() > command.len() {
+                (candidate, command)
+            } else {
+                (command, candidate)
+            };
+            let mut matched = 0;
+            let mut skipped = false;
+            for byte in longer {
+                if shorter.get(matched) == Some(byte) {
+                    matched += 1;
+                } else if skipped {
+                    return false;
+                } else {
+                    skipped = true;
+                }
+            }
+            matched == shorter.len()
+        }
+        _ => false,
+    }
 }
 
 impl std::str::FromStr for Transport {
@@ -514,18 +586,65 @@ mod tests {
     }
 
     #[test]
-    fn only_a_name_warden_could_have_defined_is_quotable() {
-        for name in ["--config", "-h", "check", "--allow-locking-reads"] {
-            assert!(is_name_shaped(name), "{name}");
+    fn a_bare_word_secret_is_not_echoed_at_a_flag_or_a_subcommand_position() {
+        // Nothing about these needs punctuation to be a secret: a dash-separated
+        // passphrase is a password manager's default scheme, and a base36 token is
+        // letters and digits. Both would pass a shape test that only asked for a name.
+        for secret in ["correct-horse-battery-staple", "hunter2", "k3mz9qx1t7b"] {
+            for command_line in [
+                args(&["check", secret]),
+                args(&["serve", secret]),
+                args(&[secret]),
+            ] {
+                let error = parse(command_line).unwrap_err();
+                assert_eq!(error, CliError::UnknownArgument, "{secret}");
+                assert!(!error.to_string().contains(secret), "{secret}");
+            }
+        }
+    }
+
+    #[test]
+    fn only_a_token_written_like_a_flag_is_quotable_as_one() {
+        for flag in ["--config", "-h", "--allow-locking-reads", "-V"] {
+            assert!(is_flag_shaped(flag), "{flag}");
         }
         for value in [
+            // The dash is the whole test: every one of these is a plausible secret or
+            // path, and every one of them is letters, digits, and dashes.
+            "correct-horse-battery-staple",
+            "hunter2",
+            "k3mz9qx1t7b",
+            "check",
             "postgres://user:password@host/db",
             "/etc/warden.toml",
             "--",
+            "-",
             "",
-            "s3cr3t!",
         ] {
-            assert!(!is_name_shaped(value), "{value}");
+            assert!(!is_flag_shaped(value), "{value}");
+        }
+    }
+
+    #[test]
+    fn a_typo_of_a_subcommand_is_still_named_but_a_distant_word_is_not() {
+        // One edit from a name Warden defines, so an operator sees their own typo.
+        for typo in ["serv", "serve1", "chek", "checkk", "versio", "helpp"] {
+            assert!(is_near_miss(typo), "{typo}");
+        }
+        // Two or more edits away: no longer a plausible typo, and a bare word this far
+        // from Warden's vocabulary is the operator's own value. `hepl` is here because a
+        // transposition is two substitutions and this deliberately does not measure
+        // Damerau distance: the cost of getting a common typo's generic message is one
+        // line telling the operator to run `warden help`, and the cost of widening the
+        // neighbourhood is more bare words becoming quotable.
+        for other in [
+            "hepl",
+            "does-not-exist",
+            "correct-horse-battery-staple",
+            "hunter2",
+            "",
+        ] {
+            assert!(!is_near_miss(other), "{other}");
         }
     }
 
