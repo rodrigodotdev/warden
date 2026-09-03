@@ -16,13 +16,6 @@
 use warden_ports::{AuditAttempt, AuditError, AuditOutcomeEvent, AuditSink, BoxFuture};
 
 /// The target both events carry, matching `warden-service`'s own audit alarm.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "read back only by this module's own test until Task 9 wires the sink"
-    )
-)]
 const AUDIT_TARGET: &str = "warden.audit";
 
 /// Every field [`TracingAuditSink::record_attempt`] emits, in the order it emits them.
@@ -79,13 +72,6 @@ const OUTCOME_FIELDS: &[&str] = &[
 /// A unit struct: it holds no handle, no buffer, and no configuration, which is the
 /// whole reason it cannot fail. `warden_config::AuditMode` therefore has no effect here
 /// yet — Milestone 13's sink is what gives the mode its meaning.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "`crate::startup::build` is the only caller, and Task 9 gives it one"
-    )
-)]
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct TracingAuditSink;
 
