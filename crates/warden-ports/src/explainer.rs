@@ -4,9 +4,10 @@
 //! planner constant-folds `IMMUTABLE` functions, so a malicious immutable function
 //! runs during planning: every policy that applies to `query` applies here
 //! (`docs/mcp.md` section 3.1), and SPEC section 6, invariant 12 requires an
-//! authorization before anything reaches the database. `ExplainRequest` stays the
-//! MCP-facing input type that Milestone 12 converts into a `QueryRequest` for
-//! analysis and authorization.
+//! authorization before anything reaches the database. `ExplainRequest` stays the type
+//! the MCP layer builds: `warden_mcp::ExplainInput::into_request` validates the agent's
+//! arguments into a `QueryRequest` and wraps it, and `warden_service::ExplainService`
+//! analyzes and authorizes that wrapped query before an adapter is asked for a plan.
 //!
 //! This is also the only design point where the string sent to the database differs
 //! from the analyzed one. The adapter prefixes the statement, reparses the result,

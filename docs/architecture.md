@@ -394,8 +394,12 @@ The attempt is recorded **before** permit acquisition and execution. If the sink
 fails, deny the query. If the process dies during execution, the attempt is already
 recorded. A recorded attempt receives its terminal outcome only if the request future
 is polled to completion — dropping it mid-flight releases the permit but writes no
-outcome — so the audit trail's completeness depends on Milestone 12 running each
-request in its own task, as `AGENTS.md` requires.
+outcome — so the audit trail's completeness depends on each request running in its own
+task, as `AGENTS.md` requires. Milestone 12 shipped that:
+`WardenServer::run_in_task` in `crates/warden-mcp/src/server.rs` spawns every tool call
+that reaches an adapter, awaits the handle, and maps a `JoinError` to `internal_error`.
+It contains the panic; it does not complete the audit record of the request that raised
+one, which stays Milestone 13's (ADR-0038).
 
 ## 9. Why adapters remain separate crates
 

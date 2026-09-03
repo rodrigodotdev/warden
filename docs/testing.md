@@ -254,7 +254,20 @@ Start Warden over stdio and test initialization, tool discovery,
 `list_connections`, `search_schema`, `describe_schema`, `query`, `explain`, denied
 query responses, sanitized errors, **protocol-only stdout**, and tool-schema snapshots.
 
-MCP E2E coverage of `search_schema` and `describe_schema` remains Milestone 12 work.
+**Shipped in Milestone 12, across two suites.**
+`crates/warden-mcp/tests/protocol.rs` drives the handshake and all five tools —
+`search_schema` and `describe_schema` included — over a real duplex transport against fake
+ports; it asserts tool discovery, the refusal of an unimplemented version with the
+supported list, a denial arriving as a readable error result, and the ADR-0040
+counts-not-values result shape. `tests/mcp_database.rs` drives the real binary over stdio
+against MySQL and PostgreSQL containers, where
+`an_agent_can_find_a_table_describe_it_query_it_and_plan_it` runs `search_schema` and
+`describe_schema` against real catalogs before querying and planning what they found, and
+where a real driver error is shown to reach the agent as a code and nothing else,
+protocol-only stdout is measured on a real process, and the database role itself is shown
+to refuse a write with every Warden layer removed. Tool-schema snapshots live in
+`crates/warden-mcp/tests/tool_schema.rs`, against
+`crates/warden-mcp/tests/snapshots/tools.json`.
 
 Once Streamable HTTP exists, test protocol negotiation, authorization, unauthenticated
 request rejection, principal propagation, concurrent requests, shutdown, malformed

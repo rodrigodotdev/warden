@@ -21,15 +21,16 @@ no error, only a `tracing::warn!` on stderr that the client cannot see. The clie
 must notice by comparing the `initialize` response's `protocolVersion` with its
 request.
 
-**Recorded decision, deferred to Milestone 12.** Accepting the SDK default advertises
-support for four versions (`2024-11-05` through `2025-11-25`) that Warden has neither
-implemented nor tested. Once `warden-mcp` exists beyond its current placeholder,
-override `supported_protocol_versions` with only the versions Warden actually speaks.
-The SDK fallback will then select Warden's real version instead of rmcp's
-`ProtocolVersion::LATEST`. This does not eliminate silent substitution because
-`negotiate_protocol_version` has no error hook. Turning substitution into a hard
-`initialize` failure would require bypassing that SDK function; decide whether this
-is worthwhile in M12 alongside the real handler, not in the disposable M0.5 crate.
+**Decided in Milestone 12: Warden advertises only what it implements (ADR-0041).**
+`supported_protocol_versions` returns exactly two revisions — `V_2025_11_25` and
+`V_2026_07_28` — rather than the five the SDK knows, because advertising a revision
+Warden has neither implemented nor tested is a claim it cannot keep. Silent substitution
+is closed the only way the SDK allows: `negotiate_protocol_version` has no error hook, so
+`ServerHandler::initialize` is overridden instead, and a request naming any other revision
+returns `ErrorData::unsupported_protocol_version` carrying the supported list in its
+`data`, so the client can retry with a version both sides actually implement. A refusal
+returned from a handler's `initialize` is written to the transport before the session
+ends, so it reaches the client rather than only stderr.
 
 Do not hand-roll framing or Streamable HTTP semantics supplied by the official SDK.
 
@@ -70,6 +71,17 @@ Use `Tool::output_schema` and `CallToolResult::structured_content` from `rmcp` 3
 - Snapshot-test schemas in CI. Without verification, the evolution rules in section 4
   are ineffective; snapshots make every contract change visible in the diff.
 
+**Shipped in Milestone 12.** All five tools carry an `output_schema` derived from their
+response type, and the whole advertised contract — every tool's name, description,
+annotations, input schema, and output schema — is snapshotted in
+`crates/warden-mcp/tests/snapshots/tools.json`. Renaming a field, relaxing an annotation,
+or adding a tool changes that file, so section 4's rules are reviewable in a diff rather
+than remembered. One schema is hand-written: a result cell's, because no Rust type
+expresses "an integer outside ±2^53 arrives as a decimal string" and a derived schema
+would claim `integer` alone (`docs/data-model.md` section 8.1, rule 6). **ADR-0040
+governs the response shape**: `structured_content` is the data, and `content` is not a
+second copy of it — see the note at the top of section 2.
+
 ### 1.3 Descriptions
 
 Descriptions are product and security surface: they shape agent behavior. Poor
@@ -89,6 +101,23 @@ Each description must communicate:
   placeholder syntax.
 
 ## 2. Contracts
+
+Each document below is what `structured_content` carries. **A successful result puts the
+data there and nothing else**: `content` holds one short line that states counts and flags
+— rows returned, matches found, whether the result was truncated, and for `explain` the
+plan's own row estimate — and never a value the database returned.
+rmcp's own `Json<T>` return type would set `structured_content` *and* push the whole
+document into a text block; Warden builds the result by hand instead, because
+`structured_content` is adopted in `docs/security.md` section 9 precisely so database
+contents stop being free text indistinguishable from instructions, and duplicating them
+into `content` would forfeit that and double what reaches model context. ADR-0040 records
+the decision, including that it is a deliberate deviation from MCP's
+backward-compatibility SHOULD.
+
+**A failed result is the one asymmetry.** Its payload is a fixed code and a fixed
+sentence from `docs/security.md` section 10 — no database content at all — so it appears
+in both `structured_content` and `content`, which costs nothing and still serves a client
+that reads only text.
 
 ### `list_connections`
 
@@ -252,8 +281,10 @@ production DSN stored in the same environment available to the agent.**
 Do not store production secrets in a committed or agent-readable `.env`, repository
 configuration, `AGENTS.md`, `CLAUDE.md`, prompt files, or MCP tool output.
 
-Prefer remote Warden for production. `warden check` warns when stdio serves a profile
-with `environment = "production"`.
+Prefer remote Warden for production. `warden check` prints a warning for every connection
+whose `environment` is `production`, naming it, and `warden serve` logs the same sentence
+on stderr before it opens anything. Neither is a failure: an operator may have chosen this
+deployment, so the exit code stays 0.
 
 ## 8. HTTP authorization
 

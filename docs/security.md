@@ -454,6 +454,18 @@ contents and schema names enter model context and can attempt to influence the a
 - Row and byte limits reduce untrusted content volume per call.
 - Auditing records every read, making abuse detectable after the fact.
 
+**Shipped in Milestone 12 (ADR-0040).** Structured content is not merely used, it is the
+whole response: a successful tool result carries its data in `structured_content` and one
+line in `content` that states counts and flags and never a value the database returned.
+rmcp's own `Json<T>` return type would have set `structured_content` *and* pushed the
+serialized document into a text block, which is what MCP's backward-compatibility SHOULD
+asks for; Warden builds the result by hand instead, because a free-text copy of every row
+would forfeit exactly the mitigation this section adopts and double what reaches model
+context. `crates/warden-mcp/src/output.rs` has one place that builds a successful result,
+so no tool can reintroduce the copy on its own, and
+`crates/warden-mcp/tests/protocol.rs` asserts over the wire that the rows arrive in
+`structuredContent` and that the fixture's own cell value appears in no text block.
+
 **Accepted residual risk:** Warden does not inspect or sanitize database contents. A
 hostile stored value can influence the agent. This appears in the SPEC section 7
 guarantee boundaries and must appear in the README. Heuristic content sanitization
@@ -476,6 +488,32 @@ query_rejected              query_execution_error
 server_busy                 schema_lookup_error
 explain_error               internal_error
 ```
+
+**Shipped in Milestone 12.** `crates/warden-mcp/src/error.rs` is the single boundary:
+every failed tool call in `warden-mcp` leaves through its `failure` function, and so does
+the one path in `output.rs` where a response cannot be serialized. It takes a
+`PublicErrorCode` and **never a message** — there is no parameter a driver string could be
+threaded through — and pairs each code with a fixed sentence chosen by an exhaustive match
+with no wildcard arm, so a new code does not compile until someone has written what an
+agent will read.
+
+`crates/warden-mcp/tests/mcp_rules.rs` keeps it that way, and two of its rules exist
+because the first versions did not. One is an AST guard: any path ending in
+`CallToolResult::error` — rmcp's own constructor, which yields `is_error: true` with
+free-form text — fails the build in every file but `error.rs`. The other scans `server.rs`
+and `stdio.rs` for `format!`, for `.to_string()` on a binding *named* like an error, and
+for `{error}`-style interpolation; it is a name-based heuristic backstop and its own
+comment says so, because the structural guarantee is `failure`'s signature rather than
+anything a syntactic scan can prove.
+
+One documented gap: an argument that fails `serde` deserialization is refused by rmcp
+before Warden sees it, and the agent reads rmcp's own wording ("failed to deserialize
+parameters: missing field `sql`") rather than a `PublicErrorCode`. That text is limited to
+Warden's own schema field names, which are already public in the tool-schema snapshot — no
+user data, no driver message, no DSN — so this section's prohibitions hold. Intercepting
+it would mean every tool taking a raw `Value` and hand-rolling deserialization;
+`crates/warden-mcp/tests/protocol.rs` pins the current framing with a comment saying it
+pins the SDK's behaviour, not a Warden invariant.
 
 ## 11. Auditing
 
@@ -599,6 +637,19 @@ Two complementary controls are mandatory:
 - **Panic hook:** panic messages can contain data, such as an `expect` formatting a row
   value, and stderr is the log destination. Record location and type, **not payload**.
 
+**Containment shipped in Milestone 12; the panic hook did not.** Every `#[tool]` method in
+`crates/warden-mcp/src/server.rs` that reaches an adapter runs through
+`WardenServer::run_in_task`, which `tokio::spawn`s the call, awaits the handle, and maps a
+`JoinError` to `internal_error` while logging no payload. `list_connections` is the one
+exception, and deliberately so: it reads an in-memory map and awaits nothing, so a task
+would add a hop and a failure mode without containing anything.
+`docs/architecture.md` section 8 and ADR-0038 both assign this to Milestone 12 by name,
+because a recorded audit attempt receives its terminal outcome only if the request future
+is polled to completion. Containment is all it buys: a task that panics still leaves its
+attempt without an outcome, which ADR-0038 states and Milestone 13's audit work owns. The
+payload-free panic hook is Milestone 13's too, so until it exists a panic message reaches
+stderr with whatever the panicking expression formatted into it.
+
 Do not globally catch every panic and continue as if nothing happened. Add parser
 panic containment only if fuzzing demonstrates a dependency panic that can be safely
 isolated.
@@ -621,7 +672,7 @@ isolated.
 - [x] Per-value and total-byte limits are tested
 - [x] Pool reuse after cancellation is tested
 - [x] Database-role write rejection is tested
-- [ ] MCP error sanitization is tested
+- [x] MCP error sanitization is tested
 - [ ] Fail-closed audit attempts are tested
 - [ ] HTTP authorization is tested before publishing remote-production guidance
 - [ ] `cargo deny check` is clean

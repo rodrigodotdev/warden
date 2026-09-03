@@ -259,8 +259,12 @@ statement-size cap can carry roughly 4096 columns, and each contributes its name
 to 64 bytes), its `database_type` string, and JSON object overhead — on the order of
 0.5 MiB, against a 256 KiB row budget. This is deliberate, not a bug: bounding
 `columns` too would require truncating schema information rows have already made
-visible. Milestone 12 must design the MCP tool contract against this real combined
-bound, not against `max_result_bytes` alone.
+visible. Milestone 12 designed the MCP tool contract against this real combined bound
+rather than against `max_result_bytes` alone: a successful tool result carries the data
+once, in `structured_content`, with one counting line in `content` instead of the
+serialized copy rmcp's `Json<T>` would have added (ADR-0040). That roughly halves what one
+successful call spends, and it is the only lever this milestone had — bounding `columns`
+itself is still refused for the reason above.
 
 ## 8. Result model
 

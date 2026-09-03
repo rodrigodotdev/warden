@@ -160,11 +160,37 @@ checkbox for two-phase auditing does not flip in M11.
 
 ## M12 — MCP over stdio
 
-Use rmcp for all five tools, populated `ToolAnnotations`, derived `output_schema`,
-`structured_content`, descriptions from `docs/mcp.md` section 1.3, subprocess E2E
-tests, and tool-schema snapshots.
+**First developer-usable release.** Eleven milestones of libraries became a program.
 
-**First developer-usable release.**
+Built here: `warden-config` parses the documented TOML, resolves DSNs from environment
+variables and files straight into `warden_core::secret::Dsn` without ever holding one in
+a struct that derives `Serialize`, and refuses a deployment it cannot serve.
+`warden-mcp` exposes the five generic tools over rmcp 3.1.4 with populated
+`ToolAnnotations`, an `output_schema` on every tool, and the section 1.3 descriptions,
+each written as a doc comment the `#[tool]` macro lifts. A successful result carries its
+data in `structured_content` and one counting line in `content` rather than a second copy
+of the rows (ADR-0040). `initialize` advertises `2025-11-25` and `2026-07-28` and refuses
+anything else instead of substituting silently (ADR-0041). `src/startup.rs` assembles
+configuration, adapters, policy, and services in the composition root, and `warden serve
+--transport stdio` and `warden check` are the CLI over it.
+
+Measured, not asserted: `crates/warden-mcp/tests/protocol.rs` drives the handshake and
+all five tools over a real duplex transport with fake ports;
+`crates/warden-mcp/tests/snapshots/tools.json` pins the tool contract and
+`crates/warden-mcp/tests/mcp_rules.rs` pins the boundary that sanitizes it;
+`tests/mcp_database.rs` drives the real binary over stdio against MySQL and PostgreSQL
+containers and, with every Warden layer removed, proves the database role itself refuses
+the same write — the second barrier `AGENTS.md` requires. The disposable Milestone 0.5
+tracer bullet was retired here, once those suites covered the same ground through the
+real SPEC boundaries.
+
+Deliberately left: the audit sink writes structured `tracing` events to stderr and
+therefore cannot fail, so ADR-0022's fail-closed attempt has nothing to fail on and the
+two audit-related boxes below stay unticked for Milestone 13. Per-request task
+containment shipped (ADR-0038, `docs/security.md` section 14); the payload-free panic
+hook did not. Policy profiles may differ in capacity but not in policy (ADR-0039).
+`InputLimits` stay at their documented defaults with no configuration key, and a client
+cancellation does not reach a running query — open questions 22, 23, and 24.
 
 ---
 
@@ -227,14 +253,30 @@ that the supposedly generic core was secretly shaped around MySQL.
 - [x] Concurrency per connection is bounded
 - [x] Schema search and description work on both engines with object policy
 - [x] Non-executing `EXPLAIN` works on both engines with reparse verification
-- [ ] MCP over stdio exposes generic tools with annotations and output schemas
-- [ ] Tool schemas do not vary by database and are snapshotted in CI
-- [ ] DSNs never appear in tool responses
+- [x] MCP over stdio exposes generic tools with annotations and output schemas
+- [x] Tool schemas do not vary by database and are snapshotted in CI
+- [x] DSNs never appear in tool responses
 - [ ] Raw SQL and parameters are disabled in logs and audits by default
 - [ ] Two-phase auditing uses fail-closed attempts
-- [ ] SQLx errors are sanitized at the MCP boundary
-- [ ] Integration tests use real containers
-- [ ] MCP E2E tests exist
+- [x] SQLx errors are sanitized at the MCP boundary
+- [x] Integration tests use real containers
+- [x] MCP E2E tests exist
 - [x] A security corpus exists
-- [ ] README documents secure deployment and the SPEC section 7 guarantee boundaries
-- [ ] Security documentation states that database privileges are mandatory
+- [x] README documents secure deployment and the SPEC section 7 guarantee boundaries
+- [x] Security documentation states that database privileges are mandatory
+
+The two unticked boxes are both about a sink Milestone 13 owns, not about a control that
+is missing.
+
+"Raw SQL and parameters are disabled in logs and audits by default" is structurally true
+today: `warden_ports::AuditAttempt` has no field a statement or a bound parameter could
+occupy, and `src/audit.rs` emits none. It stays unticked because a claim about what an
+audit record does *not* contain is only reviewable against a record format, and Milestone
+13 owns the sink that has one.
+
+"Two-phase auditing uses fail-closed attempts" is ordered structurally — `warden-service`
+records the attempt before it acquires a permit or dispatches, and
+`crates/warden-service/tests/service_rules.rs` keeps that the only call path (ADR-0038).
+It stays unticked because `src/audit.rs` writes `tracing` events and a `tracing` macro
+returns unit: a sink that cannot fail cannot demonstrate failing closed. Milestone 13's
+persistent sink can.
