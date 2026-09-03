@@ -65,8 +65,13 @@ pub(crate) enum Transport {
 
 /// Command-line parsing failures.
 ///
-/// Every variant names a flag or a subcommand and never the argument after it, which
-/// on this command line is the one place a DSN could appear.
+/// A message may quote **Warden's own vocabulary and nothing else**: a subcommand name, a
+/// flag name, or a transport name, each of which has to be name-shaped
+/// ([`is_name_shaped`]) before it is quoted at all. Everything an operator types that is
+/// not one of those is a value, and on this command line a DSN is the value that matters,
+/// so an unrecognized value is reported without being echoed. `--flag=value` is split at
+/// the first `=` before any of this, which is what keeps the value half of an unknown
+/// `--dsn=<secret>` out of the message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CliError {
     /// No subcommand was provided.
@@ -74,16 +79,22 @@ pub(crate) enum CliError {
     /// The subcommand does not exist. Contains only its name, never later arguments
     /// that might contain a DSN.
     UnknownCommand(String),
-    /// A flag this command accepts was the last argument, so its value is missing.
+    /// A flag this command accepts was given no value.
     MissingValue {
         /// The flag left without a value. One of Warden's own literals, never input.
         flag: &'static str,
     },
-    /// The subcommand does not accept this flag. Contains the flag, never its value.
+    /// The subcommand does not accept this flag. Contains the flag name, never its value.
     UnknownFlag {
-        /// The flag as written.
+        /// The flag as written, up to but not including any `=`.
         flag: String,
     },
+    /// An argument that is not name-shaped, so nothing about it can be quoted safely.
+    ///
+    /// A bare `warden serve postgres://user:password@host/db` lands here: the token is a
+    /// value, a value on this command line can be a DSN, and an operator's supervisor
+    /// collects stderr.
+    UnknownArgument,
     /// `--transport` named a transport this build does not serve.
     UnsupportedTransport {
         /// The transport as written. A transport name is not a secret.
@@ -105,6 +116,9 @@ impl fmt::Display for CliError {
             }
             Self::UnknownFlag { flag } => {
                 write!(f, "unknown flag: `{flag}`; use `warden help`")
+            }
+            Self::UnknownArgument => {
+                write!(f, "unknown argument; use `warden help`")
             }
             Self::UnsupportedTransport { name } => {
                 write!(
@@ -138,7 +152,10 @@ where
         "help" | "--help" | "-h" => Ok(Command::Help),
         "serve" => parse_serve(args),
         "check" => parse_check(args),
-        other => Err(CliError::UnknownCommand(other.to_owned())),
+        // The subcommand position is as capable of holding a DSN as any other, so the
+        // same shape rule decides whether this one can be named.
+        other if is_name_shaped(other) => Err(CliError::UnknownCommand(other.to_owned())),
+        _unquotable => Err(CliError::UnknownArgument),
     }
 }
 
@@ -151,10 +168,11 @@ where
     let mut transport = Transport::Stdio;
 
     while let Some(argument) = args.next() {
-        match argument.as_str() {
-            "--config" => config = Some(PathBuf::from(value_of("--config", &mut args)?)),
-            "--transport" => transport = value_of("--transport", &mut args)?.parse()?,
-            _ => return Err(CliError::UnknownFlag { flag: argument }),
+        let (flag, inline) = split_inline_value(&argument);
+        match flag {
+            "--config" => config = Some(PathBuf::from(value_of("--config", inline, &mut args)?)),
+            "--transport" => transport = value_of("--transport", inline, &mut args)?.parse()?,
+            unknown => return Err(unknown_argument(unknown)),
         }
     }
 
@@ -172,9 +190,10 @@ where
     let mut config = None;
 
     while let Some(argument) = args.next() {
-        match argument.as_str() {
-            "--config" => config = Some(PathBuf::from(value_of("--config", &mut args)?)),
-            _ => return Err(CliError::UnknownFlag { flag: argument }),
+        let (flag, inline) = split_inline_value(&argument);
+        match flag {
+            "--config" => config = Some(PathBuf::from(value_of("--config", inline, &mut args)?)),
+            unknown => return Err(unknown_argument(unknown)),
         }
     }
 
@@ -183,15 +202,64 @@ where
     })
 }
 
-/// Takes the argument after `flag`, or reports the flag that had none.
+/// Takes a flag's value from `--flag=value` or from the argument after it.
 ///
 /// `flag` is the matched literal rather than the string the operator typed, which is
-/// what keeps [`CliError::MissingValue`] a `&'static str` and unable to echo input.
-fn value_of<I>(flag: &'static str, args: &mut I) -> Result<String, CliError>
+/// what keeps [`CliError::MissingValue`] a `&'static str` and unable to echo input. An
+/// empty inline value (`--config=`) is a mistake rather than a path, and is reported as
+/// the missing value it is.
+fn value_of<I>(flag: &'static str, inline: Option<&str>, args: &mut I) -> Result<String, CliError>
 where
     I: Iterator<Item = String>,
 {
-    args.next().ok_or(CliError::MissingValue { flag })
+    match inline {
+        Some(value) if !value.is_empty() => Ok(value.to_owned()),
+        Some(_empty) => Err(CliError::MissingValue { flag }),
+        None => args.next().ok_or(CliError::MissingValue { flag }),
+    }
+}
+
+/// Splits `--flag=value` into its two halves, leaving a bare `--flag` alone.
+///
+/// Both forms are accepted, so `--config=/etc/warden.toml` works. This runs before any
+/// flag is matched, so the value half of an argument Warden does not recognize is already
+/// separated from the name by the time an error is built.
+fn split_inline_value(argument: &str) -> (&str, Option<&str>) {
+    match argument.split_once('=') {
+        Some((flag, value)) => (flag, Some(value)),
+        None => (argument, None),
+    }
+}
+
+/// Reports an argument no subcommand accepts, naming it only when naming it is safe.
+///
+/// A flag name is Warden's vocabulary and helps an operator find the typo. Anything else
+/// is a value the operator supplied, and this command line's values include DSNs, so it
+/// is refused without being repeated into whatever collects stderr.
+fn unknown_argument(argument: &str) -> CliError {
+    if is_name_shaped(argument) {
+        CliError::UnknownFlag {
+            flag: argument.to_owned(),
+        }
+    } else {
+        CliError::UnknownArgument
+    }
+}
+
+/// Whether a token has the shape of a name Warden itself could have defined.
+///
+/// An optional `-` or `--`, then an ASCII letter, then ASCII letters, digits, and dashes.
+/// `--dsn`, `-h`, and `check` pass; `postgres://user:password@host/db`,
+/// `/etc/warden.toml`, and any password that is not a bare word fail. It is a whitelist,
+/// so a token this cannot classify is one Warden does not quote.
+fn is_name_shaped(argument: &str) -> bool {
+    let name = argument
+        .strip_prefix("--")
+        .or_else(|| argument.strip_prefix('-'))
+        .unwrap_or(argument);
+    let mut characters = name.chars();
+    matches!(characters.next(), Some(first) if first.is_ascii_alphabetic())
+        && characters.all(|character| character.is_ascii_alphanumeric() || character == '-')
 }
 
 impl std::str::FromStr for Transport {
@@ -381,6 +449,84 @@ mod tests {
         let rendered = error.to_string();
         assert!(rendered.contains("--dsn"), "{rendered}");
         assert!(!rendered.contains("postgres://"), "{rendered}");
+    }
+
+    #[test]
+    fn an_inline_value_is_accepted_so_the_equals_form_is_not_a_usage_error() {
+        assert_eq!(
+            parse(args(&["check", "--config=/etc/warden.toml"])).unwrap(),
+            Command::Check {
+                config: PathBuf::from("/etc/warden.toml")
+            }
+        );
+        assert_eq!(
+            parse(args(&[
+                "serve",
+                "--config=/etc/warden.toml",
+                "--transport=stdio"
+            ]))
+            .unwrap(),
+            Command::Serve {
+                config: PathBuf::from("/etc/warden.toml"),
+                transport: Transport::Stdio,
+            }
+        );
+    }
+
+    #[test]
+    fn an_empty_inline_value_is_the_missing_value_it_is() {
+        assert_eq!(
+            parse(args(&["check", "--config="])).unwrap_err(),
+            CliError::MissingValue { flag: "--config" }
+        );
+    }
+
+    #[test]
+    fn an_unknown_flag_written_with_an_inline_secret_echoes_only_the_flag() {
+        let error = parse(args(&["check", "--dsn=postgres://u:password@h/d"])).unwrap_err();
+        assert_eq!(
+            error,
+            CliError::UnknownFlag {
+                flag: "--dsn".to_owned()
+            }
+        );
+        let rendered = error.to_string();
+        assert!(rendered.contains("--dsn"), "{rendered}");
+        assert!(!rendered.contains("postgres://"), "{rendered}");
+        assert!(!rendered.contains("password"), "{rendered}");
+    }
+
+    #[test]
+    fn a_bare_argument_is_refused_without_being_repeated() {
+        // A positional argument is a value, and a value here can be a DSN. An operator's
+        // supervisor collects stderr, so the token is refused rather than quoted.
+        for command_line in [
+            args(&["serve", "postgres://u:password@h/d"]),
+            args(&["check", "postgres://u:password@h/d"]),
+            args(&["postgres://u:password@h/d"]),
+        ] {
+            let error = parse(command_line).unwrap_err();
+            assert_eq!(error, CliError::UnknownArgument);
+            let rendered = error.to_string();
+            assert!(!rendered.contains("postgres://"), "{rendered}");
+            assert!(!rendered.contains("password"), "{rendered}");
+        }
+    }
+
+    #[test]
+    fn only_a_name_warden_could_have_defined_is_quotable() {
+        for name in ["--config", "-h", "check", "--allow-locking-reads"] {
+            assert!(is_name_shaped(name), "{name}");
+        }
+        for value in [
+            "postgres://user:password@host/db",
+            "/etc/warden.toml",
+            "--",
+            "",
+            "s3cr3t!",
+        ] {
+            assert!(!is_name_shaped(value), "{value}");
+        }
     }
 
     #[test]

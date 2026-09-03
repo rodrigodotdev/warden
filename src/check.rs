@@ -81,9 +81,9 @@ pub(crate) async fn run(config: &Path, out: &mut dyn Write) -> Result<bool> {
     )?;
 
     // The probes run against a fully built deployment, so every pool this opened is
-    // closed even when a probe fails or the report cannot be written. `build` itself is
-    // all-or-nothing: a connection that refuses to open aborts it, and the process exits
-    // without another connection to close.
+    // closed even when a probe fails or the report cannot be written. A connection that
+    // refuses to open never reaches this point: `build` aborts, closing whatever it had
+    // already opened, and the error propagates from the line above.
     let probed = probe(&deployment, out).await;
     deployment.close().await;
     let failures = probed?;
