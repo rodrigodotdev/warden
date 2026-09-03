@@ -104,17 +104,27 @@ impl Deployment {
     /// adapter's post-query cleanup, because that is what a draining pool is waiting on.
     pub(crate) async fn close(self) {
         self.shutdown.cancel();
-        for pool in &self.pools {
-            if tokio::time::timeout(MAX_ADAPTER_CLEANUP, pool.close())
-                .await
-                .is_err()
-            {
-                tracing::warn!(
-                    target: "warden.startup",
-                    connection = %pool.name(),
-                    "the connection pool did not drain within the cleanup budget"
-                );
-            }
+        close_pools(&self.pools).await;
+    }
+}
+
+/// Closes each pool in turn, none of them for longer than [`MAX_ADAPTER_CLEANUP`].
+///
+/// Shared by [`Deployment::close`] and by [`build`]'s own failure path, so a connection
+/// opened during a startup that later fails is closed the same way one opened during a
+/// startup that succeeded is: `docs/architecture.md` section 13 bounds every wait, and a
+/// server that has stopped answering must not turn a failure into a hang.
+async fn close_pools(pools: &[PoolHandle]) {
+    for pool in pools {
+        if tokio::time::timeout(MAX_ADAPTER_CLEANUP, pool.close())
+            .await
+            .is_err()
+        {
+            tracing::warn!(
+                target: "warden.startup",
+                connection = %pool.name(),
+                "the connection pool did not drain within the cleanup budget"
+            );
         }
     }
 }
@@ -209,7 +219,8 @@ impl PoolHandle {
 ///
 /// Returns an operator-facing error naming the connection, the registry, the policy
 /// profile, or the redaction rules — whichever refused to be built. No message carries a
-/// DSN.
+/// DSN. Every connection opened before a later one failed is closed before the error
+/// propagates, so a failed startup leaves no session for a server to time out.
 pub(crate) async fn build(
     config: ResolvedConfig,
     shutdown: CancellationToken,
@@ -230,11 +241,23 @@ pub(crate) async fn build(
     let audit: Arc<dyn AuditSink> = Arc::new(TracingAuditSink);
 
     let mut runtimes = Vec::with_capacity(connections.len());
-    let mut pools = Vec::with_capacity(connections.len());
+    let mut pools: Vec<PoolHandle> = Vec::with_capacity(connections.len());
     for connection in connections {
-        let (runtime, pool) = build_connection(connection).await?;
-        runtimes.push(Arc::new(runtime));
-        pools.push(pool);
+        match build_connection(connection).await {
+            Ok((runtime, pool)) => {
+                runtimes.push(Arc::new(runtime));
+                pools.push(pool);
+            }
+            Err(error) => {
+                // The connections opened before this one have already been accepted by
+                // their servers. Dropping them would leave every one of those sessions to
+                // be reclaimed by the operating system with no close handshake sent, and
+                // a multi-connection deployment is exactly where a startup failure is
+                // most likely to be retried.
+                close_pools(&pools).await;
+                return Err(error);
+            }
+        }
     }
 
     let registry: Arc<dyn ConnectionRegistry> = Arc::new(

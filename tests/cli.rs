@@ -120,6 +120,9 @@ fn check_reports_a_configuration_error_and_exits_non_zero() {
     let _ = std::fs::remove_file(&path);
 
     assert!(!output.status.success());
+    // The same discipline the serve test asserts: a diagnostic never reaches stdout,
+    // whichever subcommand raised it (docs/mcp.md section 5.1).
+    assert!(output.stdout.is_empty(), "stdout: {:?}", output.stdout);
     assert!(String::from_utf8_lossy(&output.stderr).contains("version"));
 }
 
