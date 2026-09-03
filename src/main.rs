@@ -119,7 +119,10 @@ async fn run_serve(config: &Path, transport: Transport) -> Result<ExitCode> {
 /// command whose output habit differs from `serve`'s is a command that eventually prints
 /// into a protocol stream. `warden check`'s answer is its exit code; the lines explain it.
 async fn run_check(config: &Path) -> Result<ExitCode> {
-    let mut stderr = io::stderr().lock();
+    // The handle, not a held `StderrLock`: this writer crosses every `await` in the
+    // probes, and a lock held that long would stall any thread the runtime logged from.
+    // `Stderr::write_fmt` locks per call, so each line still arrives whole.
+    let mut stderr = io::stderr();
     let clean = check::run(config, &mut stderr).await?;
     writeln!(
         stderr,
