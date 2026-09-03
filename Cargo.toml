@@ -150,11 +150,56 @@ publish = false
 workspace = true
 
 [dependencies]
+# The composition root is the one place that names every layer at once
+# (`docs/architecture.md` section 2). Nothing else in the workspace depends on both
+# an adapter and the MCP crate, which is what keeps the dependency direction real.
+warden-config = { workspace = true }
+warden-core = { workspace = true }
+warden-mcp = { workspace = true }
+warden-mysql = { workspace = true }
+warden-policy = { workspace = true }
+warden-ports = { workspace = true }
+warden-postgres = { workspace = true }
+warden-service = { workspace = true }
+# `anyhow` is allowed in main, startup composition, and CLI diagnostics, and nowhere
+# else (AGENTS.md).
+anyhow = { workspace = true }
+# The one runtime (ADR-0003). `signal` is what makes graceful shutdown a real signal
+# handler rather than a comment (`docs/architecture.md` section 13).
+tokio = { workspace = true, features = [
+  "rt-multi-thread",
+  "macros",
+  "signal",
+  "time",
+] }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+# stderr only: stdout carries MCP (`docs/mcp.md` section 5.1).
+tracing-subscriber = { workspace = true }
+
+[features]
+default = []
+# Enables the container-backed MCP end-to-end tests. Without it,
+# `cargo test --workspace` — the CI gate — starts no container.
+docker = []
 
 [dev-dependencies]
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 toml = { workspace = true }
+# The end-to-end tests drive Warden's own binary as a subprocess against real
+# containers: `process` and `io-util` speak to its stdio, `time` bounds every wait.
+testcontainers-modules = { workspace = true }
+tokio = { workspace = true, features = [
+  "macros",
+  "rt-multi-thread",
+  "process",
+  "io-util",
+  "time",
+] }
+# `AuditAttempt::timestamp` is the concrete `time::OffsetDateTime` the port exposes,
+# so the audit sink's own tests have to name it. Production code here never does.
+time = { workspace = true }
 
 # Per-task panic containment depends on unwinding; see docs/security.md section 14.
 [profile.release]
