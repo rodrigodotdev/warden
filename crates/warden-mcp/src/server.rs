@@ -11,11 +11,15 @@
 //! `docs/architecture.md` section 8 and ADR-0038 both assign this to Milestone 12: a
 //! recorded audit attempt receives its terminal outcome only if the request future is
 //! polled to completion, and `docs/security.md` section 14 calls per-request containment
-//! critical for the single-process stdio transport, where one panic would otherwise end
-//! the whole session. [`WardenServer::run_in_task`] spawns, awaits, and turns a
-//! `JoinError` into `internal_error`. It does not read the panic payload: a payload can
-//! contain a row value, and Milestone 13 owns the payload-free hook that records the
-//! location instead.
+//! critical for the single-process stdio transport. The consequence this contains is
+//! narrower than losing the session: rmcp already spawns every request onto its own task
+//! and drops the handle (`service.rs`'s `spawn_service_task`), so a handler that panicked
+//! without this would leave *that one* request permanently unanswered — the client waits
+//! on a JSON-RPC id no response ever arrives for — while the session and every other
+//! request carried on. [`WardenServer::run_in_task`] spawns, awaits, and turns a
+//! `JoinError` into `internal_error`, which is what turns that silent hang into an
+//! answer. It does not read the panic payload: a payload can contain a row value, and
+//! Milestone 13 owns the payload-free hook that records the location instead.
 //!
 //! What the spawn buys is containment, not a complete record of the request that
 //! panicked. ADR-0038's consequences say so directly: it keeps an ordinary request on

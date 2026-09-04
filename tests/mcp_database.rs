@@ -68,6 +68,13 @@ const PROTOCOL_VERSION: &str = "2026-07-28";
 /// `docs/testing.md` section 4 requires MySQL 8.4; the module defaults to 8.1.
 const MYSQL_TAG: &str = "8.4";
 
+/// The certificate authority MySQL generates on first start.
+///
+/// `crates/warden-mysql/src/container_tests.rs` extracts the same file for the same
+/// reason: `verify-ca` is the weakest TLS mode ADR-0030 lets a `production` connection
+/// use, and it is the only way this suite can configure one against a container.
+const CONTAINER_CA_PATH: &str = "/var/lib/mysql/ca.pem";
+
 /// The module defaults to an end-of-life release; testing needs a supported one.
 const PG_TAG: &str = "17-alpine";
 
@@ -160,6 +167,37 @@ impl Drop for TemporaryConfig {
     }
 }
 
+/// The container's own certificate authority, copied out and removed on both the
+/// success and the panic path.
+#[derive(Debug)]
+struct TemporaryCertificate {
+    /// Where it was written.
+    path: PathBuf,
+}
+
+impl TemporaryCertificate {
+    /// Copies the MySQL container's generated authority to a local file.
+    async fn from_container(container: &ContainerAsync<Mysql>) -> Self {
+        let bytes = container
+            .copy_file_from(CONTAINER_CA_PATH, Vec::new())
+            .await
+            .expect("failed to read the container's CA certificate");
+        let path = std::env::temp_dir().join(format!(
+            "warden-e2e-ca-{}-{:?}.pem",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::write(&path, bytes).expect("failed to write the CA certificate");
+        Self { path }
+    }
+}
+
+impl Drop for TemporaryCertificate {
+    fn drop(&mut self) {
+        let _ignored = std::fs::remove_file(&self.path);
+    }
+}
+
 /// One container, one provisioned fixture, one configuration file, one role DSN.
 #[derive(Debug)]
 struct Fixture {
@@ -169,6 +207,9 @@ struct Fixture {
     _server: Server,
     /// The configuration `warden serve` and `warden check` read.
     config: TemporaryConfig,
+    /// The extracted authority a `production` configuration points at, held so the file
+    /// outlives the child processes that read it. `None` until one is asked for.
+    _certificate: Option<TemporaryCertificate>,
     /// The DSN, handed to the child through the environment and never on its argv.
     dsn: String,
     /// The host the container is reachable at, for the leak assertions.
@@ -256,6 +297,7 @@ impl Fixture {
                 _container: container,
             },
             config,
+            _certificate: None,
             dsn,
             host,
             port,
@@ -338,6 +380,7 @@ impl Fixture {
                 _container: container,
             },
             config,
+            _certificate: None,
             dsn,
             host,
             port,
@@ -465,6 +508,48 @@ impl Fixture {
                 panic!("warden {arguments:?} did not finish within the process timeout")
             })
             .expect("failed to execute warden")
+    }
+
+    /// The same MySQL fixture, reconfigured as `docs/mcp.md` section 7's warned-about
+    /// deployment: a `production` connection served over stdio under a relaxed policy
+    /// profile.
+    ///
+    /// Only the configuration changes — the container, the role, and the DSN are the ones
+    /// every other test in this file uses. `verify-ca` rather than the `required` the
+    /// development configuration uses, because ADR-0030 confines `required` to
+    /// development and `production` must therefore verify a chain; the authority is the
+    /// one the container generated for itself, extracted the way
+    /// `crates/warden-mysql/src/container_tests.rs` already extracts it.
+    async fn into_a_warned_about_production_deployment(mut self) -> Self {
+        let Server::MySql {
+            _container: ref container,
+        } = self._server
+        else {
+            panic!("only the MySQL container serves a certificate `verify-ca` can check");
+        };
+        let certificate = TemporaryCertificate::from_container(container).await;
+        self.config = TemporaryConfig::write(&format!(
+            "version = 1\n\
+             \n\
+             [[connections]]\n\
+             name = \"{NAME}\"\n\
+             dialect = \"mysql\"\n\
+             environment = \"production\"\n\
+             database = \"test\"\n\
+             dsn_env = \"{DSN_VARIABLE}\"\n\
+             policy = \"e2e\"\n\
+             tls = {{ mode = \"verify-ca\", root_certificate = \"{certificate}\" }}\n\
+             \n\
+             [policies.e2e]\n\
+             allow_locking_reads = true\n\
+             allow_unknown_functions = true\n\
+             \n\
+             [redaction]\n\
+             columns = [\"*.password\"]\n",
+            certificate = certificate.path.display()
+        ));
+        self._certificate = Some(certificate);
+        self
     }
 
     /// The same fixture with a DSN whose password is wrong.
@@ -986,6 +1071,85 @@ async fn stdout_carries_protocol_only_and_the_process_exits_on_eof() {
     assert!(
         stderr.contains("warden starting"),
         "the startup log line is missing from stderr: {stderr}"
+    );
+}
+
+#[tokio::test]
+async fn both_serve_and_check_warn_about_a_relaxed_production_deployment() {
+    // The control `docs/mcp.md` section 7 and `docs/operations.md` section 3.1 ask for,
+    // measured where it is actually reached. Until this wave only the negative was
+    // asserted — a development connection raising nothing — which a
+    // `production_connections` that always returned an empty vec would have passed. This
+    // is the positive: a `production` connection under a relaxed profile, and the exact
+    // sentences both commands must print. `serve` is here because it is the process an
+    // operator reaches through an MCP client config, and it printed half of what `check`
+    // printed until the two were given one shared function.
+    let fixture = Fixture::start(Engine::MySql)
+        .await
+        .into_a_warned_about_production_deployment()
+        .await;
+
+    let (stdout, serve_stderr, status) = fixture
+        .run_to_completion(&with_ids(&[initialize(), initialized()]))
+        .await;
+    assert!(
+        status.success(),
+        "exit status {status:?}; stderr={serve_stderr}"
+    );
+    // The warnings go to stderr; stdout stays a protocol stream (docs/mcp.md section 5.1).
+    assert!(
+        !parse_protocol(&stdout).is_empty(),
+        "stdout carried no response at all; stderr={serve_stderr}"
+    );
+
+    let output = fixture.run_check().await;
+    let check_stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(output.status.success(), "stderr={check_stderr}");
+    assert!(output.stdout.is_empty(), "stdout: {:?}", output.stdout);
+
+    for (command, stderr) in [("serve", &serve_stderr), ("check", &check_stderr)] {
+        // A warning is only useful if it names the connection it is about.
+        assert!(
+            stderr.contains(NAME),
+            "warden {command} named no connection: {stderr}"
+        );
+        assert!(
+            stderr.contains("is a production connection served over stdio"),
+            "warden {command} raised no stdio exposure warning: {stderr}"
+        );
+        assert!(
+            stderr.contains("docs/mcp.md section 7"),
+            "warden {command} cited no document for the exposure warning: {stderr}"
+        );
+        // Both relaxations, separately: one loop that reported only the first would
+        // still contain the shared prefix.
+        assert!(
+            stderr.contains("the policy profile sets allow_locking_reads while serving"),
+            "warden {command} raised no allow_locking_reads warning: {stderr}"
+        );
+        assert!(
+            stderr.contains("the policy profile sets allow_unknown_functions while serving"),
+            "warden {command} raised no allow_unknown_functions warning: {stderr}"
+        );
+        assert!(
+            stderr.contains("docs/operations.md section 3.1"),
+            "warden {command} cited no document for the relaxation warning: {stderr}"
+        );
+        // A warning about a production deployment is exactly where a DSN would be most
+        // tempting to include.
+        for leaked in fixture.dsn_tokens() {
+            assert!(
+                !stderr.contains(&leaked),
+                "warden {command} leaked {leaked}: {stderr}"
+            );
+        }
+    }
+
+    // The report's own closing sentence, which is what makes a warning visible to an
+    // operator skimming the last line rather than the whole report.
+    assert!(
+        check_stderr.contains("warden check: every check passed, with warnings"),
+        "check did not report that it warned: {check_stderr}"
     );
 }
 

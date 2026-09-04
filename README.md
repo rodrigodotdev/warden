@@ -121,6 +121,12 @@ material:
 and unparseable SQL from reaching the database. It limits time, volume, and concurrency.
 It keeps credentials out of model context. It produces an audit trail for every attempt.
 
+**The audit trail covers query attempts, not every tool call.** SPEC section 6's
+invariant 24 — "every query attempt" — is what Warden implements today: `query` and
+`explain` record an attempt and its outcome. Schema reads (`search_schema`,
+`describe_schema`) and `list_connections` record neither, so a denied catalog read leaves
+no audit record. See [`docs/open-questions.md`](docs/open-questions.md) item 21.
+
 **Warden is not the final write boundary.** That boundary is the dedicated role's
 `GRANT`. SQL analysis reduces attack surface.
 

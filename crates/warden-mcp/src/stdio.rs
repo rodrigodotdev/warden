@@ -2,9 +2,12 @@
 //!
 //! stdout carries protocol data and nothing else (`docs/mcp.md` section 5.1). Two
 //! mechanisms keep that true and neither is a convention: `clippy::print_stdout = "deny"`
-//! makes a stray `println!` a build failure, and this module is the only place in the
-//! workspace that touches the process's stdout handle. Logging goes to stderr, and the
-//! server prints no banner.
+//! makes a stray `println!` a build failure, and this module is the only place on the
+//! serve path that acquires the process's stdout at all — [`serve_stdio`] asks
+//! `rmcp::transport::stdio()` for the handle, and from then on the protocol framing is
+//! its only writer. The workspace's other `io::stdout()` is `src/main.rs`'s immediate
+//! path, which prints `version` and `help` and never runs while a session is served.
+//! Logging goes to stderr, and the server prints no banner.
 //!
 //! Shutdown has two triggers. `stdin` reaching EOF means the client is gone, which is the
 //! ordinary end of a local session. The cancellation token means the process was asked to
@@ -92,7 +95,14 @@ where
         .waiting()
         .await
         .map_err(|join| StdioError::Shutdown(join.to_string()))?;
-    // stderr, never stdout, and a quit reason carries no request data.
+    // stderr, never stdout. `QuitReason::JoinError` wraps a `tokio::task::JoinError`,
+    // whose `Debug` prints the panic payload string — only the backtrace is elided — so
+    // this rendering is payload-bearing in principle. What it cannot carry is a row
+    // value: rmcp builds that variant from exactly one place, a lost task in its own
+    // `send_task_set` (`service.rs`), whose members are `transport.send` futures for
+    // server-initiated requests and notifications. No Warden code runs in one, and a tool
+    // response never travels that way — the handler task writes it to the service loop's
+    // own sink, and this future never awaits that task (`server.rs`'s `run_in_task`).
     tracing::debug!(target: "warden.mcp", ?reason, "the MCP session ended");
     Ok(())
 }

@@ -70,10 +70,11 @@ pub(crate) enum Transport {
 /// [`is_flag_shaped`], where the leading dash is what an operator writes for a flag and
 /// never for a value. A subcommand is quoted only when it is a near miss of a name Warden
 /// defines ([`is_near_miss`]), because that slot takes a bare word and a bare word can be
-/// a passphrase, a token, a username, or a hostname. A transport name is quoted because
-/// nothing but a transport is ever written there. Everything else an operator types is a
-/// value — on this command line a DSN is the value that matters — and is refused without
-/// being echoed. `--flag=value` is split at the first `=` before any of this, which is what
+/// a passphrase, a token, a username, or a hostname. A transport name is quoted on that
+/// same rule against its own vocabulary ([`TRANSPORTS`]): that slot takes a bare word too,
+/// and `warden serve --transport "$DSN"` with a misspelled variable puts a connection
+/// string in it. Everything else an operator types is a value — on this command line a DSN
+/// is the value that matters — and is refused without being echoed. `--flag=value` is split at the first `=` before any of this, which is what
 /// keeps the value half of an unknown `--dsn=<secret>` out of the message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum CliError {
@@ -101,11 +102,18 @@ pub(crate) enum CliError {
     /// this command line can be a DSN or a password, and an operator's supervisor collects
     /// stderr.
     UnknownArgument,
-    /// `--transport` named a transport this build does not serve.
+    /// `--transport` named a transport this build does not serve, and named it closely
+    /// enough to one Warden defines to be quoted back.
     UnsupportedTransport {
-        /// The transport as written. A transport name is not a secret.
+        /// The transport as written, and only ever a near miss of [`TRANSPORTS`].
         name: String,
     },
+    /// `--transport` was given a value too far from any transport Warden names to echo.
+    ///
+    /// `warden serve --transport "$DSN"` lands here when the variable holds a connection
+    /// string, which is why the value is dropped rather than repeated into whatever
+    /// collects stderr.
+    UnquotableTransport,
 }
 
 impl fmt::Display for CliError {
@@ -130,6 +138,13 @@ impl fmt::Display for CliError {
                 write!(
                     f,
                     "unsupported transport: `{name}`; this build serves `stdio` only, \
+                     and the HTTP transport arrives in Milestone 14"
+                )
+            }
+            Self::UnquotableTransport => {
+                write!(
+                    f,
+                    "unsupported transport; this build serves `stdio` only, \
                      and the HTTP transport arrives in Milestone 14"
                 )
             }
@@ -161,7 +176,7 @@ where
         // The subcommand position holds a bare word, and a bare word is as likely to be a
         // pasted secret as a typo. Only a near miss of a name Warden itself defines is
         // quoted back; anything further away is refused without being repeated.
-        other if is_near_miss(other) => Err(CliError::UnknownCommand(other.to_owned())),
+        other if is_near_miss(other, &COMMANDS) => Err(CliError::UnknownCommand(other.to_owned())),
         _unquotable => Err(CliError::UnknownArgument),
     }
 }
@@ -172,6 +187,13 @@ where
 /// so a typo of one is already quotable through [`is_flag_shaped`] when it reaches a
 /// subcommand's flag loop, and a near miss of `-h` is one edit from most short words.
 const COMMANDS: [&str; 4] = ["serve", "check", "version", "help"];
+
+/// The transport names Warden itself defines, for the same near-miss reporting.
+///
+/// `http` is here although this build refuses it: `docs/operations.md` section 11
+/// documents it and Milestone 14 serves it, so quoting it back is what puts the
+/// "arrives in Milestone 14" sentence in front of the operator who typed it.
+const TRANSPORTS: [&str; 2] = ["stdio", "http"];
 
 /// Parses `serve`'s `--config` and `--transport`, in either order.
 fn parse_serve<I>(mut args: I) -> Result<Command, CliError>
@@ -280,17 +302,18 @@ fn is_flag_shaped(argument: &str) -> bool {
         && characters.all(|character| character.is_ascii_alphanumeric() || character == '-')
 }
 
-/// Whether a token is a plausible typo of a subcommand, and so safe to quote back.
+/// Whether a token is a plausible typo of a name in `vocabulary`, and so safe to quote.
 ///
-/// The subcommand slot takes no dash, so [`is_flag_shaped`] cannot guard it and a bare
-/// word there is as likely to be a pasted secret as a typo. This is the narrower
-/// whitelist that keeps the diagnostic useful anyway: a token is quoted only when a single
-/// insertion, deletion, or substitution turns it into one of [`COMMANDS`]. `serv` is named;
-/// `correct-horse-battery-staple` is not.
-fn is_near_miss(argument: &str) -> bool {
-    COMMANDS
+/// The subcommand and `--transport` slots both take a bare word, so [`is_flag_shaped`]
+/// cannot guard either and a bare word in one is as likely to be a pasted secret as a
+/// typo. This is the narrower whitelist that keeps the diagnostic useful anyway: a token
+/// is quoted only when a single insertion, deletion, or substitution turns it into one of
+/// the names Warden itself defines. `serv` is named; `correct-horse-battery-staple` is
+/// not, and neither is the DSN an operator reaches `--transport` with by accident.
+fn is_near_miss(argument: &str, vocabulary: &[&str]) -> bool {
+    vocabulary
         .iter()
-        .any(|command| within_one_edit(argument, command))
+        .any(|name| within_one_edit(argument, name))
 }
 
 /// Whether one insertion, deletion, or substitution turns `candidate` into `command`.
@@ -340,9 +363,10 @@ impl std::str::FromStr for Transport {
     fn from_str(name: &str) -> Result<Self, Self::Err> {
         match name {
             "stdio" => Ok(Self::Stdio),
-            other => Err(CliError::UnsupportedTransport {
+            other if is_near_miss(other, &TRANSPORTS) => Err(CliError::UnsupportedTransport {
                 name: other.to_owned(),
             }),
+            _unquotable => Err(CliError::UnquotableTransport),
         }
     }
 }
@@ -510,6 +534,42 @@ mod tests {
     }
 
     #[test]
+    fn a_near_miss_of_a_transport_is_still_named() {
+        // The diagnostic an operator who typed `stdio` wrong has to get back.
+        assert_eq!(
+            parse(args(&["serve", "--transport", "stdi"])).unwrap_err(),
+            CliError::UnsupportedTransport {
+                name: "stdi".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn an_unrecognizable_transport_is_refused_without_being_echoed() {
+        // `warden serve --transport "$DSN"` with the wrong variable name. The transport
+        // slot takes a bare word, so nothing about the token's shape says "not a secret",
+        // and an operator's supervisor collects stderr.
+        let error = parse(args(&[
+            "serve",
+            "--transport",
+            "postgres://user:password@host/db",
+        ]))
+        .unwrap_err();
+        assert_eq!(error, CliError::UnquotableTransport);
+        let rendered = error.to_string();
+        assert!(
+            !rendered.contains("password"),
+            "error leaked a transport value: {rendered}"
+        );
+        assert!(
+            !rendered.contains("postgres://"),
+            "error leaked a transport value: {rendered}"
+        );
+        // Still a usable diagnostic: it names the transport this build does serve.
+        assert!(rendered.contains("stdio"), "{rendered}");
+    }
+
+    #[test]
     fn a_flag_without_its_value_is_a_usage_error_that_echoes_no_argument() {
         let error = parse(args(&["serve", "--config"])).unwrap_err();
         assert_eq!(error, CliError::MissingValue { flag: "--config" });
@@ -629,7 +689,7 @@ mod tests {
     fn a_typo_of_a_subcommand_is_still_named_but_a_distant_word_is_not() {
         // One edit from a name Warden defines, so an operator sees their own typo.
         for typo in ["serv", "serve1", "chek", "checkk", "versio", "helpp"] {
-            assert!(is_near_miss(typo), "{typo}");
+            assert!(is_near_miss(typo, &COMMANDS), "{typo}");
         }
         // Two or more edits away: no longer a plausible typo, and a bare word this far
         // from Warden's vocabulary is the operator's own value. `hepl` is here because a
@@ -644,7 +704,7 @@ mod tests {
             "hunter2",
             "",
         ] {
-            assert!(!is_near_miss(other), "{other}");
+            assert!(!is_near_miss(other, &COMMANDS), "{other}");
         }
     }
 

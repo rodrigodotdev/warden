@@ -69,9 +69,7 @@ pub(crate) async fn run(config: &Path, out: &mut dyn Write) -> Result<bool> {
 
     // Collected before `build` consumes the configuration, reported after the probes so
     // the report reads in the order `docs/operations.md` section 11 lists the jobs.
-    let production = production_connections(&resolved);
-    let mut warnings = stdio_exposure_warnings(&resolved);
-    warnings.extend(relaxation_warnings(&production, &resolved.policy));
+    let warnings = startup_warnings(&resolved);
 
     let deployment = startup::build(resolved, CancellationToken::new()).await?;
     writeln!(
@@ -141,15 +139,20 @@ async fn probe(deployment: &Deployment, out: &mut dyn Write) -> Result<usize> {
     Ok(failures)
 }
 
-/// One warning per connection stdio would expose a production database through.
+/// Every warning a deployment raises before it serves anything.
 ///
-/// `serve` prints these on stderr at startup and `check` prints them into its report, so
-/// both say the same sentence about the same deployment.
-pub(crate) fn stdio_exposure_warnings(config: &ResolvedConfig) -> Vec<String> {
-    production_connections(config)
-        .iter()
-        .map(exposure_warning)
-        .collect()
+/// `serve` writes these to stderr at startup and `check` writes them into its report, so
+/// both commands say the same sentences about the same deployment. It is one function
+/// rather than one call each because the two commands drifted apart once already: `serve`
+/// emitted the stdio exposure warnings and not the relaxation ones, so the process that
+/// actually hands an agent a production database stayed quiet about the pair
+/// `docs/operations.md` section 3.1 exists to flag. A caller that can only ask for *all*
+/// of them cannot reintroduce that gap.
+pub(crate) fn startup_warnings(config: &ResolvedConfig) -> Vec<String> {
+    let production = production_connections(config);
+    let mut warnings: Vec<String> = production.iter().map(exposure_warning).collect();
+    warnings.extend(relaxation_warnings(&production, &config.policy));
+    warnings
 }
 
 /// The connections whose `environment` is `production`, in configuration order.
