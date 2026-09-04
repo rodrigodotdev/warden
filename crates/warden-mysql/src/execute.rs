@@ -224,18 +224,12 @@ async fn collect(
     let mut builder: Option<ResultBuilder> = None;
 
     loop {
-        let next = tokio::select! {
-            // Deterministic ordering: a cancelled request must not depend on which
-            // arm the scheduler happened to poll first.
-            biased;
-            () = cancel.cancelled() => return Err(ExecuteError::Cancelled),
-            next = timeout_at(deadline, rows.try_next()) => next,
-        };
-        let row = match next {
-            Ok(Ok(Some(row))) => row,
-            Ok(Ok(None)) => break,
-            Ok(Err(error)) => return Err(execute_error(&error)),
-            Err(_elapsed) => return Err(ExecuteError::Timeout),
+        // Each fetch goes through the same guard as the statements before it, so an
+        // expired deadline stops the next row rather than being outrun by one the
+        // driver had already buffered.
+        let row = match guarded(deadline, cancel, rows.try_next()).await? {
+            Some(row) => row,
+            None => break,
         };
 
         // Column metadata comes from the first row: the driver exposes it nowhere
@@ -271,6 +265,9 @@ async fn guarded<T>(
     cancel: &CancellationToken,
     future: impl Future<Output = Result<T, sqlx::Error>>,
 ) -> Result<T, ExecuteError> {
+    if expired(deadline) {
+        return Err(ExecuteError::Timeout);
+    }
     tokio::select! {
         biased;
         () = cancel.cancelled() => Err(ExecuteError::Cancelled),
@@ -283,7 +280,23 @@ async fn bounded<T>(
     deadline: Instant,
     future: impl Future<Output = Result<T, sqlx::Error>>,
 ) -> Result<T, ExecuteError> {
+    if expired(deadline) {
+        return Err(ExecuteError::Timeout);
+    }
     finish(timeout_at(deadline, future).await)
+}
+
+/// Whether the deadline has already passed, checked before any work begins.
+///
+/// `timeout_at` polls its inner future *before* it consults the deadline and
+/// reports success whenever that first poll is ready, so a driver call whose reply
+/// is already buffered outruns a deadline that expired long ago. A pooled
+/// connection answers that fast whenever the runtime was descheduled long enough
+/// for the server's reply to arrive. Refusing up front is what keeps expired work
+/// from reaching the connection at all; the deadline still bounds the call itself
+/// once it starts.
+fn expired(deadline: Instant) -> bool {
+    Instant::now() >= deadline
 }
 
 /// Collapses a `timeout_at` result into the port's error type.
@@ -320,5 +333,49 @@ fn execute_error(error: &sqlx::Error) -> ExecuteError {
     }
     ExecuteError::Database {
         detail: error.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::time::Duration;
+
+    use tokio::time::Instant;
+    use tokio_util::sync::CancellationToken;
+    use warden_ports::error::ExecuteError;
+
+    use super::{bounded, guarded};
+
+    /// An answer that is already buffered must not outrank an expired deadline.
+    ///
+    /// This is the unit-level form of the race that let an expired request reach a
+    /// real server: `timeout_at` reports success whenever the first poll of its
+    /// inner future is ready, and a pooled connection is ready exactly that fast
+    /// once the runtime has been descheduled long enough for the reply to arrive.
+    #[tokio::test]
+    async fn an_expired_deadline_outranks_work_that_could_answer_at_once() {
+        let expired = Instant::now() - Duration::from_millis(1);
+        let cancel = CancellationToken::new();
+
+        let guarded_outcome = guarded(expired, &cancel, async { Ok::<_, sqlx::Error>(()) }).await;
+        let bounded_outcome = bounded(expired, async { Ok::<_, sqlx::Error>(()) }).await;
+
+        assert_eq!(guarded_outcome.unwrap_err(), ExecuteError::Timeout);
+        assert_eq!(bounded_outcome.unwrap_err(), ExecuteError::Timeout);
+    }
+
+    /// The guard refuses only expired deadlines, never a live one.
+    #[tokio::test]
+    async fn a_live_deadline_still_lets_the_work_run() {
+        let live = Instant::now() + Duration::from_secs(30);
+        let cancel = CancellationToken::new();
+
+        let guarded_outcome = guarded(live, &cancel, async { Ok::<_, sqlx::Error>(7) }).await;
+        let bounded_outcome = bounded(live, async { Ok::<_, sqlx::Error>(7) }).await;
+
+        assert_eq!(guarded_outcome.unwrap(), 7);
+        assert_eq!(bounded_outcome.unwrap(), 7);
     }
 }

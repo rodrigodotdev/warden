@@ -340,6 +340,13 @@ async fn guarded<T>(
     deadline: Instant,
     cancel: &CancellationToken,
 ) -> Result<T, SchemaError> {
+    // `timeout_at` polls its inner future *before* it consults the deadline and
+    // reports success whenever that first poll is ready, so a catalog read whose
+    // reply is already buffered outruns a deadline that expired long ago. Refusing
+    // up front is what keeps expired work from reaching the connection at all.
+    if Instant::now() >= deadline {
+        return Err(SchemaError::Timeout);
+    }
     let Some(result) = cancel
         .run_until_cancelled(timeout_at(deadline, future))
         .await
@@ -412,6 +419,34 @@ mod tests {
     use warden_policy::folding::rule_matches;
     use warden_policy::{ObjectFilter, ObjectRules, PolicyContext, PolicyEngine, PolicySettings};
     use warden_ports::SchemaInspector;
+    use warden_ports::error::SchemaError;
+
+    /// A catalog answer that is already buffered must not outrank an expired
+    /// deadline.
+    ///
+    /// `timeout_at` reports success whenever the first poll of its inner future is
+    /// ready, and a pooled connection is ready exactly that fast once the runtime
+    /// has been descheduled long enough for the reply to arrive.
+    #[tokio::test]
+    async fn an_expired_deadline_outranks_work_that_could_answer_at_once() {
+        let expired = tokio::time::Instant::now() - std::time::Duration::from_millis(1);
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let outcome = super::guarded(async { Ok::<_, sqlx::Error>(()) }, expired, &cancel).await;
+
+        assert_eq!(outcome.unwrap_err(), SchemaError::Timeout);
+    }
+
+    /// The guard refuses only expired deadlines, never a live one.
+    #[tokio::test]
+    async fn a_live_deadline_still_lets_the_work_run() {
+        let live = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let cancel = tokio_util::sync::CancellationToken::new();
+
+        let outcome = super::guarded(async { Ok::<_, sqlx::Error>(7) }, live, &cancel).await;
+
+        assert_eq!(outcome.unwrap(), 7);
+    }
 
     use super::{PostgreSqlSchemaInspector, filter_foreign_keys, object_ref, selector_ref};
     use crate::connection::PostgreSqlConnectionPools;

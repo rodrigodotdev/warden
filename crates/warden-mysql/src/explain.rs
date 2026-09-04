@@ -221,6 +221,9 @@ async fn guarded<T>(
     cancel: &CancellationToken,
     future: impl Future<Output = Result<T, sqlx::Error>>,
 ) -> Result<T, ExplainError> {
+    if expired(deadline) {
+        return Err(ExplainError::Timeout);
+    }
     tokio::select! {
         // Deterministic ordering: a cancelled request must not depend on which
         // arm the scheduler happened to poll first.
@@ -235,7 +238,23 @@ async fn bounded<T>(
     deadline: Instant,
     future: impl Future<Output = Result<T, sqlx::Error>>,
 ) -> Result<T, ExplainError> {
+    if expired(deadline) {
+        return Err(ExplainError::Timeout);
+    }
     finish(timeout_at(deadline, future).await)
+}
+
+/// Whether the deadline has already passed, checked before any work begins.
+///
+/// `timeout_at` polls its inner future *before* it consults the deadline and
+/// reports success whenever that first poll is ready, so a driver call whose reply
+/// is already buffered outruns a deadline that expired long ago. A pooled
+/// connection answers that fast whenever the runtime was descheduled long enough
+/// for the server's reply to arrive. Refusing up front is what keeps expired work
+/// from reaching the connection at all; the deadline still bounds the call itself
+/// once it starts.
+fn expired(deadline: Instant) -> bool {
+    Instant::now() >= deadline
 }
 
 /// Collapses a `timeout_at` result into the port's error type.
@@ -273,11 +292,45 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use std::sync::Arc;
+    use std::time::Duration;
 
+    use tokio::time::Instant;
+    use tokio_util::sync::CancellationToken;
     use warden_ports::Explainer;
+    use warden_ports::error::ExplainError;
 
-    use super::MySqlExplainer;
+    use super::{MySqlExplainer, bounded, guarded};
     use crate::connection::MySqlConnectionPools;
+
+    /// An answer that is already buffered must not outrank an expired deadline.
+    ///
+    /// `timeout_at` reports success whenever the first poll of its inner future is
+    /// ready, and a pooled connection is ready exactly that fast once the runtime
+    /// has been descheduled long enough for the reply to arrive.
+    #[tokio::test]
+    async fn an_expired_deadline_outranks_work_that_could_answer_at_once() {
+        let expired = Instant::now() - Duration::from_millis(1);
+        let cancel = CancellationToken::new();
+
+        let guarded_outcome = guarded(expired, &cancel, async { Ok::<_, sqlx::Error>(()) }).await;
+        let bounded_outcome = bounded(expired, async { Ok::<_, sqlx::Error>(()) }).await;
+
+        assert_eq!(guarded_outcome.unwrap_err(), ExplainError::Timeout);
+        assert_eq!(bounded_outcome.unwrap_err(), ExplainError::Timeout);
+    }
+
+    /// The guard refuses only expired deadlines, never a live one.
+    #[tokio::test]
+    async fn a_live_deadline_still_lets_the_work_run() {
+        let live = Instant::now() + Duration::from_secs(30);
+        let cancel = CancellationToken::new();
+
+        let guarded_outcome = guarded(live, &cancel, async { Ok::<_, sqlx::Error>(7) }).await;
+        let bounded_outcome = bounded(live, async { Ok::<_, sqlx::Error>(7) }).await;
+
+        assert_eq!(guarded_outcome.unwrap(), 7);
+        assert_eq!(bounded_outcome.unwrap(), 7);
+    }
 
     #[test]
     fn the_explainer_is_send_sync_and_coerces_to_its_port() {
