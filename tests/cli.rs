@@ -6,6 +6,9 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+#[cfg(unix)]
+use std::process::Stdio;
+
 fn warden(args: &[&str]) -> std::process::Output {
     // `RUST_LOG` inherited from the developer's shell would put log lines on stderr and
     // make the assertions below depend on an environment variable nobody set for them.
@@ -190,6 +193,56 @@ path = "{}"
         stderr.contains(&format!(
             "FAIL  the audit trail at {} could not be opened",
             audit_path.display()
+        )),
+        "stderr: {stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn check_rejects_the_regular_file_backing_stdout_without_contaminating_it() {
+    let path = write_temp_config("");
+    let stdout_path = write_temp_config("");
+    let config = format!(
+        r#"version = 1
+
+[[connections]]
+name = "db"
+dialect = "mysql"
+environment = "development"
+database = "app"
+dsn_env = "WARDEN_TEST_DSN"
+policy = "p"
+
+[policies.p]
+
+[audit]
+destination = "file"
+path = "{}"
+"#,
+        stdout_path.display()
+    );
+    std::fs::write(&path, config).unwrap();
+    let stdout = std::fs::File::create(&stdout_path).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_warden"))
+        .env_remove("RUST_LOG")
+        .env("WARDEN_TEST_DSN", "mysql://warden_ro:pw@127.0.0.1:1/app")
+        .args(["check", "--config", path.to_str().unwrap()])
+        .stdout(Stdio::from(stdout))
+        .output()
+        .expect("failed to execute the warden binary");
+    let stdout_contents = std::fs::read(&stdout_path).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(&stdout_path);
+
+    assert!(!output.status.success());
+    assert!(stdout_contents.is_empty(), "stdout: {stdout_contents:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains(&format!(
+            "FAIL  the audit trail at {} could not be opened",
+            stdout_path.display()
         )),
         "stderr: {stderr}"
     );

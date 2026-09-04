@@ -247,10 +247,12 @@ ADR-0023).
 **`audit.mode` controls which safe attempt fields are recorded, and `audit.destination`
 controls where both attempt and outcome records are written.** The destination defaults
 to `stderr`; `file` requires `audit.path`, opens that path for append before any database
-pool, and writes one JSON object per line. A path is refused for the `stderr` destination.
-With a file destination, an unwritable audit volume denies queries whose attempt cannot
-be recorded (ADR-0022, ADR-0043). Rotation must append or use `copytruncate`, rather than
-move the open file: Warden continues writing the inode it already has open.
+pool, and writes one JSON object per line. The target must be a regular file distinct from
+stdout; devices, FIFOs, stdout aliases, and every other special file are startup failures.
+A path is refused for the `stderr` destination. With a file destination, an unwritable
+audit volume denies queries whose attempt cannot be recorded (ADR-0022, ADR-0043).
+Rotation must append or use `copytruncate`, rather than move the open file: Warden
+continues writing the inode it already has open.
 
 ### 3.1 Structural rules
 
