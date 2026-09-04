@@ -544,8 +544,9 @@ pub struct AuditAttempt {
     pub connection: ConnectionName,
     pub dialect: Dialect,
     pub environment: Environment,
+    pub operation: AuditOperation,
     pub fingerprint: Option<QueryFingerprint>,
-    pub statement_kind: StatementKind,
+    pub statement_kind: Option<StatementKind>,
     pub deny_reasons: Vec<DenyReason>,   // Every denial, not only the first.
 }
 
@@ -553,6 +554,7 @@ pub struct AuditOutcomeEvent {
     pub attempt_id: AuditEventId,
     pub outcome: AuditOutcome,
     pub duration: Option<Duration>,
+    pub queue_wait: Option<Duration>,
     pub rows_returned: Option<usize>,
     pub result_bytes: Option<usize>,
     pub error_code: Option<PublicErrorCode>,
@@ -561,10 +563,17 @@ pub struct AuditOutcomeEvent {
 pub enum AuditOutcome {
     Denied, Succeeded, Failed, TimedOut, Cancelled, NotStarted,
 }
+
+pub enum AuditOperation {
+    Query, Explain, SearchSchema, DescribeSchema,
+}
 ```
 
 `NotStarted` means an authorized statement had an attempt on record but never reached
 the database, such as when permit acquisition ended at `server_busy`.
+
+`statement_kind` is `None` for `search_schema` and `describe_schema`: a catalog read
+submits no statement, so recording one would be false.
 
 Identifiers are newtypes, not `String`; swapping two `String` fields in an audit event
 would otherwise compile. `error_code` is the `PublicErrorCode` enum rather than a

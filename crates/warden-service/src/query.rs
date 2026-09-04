@@ -30,10 +30,11 @@ use warden_core::query::QueryRequest;
 use warden_core::result::ResultSet;
 use warden_policy::PolicyEngine;
 use warden_ports::{
-    AuditAttempt, AuditOutcome, AuditOutcomeEvent, AuditSink, ConnectionRegistry, ExecuteError,
+    AuditAttempt, AuditOperation, AuditOutcome, AuditOutcomeEvent, AuditSink, ConnectionRegistry,
+    ExecuteError,
 };
 
-use crate::audit;
+use crate::audit::{self, StatementFacts};
 use crate::error::QueryServiceError;
 use crate::pipeline::{ExecutionGate, GateError};
 use crate::redaction::Redactor;
@@ -111,8 +112,11 @@ impl QueryService {
                 let attempt = audit::attempt(
                     context,
                     runtime.metadata(),
-                    StatementKind::Unknown,
-                    None,
+                    AuditOperation::Query,
+                    StatementFacts {
+                        kind: Some(StatementKind::Unknown),
+                        fingerprint: None,
+                    },
                     vec![error.deny_reason()],
                 );
                 self.refuse(&attempt, AuditOutcome::Denied, error.public_code())
@@ -136,8 +140,11 @@ impl QueryService {
                     let attempt = audit::attempt(
                         context,
                         runtime.metadata(),
-                        statement_kind,
-                        fingerprint,
+                        AuditOperation::Query,
+                        StatementFacts {
+                            kind: Some(statement_kind),
+                            fingerprint,
+                        },
                         rejection.reasons().to_vec(),
                     );
                     self.refuse(&attempt, AuditOutcome::Denied, rejection.public_code())
@@ -149,8 +156,11 @@ impl QueryService {
         let attempt = audit::attempt(
             context,
             runtime.metadata(),
-            statement_kind,
-            fingerprint,
+            AuditOperation::Query,
+            StatementFacts {
+                kind: Some(statement_kind),
+                fingerprint,
+            },
             Vec::new(),
         );
         let gate = match ExecutionGate::enter(
@@ -165,14 +175,21 @@ impl QueryService {
             Ok(gate) => gate,
             // No attempt was recorded, so there is no outcome to complete.
             Err(GateError::Audit(error)) => return Err(error.into()),
-            Err(GateError::Connection(error)) => {
+            Err(GateError::Connection { error, queue_wait }) => {
                 let code = error.public_code();
-                self.complete(&attempt, AuditOutcome::NotStarted, None, code)
-                    .await;
+                self.complete(
+                    &attempt,
+                    AuditOutcome::NotStarted,
+                    None,
+                    Some(queue_wait),
+                    code,
+                )
+                .await;
                 return Err(error.into());
             }
         };
 
+        let queue_wait = gate.queue_wait();
         match gate.execute().await {
             Ok(mut result) => {
                 self.redactor.redact_result(&mut result);
@@ -192,6 +209,7 @@ impl QueryService {
                         // two are not the same quantity and an auditor should not
                         // compare them directly.
                         duration: Some(result.stats.duration),
+                        queue_wait: Some(queue_wait),
                         rows_returned: Some(result.stats.rows_returned),
                         // After redaction, so the figure describes what the agent
                         // actually receives.
@@ -211,7 +229,8 @@ impl QueryService {
                     | ExecuteError::Database { .. } => AuditOutcome::Failed,
                 };
                 let code = error.public_code();
-                self.complete(&attempt, outcome, None, code).await;
+                self.complete(&attempt, outcome, None, Some(queue_wait), code)
+                    .await;
                 Err(error.into())
             }
         }
@@ -237,7 +256,10 @@ impl QueryService {
                 "the audit attempt could not be recorded for a refused statement"
             );
         }
-        self.complete(attempt, outcome, None, error_code).await;
+        // No gate was ever entered for a refused statement, so there is no permit
+        // acquisition to time.
+        self.complete(attempt, outcome, None, None, error_code)
+            .await;
     }
 
     /// Records the terminal state of an attempt without writing the attempt again.
@@ -246,6 +268,7 @@ impl QueryService {
         attempt: &AuditAttempt,
         outcome: AuditOutcome,
         duration: Option<Duration>,
+        queue_wait: Option<Duration>,
         error_code: warden_core::error::PublicErrorCode,
     ) {
         audit::record_outcome(
@@ -254,6 +277,7 @@ impl QueryService {
                 attempt_id: attempt.id,
                 outcome,
                 duration,
+                queue_wait,
                 rows_returned: None,
                 result_bytes: None,
                 error_code: Some(error_code),
@@ -559,6 +583,26 @@ mod tests {
         assert_eq!(outcomes[0].attempt_id, attempts[0].id);
         assert_eq!(outcomes[0].outcome, AuditOutcome::NotStarted);
         assert_eq!(outcomes[0].error_code, Some(PublicErrorCode::ServerBusy));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_saturated_connection_records_the_wait_that_produced_server_busy() {
+        let (service, sink, _held) = testing::saturated_query_service().await;
+        let error = service
+            .execute(&testing::request_context(), testing::request())
+            .await
+            .unwrap_err();
+        assert_eq!(error.public_code(), PublicErrorCode::ServerBusy);
+        let outcomes = sink.outcomes();
+        assert_eq!(outcomes[0].outcome, AuditOutcome::NotStarted);
+        assert_eq!(
+            outcomes[0].queue_wait,
+            Some(warden_core::limits::ExecutionLimits::default().max_queue_wait)
+        );
+        assert_eq!(
+            sink.attempts()[0].operation,
+            warden_ports::AuditOperation::Query
+        );
     }
 
     #[tokio::test]

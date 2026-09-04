@@ -41,6 +41,7 @@ const ATTEMPT_FIELDS: &[&str] = &[
     "connection",
     "dialect",
     "environment",
+    "operation",
     "statement_kind",
     "fingerprint",
     "deny_codes",
@@ -62,6 +63,7 @@ const OUTCOME_FIELDS: &[&str] = &[
     "attempt_id",
     "outcome",
     "duration_ms",
+    "queue_wait_ms",
     "rows",
     "result_bytes",
     "error_code",
@@ -98,7 +100,10 @@ impl AuditSink for TracingAuditSink {
                 connection = %event.connection,
                 dialect = %event.dialect,
                 environment = %event.environment,
-                statement_kind = event.statement_kind.as_str(),
+                operation = event.operation.as_str(),
+                statement_kind = event
+                    .statement_kind
+                    .map(warden_core::analysis::StatementKind::as_str),
                 fingerprint = event.fingerprint.as_ref().map(|value| value.as_str()),
                 deny_codes = %deny_codes,
                 "audit attempt"
@@ -121,6 +126,12 @@ impl AuditSink for TracingAuditSink {
                 // ceiling is still true where wrapping would not be.
                 duration_ms = event
                     .duration
+                    .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)),
+                // Saturating for the same reason as `duration_ms`: a queue wait beyond
+                // `u64` milliseconds is not reachable under any configured
+                // `max_queue_wait`.
+                queue_wait_ms = event
+                    .queue_wait
                     .map(|elapsed| u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)),
                 rows = event.rows_returned,
                 result_bytes = event.result_bytes,
@@ -177,6 +188,7 @@ mod tests {
                 "connection",
                 "dialect",
                 "environment",
+                "operation",
                 "statement_kind",
                 "fingerprint",
                 "deny_codes",
@@ -341,8 +353,9 @@ mod tests {
             connection: "production-db".parse().unwrap(),
             dialect: warden_core::dialect::Dialect::MySql,
             environment: warden_core::connection::Environment::Production,
+            operation: warden_ports::AuditOperation::Query,
             fingerprint: None,
-            statement_kind: warden_core::analysis::StatementKind::Select,
+            statement_kind: Some(warden_core::analysis::StatementKind::Select),
             deny_reasons: vec![warden_policy::DenyReason::with_detail(
                 warden_policy::DenyCode::ObjectNotAllowed,
                 "app.secrets",
@@ -355,6 +368,7 @@ mod tests {
             attempt_id: id,
             outcome: warden_ports::AuditOutcome::Succeeded,
             duration: Some(Duration::from_millis(3)),
+            queue_wait: Some(Duration::from_millis(1)),
             rows_returned: Some(2),
             result_bytes: Some(64),
             error_code: None,

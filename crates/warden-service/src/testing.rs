@@ -38,9 +38,10 @@ use warden_policy::{
     PolicySettings,
 };
 use warden_ports::{
-    AnalyzeError, AuditAttempt, AuditError, AuditEventId, AuditOutcomeEvent, AuditSink,
-    ConnectionRegistry, ConnectionRuntime, ConnectionRuntimeParts, ExecuteError, ExplainError,
-    Explainer, QueryAnalyzer, QueryExecutor, QueryPermit, SchemaError, SchemaInspector,
+    AnalyzeError, AuditAttempt, AuditError, AuditEventId, AuditOperation, AuditOutcomeEvent,
+    AuditSink, ConnectionRegistry, ConnectionRuntime, ConnectionRuntimeParts, ExecuteError,
+    ExplainError, Explainer, QueryAnalyzer, QueryExecutor, QueryPermit, SchemaError,
+    SchemaInspector,
 };
 
 use crate::explain::ExplainService;
@@ -121,8 +122,9 @@ pub(crate) fn attempt() -> AuditAttempt {
         connection: connection(Dialect::MySql).name,
         dialect: Dialect::MySql,
         environment: Environment::Production,
+        operation: AuditOperation::Query,
         fingerprint: None,
-        statement_kind: StatementKind::Select,
+        statement_kind: Some(StatementKind::Select),
         deny_reasons: Vec::<DenyReason>::new(),
     }
 }

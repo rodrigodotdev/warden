@@ -73,6 +73,56 @@ impl fmt::Display for AuditEventId {
     }
 }
 
+/// Which tool the record is about.
+///
+/// `AuditAttempt` was statement-shaped through Milestone 12, so a catalog read had
+/// no record it could honestly produce (`docs/open-questions.md` item 21). This
+/// enum is what lets one sink carry both without a schema read pretending to be a
+/// statement. `list_connections` is deliberately absent: it reads an in-memory map,
+/// reaches no database, and returns configuration metadata the agent already needs
+/// in order to call anything else (ADR-0042).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum AuditOperation {
+    /// A `query` tool call.
+    Query,
+    /// An `explain` tool call.
+    Explain,
+    /// A `search_schema` tool call.
+    SearchSchema,
+    /// A `describe_schema` tool call.
+    DescribeSchema,
+}
+
+impl AuditOperation {
+    /// Every operation. The sinks iterate this to prove each has a spelling.
+    pub const ALL: [Self; 4] = [
+        Self::Query,
+        Self::Explain,
+        Self::SearchSchema,
+        Self::DescribeSchema,
+    ];
+
+    /// The stable name used in audit records and trace fields.
+    ///
+    /// Exhaustive on purpose: a new operation must not compile until it has a
+    /// documented spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Query => "query",
+            Self::Explain => "explain",
+            Self::SearchSchema => "search_schema",
+            Self::DescribeSchema => "describe_schema",
+        }
+    }
+}
+
+impl fmt::Display for AuditOperation {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// What Warden is about to attempt, recorded before anything runs.
 ///
 /// Written before the concurrency permit is acquired, so a process that dies during
@@ -95,13 +145,19 @@ pub struct AuditAttempt {
     pub dialect: Dialect,
     /// The connection's environment.
     pub environment: Environment,
+    /// Which tool asked.
+    pub operation: AuditOperation,
     /// The statement's fingerprint, when the adapter computed one.
     ///
     /// The only stable way to recognize the same statement across attempts without
     /// storing the statement (`docs/security.md` section 11.4).
     pub fingerprint: Option<QueryFingerprint>,
-    /// What kind of statement it was.
-    pub statement_kind: StatementKind,
+    /// What kind of statement it was, when the record is about one.
+    ///
+    /// `None` for a catalog read: `search_schema` and `describe_schema` submit no
+    /// statement, and `StatementKind::Unknown` would claim one was submitted and
+    /// could not be classified — a different fact.
+    pub statement_kind: Option<StatementKind>,
     /// **Every** denial, not only the one the agent was told about.
     ///
     /// Empty when the statement was authorized. An auditor investigating a denial
@@ -179,6 +235,13 @@ pub struct AuditOutcomeEvent {
     pub outcome: AuditOutcome,
     /// Wall-clock execution time, when the statement ran.
     pub duration: Option<Duration>,
+    /// How long the request waited for a concurrency permit, when it waited.
+    ///
+    /// `docs/operations.md` section 10.2 has allowed this field since v0.3 and
+    /// nothing carried it. It is the measurement that distinguishes a slow database
+    /// from a saturated connection, and it is the only figure a `server_busy`
+    /// outcome has to report at all.
+    pub queue_wait: Option<Duration>,
     /// Rows returned after truncation, when the statement ran.
     pub rows_returned: Option<usize>,
     /// Normalized result size in bytes, when the statement ran.
@@ -250,7 +313,7 @@ mod tests {
             attempt.deny_reasons[1].internal_detail(),
             Some("app.secrets")
         );
-        assert_eq!(attempt.statement_kind, StatementKind::Select);
+        assert_eq!(attempt.statement_kind, Some(StatementKind::Select));
     }
 
     #[tokio::test]
@@ -263,6 +326,7 @@ mod tests {
             attempt_id: attempt.id,
             outcome: AuditOutcome::Succeeded,
             duration: Some(Duration::from_millis(3)),
+            queue_wait: None,
             rows_returned: Some(1),
             result_bytes: Some(64),
             error_code: None,
@@ -276,5 +340,40 @@ mod tests {
         let attempt = testing::attempt(Vec::new());
         let error = sink.record_attempt(&attempt).await.unwrap_err();
         assert!(matches!(error, AuditError::Unavailable { .. }), "{error:?}");
+    }
+
+    #[test]
+    fn every_operation_has_a_distinct_stable_spelling() {
+        let names: BTreeSet<&str> = AuditOperation::ALL.iter().map(|o| o.as_str()).collect();
+        assert_eq!(names.len(), AuditOperation::ALL.len());
+        assert_eq!(AuditOperation::SearchSchema.to_string(), "search_schema");
+    }
+
+    #[test]
+    fn a_catalog_read_is_auditable_without_inventing_a_statement() {
+        // A schema read has no StatementKind and no fingerprint. Inventing either
+        // would make an audit record state something untrue, which is the same rule
+        // AuditOutcomeEvent already follows for its measurements
+        // (docs/open-questions.md item 21).
+        let mut attempt = testing::attempt(Vec::new());
+        attempt.operation = AuditOperation::DescribeSchema;
+        attempt.statement_kind = None;
+        attempt.fingerprint = None;
+        assert_eq!(attempt.operation.as_str(), "describe_schema");
+        assert!(attempt.statement_kind.is_none());
+    }
+
+    #[test]
+    fn an_outcome_can_report_how_long_the_request_queued() {
+        let event = AuditOutcomeEvent {
+            attempt_id: AuditEventId::generate(),
+            outcome: AuditOutcome::NotStarted,
+            duration: None,
+            queue_wait: Some(Duration::from_millis(2_000)),
+            rows_returned: None,
+            result_bytes: None,
+            error_code: Some(PublicErrorCode::ServerBusy),
+        };
+        assert_eq!(event.queue_wait, Some(Duration::from_millis(2_000)));
     }
 }

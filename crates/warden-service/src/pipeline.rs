@@ -21,6 +21,8 @@
 //! that calls the ports directly, and it does not replace database privileges
 //! (ADR-0016).
 
+use std::time::Duration;
+
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use warden_core::explain::QueryPlan;
@@ -46,8 +48,17 @@ pub(crate) enum GateError {
     #[error(transparent)]
     Audit(AuditError),
     /// The connection could not give this request a slot.
-    #[error(transparent)]
-    Connection(ConnectionError),
+    #[error("{error}")]
+    Connection {
+        /// Why the connection refused.
+        error: ConnectionError,
+        /// How long the request waited before it was refused.
+        ///
+        /// Carried out of the gate because a `server_busy` outcome has no other
+        /// measurement to report, and the caller cannot time an acquisition that
+        /// happens inside this constructor.
+        queue_wait: Duration,
+    },
 }
 
 /// An authorized statement, its connection, a recorded attempt, and that connection's
@@ -59,6 +70,8 @@ pub(crate) struct ExecutionGate<'a> {
     /// Both the witness `execute_read_only` and `explain` require (ADR-0032) and the
     /// slot itself: dropping the gate releases it.
     permit: QueryPermit,
+    /// How long this request waited for its permit.
+    queue_wait: Duration,
     deadline: Instant,
     cancel: CancellationToken,
 }
@@ -79,17 +92,29 @@ impl<'a> ExecutionGate<'a> {
         audit::record_attempt(sink, attempt)
             .await
             .map_err(GateError::Audit)?;
-        let permit = runtime
-            .acquire_query_permit()
-            .await
-            .map_err(GateError::Connection)?;
+        let queued_at = Instant::now();
+        let permit =
+            runtime
+                .acquire_query_permit()
+                .await
+                .map_err(|error| GateError::Connection {
+                    error,
+                    queue_wait: queued_at.elapsed(),
+                })?;
+        let acquired_at = Instant::now();
         Ok(Self {
             runtime,
             query,
             permit,
-            deadline: RequestBudget::new(runtime.limits()).deadline(Instant::now()),
+            queue_wait: acquired_at.saturating_duration_since(queued_at),
+            deadline: RequestBudget::new(runtime.limits()).deadline(acquired_at),
             cancel,
         })
+    }
+
+    /// How long this request waited for its permit.
+    pub(crate) fn queue_wait(&self) -> Duration {
+        self.queue_wait
     }
 
     /// Runs the statement, releasing the slot when the call returns.
@@ -218,7 +243,10 @@ mod tests {
         .unwrap_err();
         assert!(matches!(
             error,
-            GateError::Connection(ConnectionError::Busy { .. })
+            GateError::Connection {
+                error: ConnectionError::Busy { .. },
+                ..
+            }
         ));
         // The second attempt was still recorded: the ordering is attempt first.
         assert_eq!(sink.attempts().len(), 2);

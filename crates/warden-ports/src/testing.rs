@@ -42,7 +42,7 @@ use warden_policy::{
 
 use crate::BoxFuture;
 use crate::analyzer::QueryAnalyzer;
-use crate::audit::{AuditAttempt, AuditEventId, AuditOutcomeEvent, AuditSink};
+use crate::audit::{AuditAttempt, AuditEventId, AuditOperation, AuditOutcomeEvent, AuditSink};
 use crate::error::{
     AnalyzeError, AuditError, ConnectionError, ExecuteError, ExplainError, RuntimeError,
     SchemaError,
@@ -467,8 +467,9 @@ pub(crate) fn attempt(deny_reasons: Vec<DenyReason>) -> AuditAttempt {
         connection: "production-db".parse().unwrap(),
         dialect: Dialect::MySql,
         environment: Environment::Production,
+        operation: AuditOperation::Query,
         fingerprint: None,
-        statement_kind: StatementKind::Select,
+        statement_kind: Some(StatementKind::Select),
         deny_reasons,
     }
 }

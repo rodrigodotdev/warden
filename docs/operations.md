@@ -845,11 +845,12 @@ Reconciled with `src/audit.rs` in Milestone 12: the list below is what the code 
 not a wish. The added names were reviewed and carry nothing sensitive.
 
 The Milestone 12 audit sink emits, per attempt: `attempt_id`, `request_id`,
-`principal_id`, `client`, `connection`, `dialect`, `environment`, `statement_kind`,
-`fingerprint`, and `deny_codes`. Per outcome: `attempt_id`, `outcome`, `duration_ms`,
-`rows`, `result_bytes`, and `error_code`. `src/audit.rs` declares both lists as constants
-and its own test asserts the emitted field names against them, so a renamed field fails
-the build rather than silently drifting from this section.
+`principal_id`, `client`, `connection`, `dialect`, `environment`, `operation`,
+`statement_kind`, `fingerprint`, and `deny_codes`. Per outcome: `attempt_id`, `outcome`,
+`duration_ms`, `queue_wait_ms`, `rows`, `result_bytes`, and `error_code`. `src/audit.rs`
+declares both lists as constants and its own test asserts the emitted field names
+against them, so a renamed field fails the build rather than silently drifting from
+this section.
 
 Four of those are new since the list this section first carried, and each is safe by
 construction: `attempt_id` is a generated identifier and the only thing that makes the two
@@ -861,8 +862,9 @@ function that tripped a rule and stays off every surface but a durable audit rec
 section 10 of `docs/security.md` fixes. `outcome` is this section's former
 `policy_outcome` under the name `warden_ports::AuditOutcome` actually uses.
 
-`operation` and `queue_wait_ms` remain allowed and are not emitted yet: nothing carries
-them into `AuditAttempt` or `AuditOutcomeEvent`.
+`operation` and `queue_wait_ms` are now emitted: `operation` is a fixed `&'static str`
+drawn from `AuditOperation`'s closed set, and `queue_wait_ms` is a duration Warden
+measured itself, around permit acquisition inside the execution gate.
 
 Forbidden by default: `raw_sql`, `raw_parameters`, `password`, and `dsn`. `AuditAttempt`
 has no field any of them could occupy, which is the structural half of the guarantee; the

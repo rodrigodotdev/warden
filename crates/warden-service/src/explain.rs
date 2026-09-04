@@ -30,10 +30,11 @@ use warden_core::error::PublicError;
 use warden_core::explain::{ExplainRequest, QueryPlan};
 use warden_policy::PolicyEngine;
 use warden_ports::{
-    AuditAttempt, AuditOutcome, AuditOutcomeEvent, AuditSink, ConnectionRegistry, ExplainError,
+    AuditAttempt, AuditOperation, AuditOutcome, AuditOutcomeEvent, AuditSink, ConnectionRegistry,
+    ExplainError,
 };
 
-use crate::audit;
+use crate::audit::{self, StatementFacts};
 use crate::error::ExplainServiceError;
 use crate::pipeline::{ExecutionGate, GateError};
 use crate::redaction::Redactor;
@@ -106,8 +107,11 @@ impl ExplainService {
                 let attempt = audit::attempt(
                     context,
                     runtime.metadata(),
-                    StatementKind::Unknown,
-                    None,
+                    AuditOperation::Explain,
+                    StatementFacts {
+                        kind: Some(StatementKind::Unknown),
+                        fingerprint: None,
+                    },
                     vec![error.deny_reason()],
                 );
                 self.refuse(&attempt, AuditOutcome::Denied, error.public_code())
@@ -128,8 +132,11 @@ impl ExplainService {
                     let attempt = audit::attempt(
                         context,
                         runtime.metadata(),
-                        statement_kind,
-                        fingerprint,
+                        AuditOperation::Explain,
+                        StatementFacts {
+                            kind: Some(statement_kind),
+                            fingerprint,
+                        },
                         rejection.reasons().to_vec(),
                     );
                     self.refuse(&attempt, AuditOutcome::Denied, rejection.public_code())
@@ -141,8 +148,11 @@ impl ExplainService {
         let attempt = audit::attempt(
             context,
             runtime.metadata(),
-            statement_kind,
-            fingerprint,
+            AuditOperation::Explain,
+            StatementFacts {
+                kind: Some(statement_kind),
+                fingerprint,
+            },
             Vec::new(),
         );
         let gate = match ExecutionGate::enter(
@@ -156,10 +166,16 @@ impl ExplainService {
         {
             Ok(gate) => gate,
             Err(GateError::Audit(error)) => return Err(error.into()),
-            Err(GateError::Connection(error)) => {
+            Err(GateError::Connection { error, queue_wait }) => {
                 let code = error.public_code();
-                self.complete(&attempt, AuditOutcome::NotStarted, None, code)
-                    .await;
+                self.complete(
+                    &attempt,
+                    AuditOutcome::NotStarted,
+                    None,
+                    Some(queue_wait),
+                    code,
+                )
+                .await;
                 return Err(error.into());
             }
         };
@@ -171,6 +187,7 @@ impl ExplainService {
         // wider than `query.rs`'s adapter-reported statement duration, and an auditor
         // comparing `AuditOutcomeEvent.duration` across the two tools is comparing two
         // different quantities.
+        let queue_wait = gate.queue_wait();
         let started = Instant::now();
         let planned = gate.explain().await;
         let elapsed = started.elapsed();
@@ -184,6 +201,7 @@ impl ExplainService {
                         attempt_id: attempt.id,
                         outcome: AuditOutcome::Succeeded,
                         duration: Some(elapsed),
+                        queue_wait: Some(queue_wait),
                         rows_returned: None,
                         result_bytes: Some(plan_bytes),
                         error_code: None,
@@ -202,7 +220,8 @@ impl ExplainService {
                     | ExplainError::Database { .. } => AuditOutcome::Failed,
                 };
                 let code = error.public_code();
-                self.complete(&attempt, outcome, None, code).await;
+                self.complete(&attempt, outcome, None, Some(queue_wait), code)
+                    .await;
                 Err(error.into())
             }
         }
@@ -223,7 +242,10 @@ impl ExplainService {
                 "the audit attempt could not be recorded for a refused explain request"
             );
         }
-        self.complete(attempt, outcome, None, error_code).await;
+        // No gate was ever entered for a refused statement, so there is no permit
+        // acquisition to time.
+        self.complete(attempt, outcome, None, None, error_code)
+            .await;
     }
 
     /// Records the terminal state of an attempt without writing the attempt again.
@@ -232,6 +254,7 @@ impl ExplainService {
         attempt: &AuditAttempt,
         outcome: AuditOutcome,
         duration: Option<Duration>,
+        queue_wait: Option<Duration>,
         error_code: warden_core::error::PublicErrorCode,
     ) {
         audit::record_outcome(
@@ -240,6 +263,7 @@ impl ExplainService {
                 attempt_id: attempt.id,
                 outcome,
                 duration,
+                queue_wait,
                 rows_returned: None,
                 result_bytes: None,
                 error_code: Some(error_code),
@@ -264,7 +288,7 @@ mod tests {
     use warden_core::dialect::Dialect;
     use warden_core::error::{PublicError, PublicErrorCode};
     use warden_core::explain::ExplainRequest;
-    use warden_ports::{AnalyzeError, AuditOutcome, ExplainError};
+    use warden_ports::{AnalyzeError, AuditOperation, AuditOutcome, ExplainError};
 
     use crate::testing;
 
@@ -299,6 +323,7 @@ mod tests {
         assert_eq!(outcomes[0].rows_returned, None);
         assert_eq!(outcomes[0].result_bytes, Some(plan.plan_bytes()));
         assert_eq!(outcomes[0].error_code, None);
+        assert_eq!(attempts[0].operation, AuditOperation::Explain);
     }
 
     #[tokio::test]

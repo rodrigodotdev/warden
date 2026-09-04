@@ -18,9 +18,24 @@ use warden_core::connection::ConnectionMetadata;
 use warden_core::context::RequestContext;
 use warden_core::fingerprint::QueryFingerprint;
 use warden_policy::DenyReason;
-use warden_ports::{AuditAttempt, AuditError, AuditEventId, AuditOutcomeEvent, AuditSink};
+use warden_ports::{
+    AuditAttempt, AuditError, AuditEventId, AuditOperation, AuditOutcomeEvent, AuditSink,
+};
 
 use crate::limits::AUDIT_WRITE_TIMEOUT;
+
+/// What an attempt says about a statement, when there is one.
+///
+/// Grouped rather than passed as two parameters so a catalog read can write
+/// `StatementFacts::default()` and mean it: no kind, no fingerprint, and no way to
+/// pass one without the other by accident.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct StatementFacts {
+    /// The analyzed root statement kind.
+    pub(crate) kind: Option<StatementKind>,
+    /// The versioned fingerprint, when the adapter computed one.
+    pub(crate) fingerprint: Option<QueryFingerprint>,
+}
 
 /// Builds the attempt for one request.
 ///
@@ -31,8 +46,8 @@ use crate::limits::AUDIT_WRITE_TIMEOUT;
 pub(crate) fn attempt(
     context: &RequestContext,
     connection: &ConnectionMetadata,
-    statement_kind: StatementKind,
-    fingerprint: Option<QueryFingerprint>,
+    operation: AuditOperation,
+    facts: StatementFacts,
     deny_reasons: Vec<DenyReason>,
 ) -> AuditAttempt {
     AuditAttempt {
@@ -44,8 +59,9 @@ pub(crate) fn attempt(
         connection: connection.name.clone(),
         dialect: connection.dialect,
         environment: connection.environment.clone(),
-        fingerprint,
-        statement_kind,
+        operation,
+        fingerprint: facts.fingerprint,
+        statement_kind: facts.kind,
         deny_reasons,
     }
 }
@@ -193,6 +209,7 @@ mod tests {
             attempt_id: AuditEventId::generate(),
             outcome: AuditOutcome::Succeeded,
             duration: Some(Duration::from_millis(1)),
+            queue_wait: None,
             rows_returned: Some(1),
             result_bytes: Some(3),
             error_code: None,
@@ -205,12 +222,15 @@ mod tests {
         let recorded = attempt(
             &testing::request_context(),
             &testing::connection(Dialect::MySql),
-            StatementKind::Insert,
-            None,
+            AuditOperation::Query,
+            StatementFacts {
+                kind: Some(StatementKind::Insert),
+                fingerprint: None,
+            },
             reasons.clone(),
         );
         assert_eq!(recorded.deny_reasons, reasons);
-        assert_eq!(recorded.statement_kind, StatementKind::Insert);
+        assert_eq!(recorded.statement_kind, Some(StatementKind::Insert));
         assert_eq!(
             recorded.connection,
             testing::connection(Dialect::MySql).name
