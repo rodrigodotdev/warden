@@ -16,6 +16,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use tokio::time::timeout;
+use tracing::Instrument as _;
 use warden_core::analysis::StatementKind;
 use warden_core::connection::ConnectionMetadata;
 use warden_core::context::RequestContext;
@@ -76,7 +77,11 @@ pub(crate) async fn record_attempt(
     sink: &dyn AuditSink,
     event: &AuditAttempt,
 ) -> Result<(), AuditError> {
-    match timeout(AUDIT_WRITE_TIMEOUT, sink.record_attempt(event)).await {
+    let span = tracing::debug_span!("audit.attempt");
+    match timeout(AUDIT_WRITE_TIMEOUT, sink.record_attempt(event))
+        .instrument(span)
+        .await
+    {
         Ok(result) => result,
         Err(_elapsed) => Err(AuditError::Timeout),
     }
@@ -92,7 +97,11 @@ pub(crate) async fn record_attempt(
 /// which prints no `detail` field — so the operator log gains no hostname, database
 /// user, or statement fragment (`docs/security.md` section 10).
 pub(crate) async fn record_outcome(sink: &dyn AuditSink, event: AuditOutcomeEvent) {
-    let written = match timeout(AUDIT_WRITE_TIMEOUT, sink.record_outcome(&event)).await {
+    let span = tracing::debug_span!("audit.outcome");
+    let written = match timeout(AUDIT_WRITE_TIMEOUT, sink.record_outcome(&event))
+        .instrument(span)
+        .await
+    {
         Ok(result) => result,
         Err(_elapsed) => Err(AuditError::Timeout),
     };

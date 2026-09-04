@@ -25,6 +25,7 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument as _;
 use warden_core::explain::QueryPlan;
 use warden_core::result::ResultSet;
 use warden_policy::AuthorizedQuery;
@@ -51,6 +52,7 @@ pub(crate) enum GateError {
     #[error("{error}")]
     Connection {
         /// Why the connection refused.
+        #[source]
         error: ConnectionError,
         /// How long the request waited before it was refused.
         ///
@@ -93,14 +95,15 @@ impl<'a> ExecutionGate<'a> {
             .await
             .map_err(GateError::Audit)?;
         let queued_at = Instant::now();
-        let permit =
-            runtime
-                .acquire_query_permit()
-                .await
-                .map_err(|error| GateError::Connection {
-                    error,
-                    queue_wait: queued_at.elapsed(),
-                })?;
+        let span = tracing::debug_span!("concurrency.acquire");
+        let permit = runtime
+            .acquire_query_permit()
+            .instrument(span)
+            .await
+            .map_err(|error| GateError::Connection {
+                error,
+                queue_wait: queued_at.elapsed(),
+            })?;
         let acquired_at = Instant::now();
         Ok(Self {
             runtime,
@@ -251,6 +254,22 @@ mod tests {
         // The second attempt was still recorded: the ordering is attempt first.
         assert_eq!(sink.attempts().len(), 2);
         drop(held);
+    }
+
+    #[test]
+    fn a_connection_gate_error_exposes_its_typed_source() {
+        let source = ConnectionError::Busy {
+            name: "production-db".parse().unwrap(),
+        };
+        let error = GateError::Connection {
+            error: source.clone(),
+            queue_wait: Duration::from_millis(3),
+        };
+
+        let exposed = std::error::Error::source(&error)
+            .and_then(|source| source.downcast_ref::<ConnectionError>());
+
+        assert_eq!(exposed, Some(&source));
     }
 
     #[tokio::test]

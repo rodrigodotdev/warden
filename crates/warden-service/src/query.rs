@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument as _;
 use warden_core::analysis::StatementKind;
 use warden_core::context::RequestContext;
 use warden_core::error::PublicError;
@@ -100,41 +101,55 @@ impl QueryService {
         context: &RequestContext,
         request: QueryRequest,
     ) -> Result<ResultSet, QueryServiceError> {
-        let runtime = self.registry.get(request.connection())?;
+        let span = tracing::info_span!(
+            "warden.query",
+            request_id = %context.request_id(),
+            connection = %request.connection(),
+        );
+        async move {
+            let runtime = {
+                let _entered = tracing::debug_span!("connection.resolve").entered();
+                self.registry.get(request.connection())
+            }?;
 
-        let analyzed = match runtime.analyzer().analyze(request) {
-            Ok(analyzed) => analyzed,
-            Err(error) => {
-                // SPEC section 6, invariant 24: an attempt that never reached policy
-                // is still an attempt. `AnalyzeError::deny_reason` is the only
-                // producer of `DenyCode::ParserRecursionLimit`, and it copies no
-                // parser text into the record.
-                let attempt = audit::attempt(
-                    context,
-                    runtime.metadata(),
-                    AuditOperation::Query,
-                    StatementFacts {
-                        kind: Some(StatementKind::Unknown),
-                        fingerprint: None,
-                    },
-                    vec![error.deny_reason()],
-                );
-                self.refuse(&attempt, AuditOutcome::Denied, error.public_code())
-                    .await;
-                return Err(error.into());
-            }
-        };
+            let analysis_result = {
+                let _entered = tracing::debug_span!("sql.analyze").entered();
+                runtime.analyzer().analyze(request)
+            };
+            let analyzed = match analysis_result {
+                Ok(analyzed) => analyzed,
+                Err(error) => {
+                    // SPEC section 6, invariant 24: an attempt that never reached policy
+                    // is still an attempt. `AnalyzeError::deny_reason` is the only
+                    // producer of `DenyCode::ParserRecursionLimit`, and it copies no
+                    // parser text into the record.
+                    let attempt = audit::attempt(
+                        context,
+                        runtime.metadata(),
+                        AuditOperation::Query,
+                        StatementFacts {
+                            kind: Some(StatementKind::Unknown),
+                            fingerprint: None,
+                        },
+                        vec![error.deny_reason()],
+                    );
+                    self.refuse(&attempt, AuditOutcome::Denied, error.public_code())
+                        .await;
+                    return Err(error.into());
+                }
+            };
 
-        let statement_kind = analyzed.analysis().root_kind();
-        let fingerprint = analyzed.analysis().fingerprint().cloned();
-        // `runtime.limits()` and nothing else: `AuthorizedQuery::limits()` is whatever
-        // the caller passed here, and the adapter treats it as authoritative for the
-        // row and byte bounds (crates/warden-ports/src/runtime.rs).
-        let authorized =
-            match self
-                .engine
-                .authorize(context, runtime.metadata(), analyzed, runtime.limits())
-            {
+            let statement_kind = analyzed.analysis().root_kind();
+            let fingerprint = analyzed.analysis().fingerprint().cloned();
+            // `runtime.limits()` and nothing else: `AuthorizedQuery::limits()` is whatever
+            // the caller passed here, and the adapter treats it as authoritative for the
+            // row and byte bounds (crates/warden-ports/src/runtime.rs).
+            let authorization = {
+                let _entered = tracing::debug_span!("policy.evaluate").entered();
+                self.engine
+                    .authorize(context, runtime.metadata(), analyzed, runtime.limits())
+            };
+            let authorized = match authorization {
                 Ok(authorized) => authorized,
                 Err(rejection) => {
                     let attempt = audit::attempt(
@@ -153,95 +168,101 @@ impl QueryService {
                 }
             };
 
-        let attempt = audit::attempt(
-            context,
-            runtime.metadata(),
-            AuditOperation::Query,
-            StatementFacts {
-                kind: Some(statement_kind),
-                fingerprint,
-            },
-            Vec::new(),
-        );
-        let gate = match ExecutionGate::enter(
-            &runtime,
-            self.audit.as_ref(),
-            &attempt,
-            authorized,
-            self.shutdown.child_token(),
-        )
-        .await
-        {
-            Ok(gate) => gate,
-            // No attempt was recorded, so there is no outcome to complete.
-            Err(GateError::Audit(error)) => return Err(error.into()),
-            Err(GateError::Connection { error, queue_wait }) => {
-                let code = error.public_code();
-                self.complete(
-                    &attempt,
-                    AuditOutcome::NotStarted,
-                    None,
-                    Some(queue_wait),
-                    code,
-                )
-                .await;
-                return Err(error.into());
-            }
-        };
+            let attempt = audit::attempt(
+                context,
+                runtime.metadata(),
+                AuditOperation::Query,
+                StatementFacts {
+                    kind: Some(statement_kind),
+                    fingerprint,
+                },
+                Vec::new(),
+            );
+            let gate = match ExecutionGate::enter(
+                &runtime,
+                self.audit.as_ref(),
+                &attempt,
+                authorized,
+                self.shutdown.child_token(),
+            )
+            .await
+            {
+                Ok(gate) => gate,
+                // No attempt was recorded, so there is no outcome to complete.
+                Err(GateError::Audit(error)) => return Err(error.into()),
+                Err(GateError::Connection { error, queue_wait }) => {
+                    let code = error.public_code();
+                    self.complete(
+                        &attempt,
+                        AuditOutcome::NotStarted,
+                        None,
+                        Some(queue_wait),
+                        code,
+                    )
+                    .await;
+                    return Err(error.into());
+                }
+            };
 
-        let guard = audit::OutcomeGuard::arm(Arc::clone(&self.audit), attempt.id);
-        let queue_wait = gate.queue_wait();
-        match gate.execute().await {
-            Ok(mut result) => {
-                self.redactor.redact_result(&mut result);
-                guard
-                    .complete(AuditOutcomeEvent {
-                        attempt_id: attempt.id,
-                        outcome: AuditOutcome::Succeeded,
-                        // The adapter's own clock over the whole database call, not a
-                        // measurement of the statement alone: it starts before the
-                        // pool checkout and `BEGIN READ ONLY` and their setup round
-                        // trips, and stops once the rows are collected and normalized,
-                        // before rollback and cleanup
-                        // (`crates/warden-mysql/src/execute.rs`; PostgreSQL has the
-                        // same shape). `explain.rs` records a service-side elapsed
-                        // time instead, because a `QueryPlan` carries no stats; the
-                        // two are not the same quantity and an auditor should not
-                        // compare them directly.
-                        duration: Some(result.stats.duration),
-                        queue_wait: Some(queue_wait),
-                        rows_returned: Some(result.stats.rows_returned),
-                        // After redaction, so the figure describes what the agent
-                        // actually receives.
-                        result_bytes: Some(result.stats.bytes),
-                        error_code: None,
-                    })
-                    .await;
-                Ok(result)
-            }
-            Err(error) => {
-                let outcome = match &error {
-                    ExecuteError::Timeout => AuditOutcome::TimedOut,
-                    ExecuteError::Cancelled => AuditOutcome::Cancelled,
-                    ExecuteError::ResultTooLarge { .. }
-                    | ExecuteError::Normalization(_)
-                    | ExecuteError::Database { .. } => AuditOutcome::Failed,
-                };
-                let code = error.public_code();
-                guard
-                    .complete(AuditOutcomeEvent {
-                        attempt_id: attempt.id,
-                        outcome,
-                        duration: None,
-                        queue_wait: Some(queue_wait),
-                        rows_returned: None,
-                        result_bytes: None,
-                        error_code: Some(code),
-                    })
-                    .await;
-                Err(error.into())
+            let guard = audit::OutcomeGuard::arm(Arc::clone(&self.audit), attempt.id);
+            let queue_wait = gate.queue_wait();
+            match gate.execute().await {
+                Ok(mut result) => {
+                    {
+                        let _entered = tracing::debug_span!("result.redact").entered();
+                        self.redactor.redact_result(&mut result);
+                    }
+                    guard
+                        .complete(AuditOutcomeEvent {
+                            attempt_id: attempt.id,
+                            outcome: AuditOutcome::Succeeded,
+                            // The adapter's own clock over the whole database call, not a
+                            // measurement of the statement alone: it starts before the
+                            // pool checkout and `BEGIN READ ONLY` and their setup round
+                            // trips, and stops once the rows are collected and normalized,
+                            // before rollback and cleanup
+                            // (`crates/warden-mysql/src/execute.rs`; PostgreSQL has the
+                            // same shape). `explain.rs` records a service-side elapsed
+                            // time instead, because a `QueryPlan` carries no stats; the
+                            // two are not the same quantity and an auditor should not
+                            // compare them directly.
+                            duration: Some(result.stats.duration),
+                            queue_wait: Some(queue_wait),
+                            rows_returned: Some(result.stats.rows_returned),
+                            // After redaction, so the figure describes what the agent
+                            // actually receives.
+                            result_bytes: Some(result.stats.bytes),
+                            error_code: None,
+                        })
+                        .await;
+                    Ok(result)
+                }
+                Err(error) => {
+                    let outcome = match &error {
+                        ExecuteError::Timeout => AuditOutcome::TimedOut,
+                        ExecuteError::Cancelled => AuditOutcome::Cancelled,
+                        ExecuteError::ResultTooLarge { .. }
+                        | ExecuteError::Normalization(_)
+                        | ExecuteError::Database { .. } => AuditOutcome::Failed,
+                    };
+                    let code = error.public_code();
+                    guard
+                        .complete(AuditOutcomeEvent {
+                            attempt_id: attempt.id,
+                            outcome,
+                            duration: None,
+                            queue_wait: Some(queue_wait),
+                            rows_returned: None,
+                            result_bytes: None,
+                            error_code: Some(code),
+                        })
+                        .await;
+                    Err(error.into())
+                }
             }
         }
+        .instrument(span)
+        .await
     }
 
     /// Records a refused attempt and its terminal outcome together.

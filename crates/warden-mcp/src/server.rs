@@ -55,6 +55,7 @@ use rmcp::model::{
 };
 use rmcp::service::RequestContext as McpRequestContext;
 use rmcp::{RoleServer, ServerHandler, tool, tool_router};
+use tracing::Instrument as _;
 use warden_core::context::RequestContext;
 use warden_core::error::{PublicError, PublicErrorCode};
 use warden_service::Services;
@@ -272,7 +273,12 @@ impl WardenServer {
     /// It takes the identity it does not read so that every tool builds one on the same
     /// path — a call this transport cannot identify must fail here exactly as it does
     /// for the other four — and because Milestone 13's audit event needs it.
-    async fn run_list_connections(&self, _identity: RequestContext) -> CallToolResult {
+    async fn run_list_connections(&self, identity: RequestContext) -> CallToolResult {
+        let _entered = tracing::info_span!(
+            "mcp.tool.list_connections",
+            request_id = %identity.request_id(),
+        )
+        .entered();
         output::ConnectionsOutput::from_metadata(&self.services.registry().list()).into_result()
     }
 
@@ -283,9 +289,14 @@ impl WardenServer {
             Err(code) => return failure(code),
         };
         let services = Arc::clone(&self.services);
-        let outcome =
-            Self::run_in_task(async move { services.query().execute(&identity, request).await })
-                .await;
+        let span = tracing::info_span!(
+            "mcp.tool.query",
+            request_id = %identity.request_id(),
+        );
+        let outcome = Self::run_in_task(
+            async move { services.query().execute(&identity, request).await }.instrument(span),
+        )
+        .await;
         match outcome {
             Ok(Ok(result)) => output::QueryOutput::from(&result).into_result(),
             Ok(Err(error)) => failure(error.public_code()),
@@ -300,9 +311,14 @@ impl WardenServer {
             Err(code) => return failure(code),
         };
         let services = Arc::clone(&self.services);
-        let outcome =
-            Self::run_in_task(async move { services.explain().explain(&identity, request).await })
-                .await;
+        let span = tracing::info_span!(
+            "mcp.tool.explain",
+            request_id = %identity.request_id(),
+        );
+        let outcome = Self::run_in_task(
+            async move { services.explain().explain(&identity, request).await }.instrument(span),
+        )
+        .await;
         match outcome {
             Ok(Ok(plan)) => output::ExplainOutput::from(&plan).into_result(),
             Ok(Err(error)) => failure(error.public_code()),
@@ -321,9 +337,14 @@ impl WardenServer {
             Err(code) => return failure(code),
         };
         let services = Arc::clone(&self.services);
-        let outcome =
-            Self::run_in_task(async move { services.schema().search(&identity, request).await })
-                .await;
+        let span = tracing::info_span!(
+            "mcp.tool.search_schema",
+            request_id = %identity.request_id(),
+        );
+        let outcome = Self::run_in_task(
+            async move { services.schema().search(&identity, request).await }.instrument(span),
+        )
+        .await;
         match outcome {
             Ok(Ok(found)) => output::SearchOutput::from(&found).into_result(),
             Ok(Err(error)) => failure(error.public_code()),
@@ -342,9 +363,14 @@ impl WardenServer {
             Err(code) => return failure(code),
         };
         let services = Arc::clone(&self.services);
-        let outcome =
-            Self::run_in_task(async move { services.schema().describe(&identity, request).await })
-                .await;
+        let span = tracing::info_span!(
+            "mcp.tool.describe_schema",
+            request_id = %identity.request_id(),
+        );
+        let outcome = Self::run_in_task(
+            async move { services.schema().describe(&identity, request).await }.instrument(span),
+        )
+        .await;
         match outcome {
             Ok(Ok(described)) => output::DescribeOutput::from(&described).into_result(),
             Ok(Err(error)) => failure(error.public_code()),

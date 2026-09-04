@@ -7,24 +7,55 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io;
+use std::num::NonZeroUsize;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::thread::ThreadId;
+use std::time::Duration;
 
 use proc_macro2::{Ident, TokenStream, TokenTree};
 use syn::visit::Visit;
 use tokio_util::sync::CancellationToken;
+use tracing::field::{Field, Visit as FieldVisit};
+use tracing::span::{self, Id};
+use tracing::{Event, Level, Metadata, Subscriber};
+use warden_core::analysis::{QueryAnalysis, QueryAnalysisParts, StatementKind};
+use warden_core::connection::Capabilities;
 use warden_core::connection::{ConnectionMetadata, ConnectionName, Environment};
+use warden_core::context::RequestContext;
 use warden_core::dialect::Dialect;
-use warden_policy::{PolicyEngine, PolicySettings};
-use warden_ports::{AuditAttempt, AuditError, AuditOutcomeEvent, BoxFuture, ConnectionError};
+use warden_core::explain::QueryPlan;
+use warden_core::limits::ExecutionLimits;
+use warden_core::query::{InputLimits, QueryRequest};
+use warden_core::result::{QueryStats, ResultColumn, ResultSet, ResultValue};
+use warden_core::schema::{
+    SchemaDescribeRequest, SchemaDescription, SchemaSearchRequest, SchemaSearchResult,
+};
+use warden_policy::{AnalyzedQuery, AuthorizedQuery, ObjectFilter, PolicyEngine, PolicySettings};
+use warden_ports::{
+    AnalyzeError, AuditAttempt, AuditError, AuditOutcomeEvent, BoxFuture, ConnectionError,
+    ExecuteError, ExplainError, Explainer, QueryAnalyzer, QueryExecutor, QueryPermit, SchemaError,
+    SchemaInspector,
+};
 use warden_service::{
     AuditSink, ConnectionRegistry, ConnectionRuntime, ConnectionRuntimeParts, ExplainService,
     QueryService, RedactionRuleError, RedactionSettings, RuntimeError, SchemaService,
-    ServiceBuildError, ServiceParts, Services,
+    ServiceBuildError, ServiceParts, Services, StaticConnectionRegistry,
 };
+
+const FORBIDDEN_SPAN_FIELDS: &[&str] = &[
+    "sql",
+    "raw_sql",
+    "statement",
+    "parameters",
+    "raw_parameters",
+    "password",
+    "dsn",
+];
 
 /// Runtime methods that reach a database or take a concurrency slot. `pipeline.rs`
 /// is the only source file allowed to name them (ADR-0038). Schema inspection uses
@@ -556,6 +587,292 @@ impl AuditSink for Sink {
     }
 }
 
+#[derive(Debug)]
+struct TestAnalyzer;
+
+impl QueryAnalyzer for TestAnalyzer {
+    fn dialect(&self) -> Dialect {
+        Dialect::PostgreSql
+    }
+
+    fn analyze(&self, request: QueryRequest) -> Result<AnalyzedQuery, AnalyzeError> {
+        Ok(AnalyzedQuery::new(
+            request,
+            QueryAnalysis::new(QueryAnalysisParts {
+                dialect: Dialect::PostgreSql,
+                statement_count: NonZeroUsize::MIN,
+                root_kind: StatementKind::Select,
+                nested_kinds: Vec::new(),
+                objects: Vec::new(),
+                functions: Vec::new(),
+                risks: Vec::new(),
+                has_locking_clause: false,
+                has_side_effects: false,
+                fingerprint: None,
+            }),
+        ))
+    }
+}
+
+#[derive(Debug)]
+struct TestExecutor;
+
+impl QueryExecutor for TestExecutor {
+    fn execute_read_only<'a>(
+        &'a self,
+        _query: &'a AuthorizedQuery,
+        _permit: &'a QueryPermit,
+        _deadline: tokio::time::Instant,
+        _cancel: CancellationToken,
+    ) -> BoxFuture<'a, Result<ResultSet, ExecuteError>> {
+        Box::pin(async {
+            Ok(ResultSet {
+                columns: vec![ResultColumn {
+                    name: "token".to_owned(),
+                    database_type: "TEXT".to_owned(),
+                    nullable: Some(false),
+                }],
+                rows: vec![vec![ResultValue::String("redacted fixture".to_owned())]],
+                truncated: false,
+                stats: QueryStats {
+                    rows_returned: 1,
+                    bytes: 20,
+                    duration: Duration::from_millis(1),
+                },
+            })
+        })
+    }
+}
+
+#[derive(Debug)]
+struct UnusedPorts;
+
+impl Explainer for UnusedPorts {
+    fn explain<'a>(
+        &'a self,
+        _query: &'a AuthorizedQuery,
+        _permit: &'a QueryPermit,
+        _deadline: tokio::time::Instant,
+        _cancel: CancellationToken,
+    ) -> BoxFuture<'a, Result<QueryPlan, ExplainError>> {
+        Box::pin(async {
+            Err(ExplainError::Database {
+                detail: "unused test port".to_owned(),
+            })
+        })
+    }
+}
+
+impl SchemaInspector for UnusedPorts {
+    fn search_schema<'a>(
+        &'a self,
+        _request: &'a SchemaSearchRequest,
+        _filter: ObjectFilter<'a>,
+        _deadline: tokio::time::Instant,
+        _cancel: CancellationToken,
+    ) -> BoxFuture<'a, Result<SchemaSearchResult, SchemaError>> {
+        Box::pin(async {
+            Err(SchemaError::Database {
+                detail: "unused test port".to_owned(),
+            })
+        })
+    }
+
+    fn describe_schema<'a>(
+        &'a self,
+        _request: &'a SchemaDescribeRequest,
+        _filter: ObjectFilter<'a>,
+        _deadline: tokio::time::Instant,
+        _cancel: CancellationToken,
+    ) -> BoxFuture<'a, Result<SchemaDescription, SchemaError>> {
+        Box::pin(async {
+            Err(SchemaError::Database {
+                detail: "unused test port".to_owned(),
+            })
+        })
+    }
+}
+
+#[derive(Debug)]
+struct CapturedSpan {
+    id: Id,
+    name: &'static str,
+    level: Level,
+    parent: Option<Id>,
+    field_names: Vec<String>,
+    field_values: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Default)]
+struct CaptureState {
+    spans: Vec<CapturedSpan>,
+    stacks: HashMap<ThreadId, Vec<Id>>,
+}
+
+#[derive(Debug, Clone)]
+struct CapturingSubscriber {
+    state: Arc<Mutex<CaptureState>>,
+    next_id: Arc<AtomicU64>,
+}
+
+impl Subscriber for CapturingSubscriber {
+    fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+        true
+    }
+
+    fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+        Some(tracing::level_filters::LevelFilter::TRACE)
+    }
+
+    fn new_span(&self, attributes: &span::Attributes<'_>) -> Id {
+        let id = Id::from_u64(self.next_id.fetch_add(1, Ordering::Relaxed));
+        let mut values = SpanFieldVisitor::default();
+        attributes.record(&mut values);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let contextual_parent = state
+            .stacks
+            .get(&std::thread::current().id())
+            .and_then(|stack| stack.last())
+            .cloned();
+        let parent = attributes.parent().cloned().or(contextual_parent);
+        let metadata = attributes.metadata();
+        state.spans.push(CapturedSpan {
+            id: id.clone(),
+            name: metadata.name(),
+            level: *metadata.level(),
+            parent,
+            field_names: metadata
+                .fields()
+                .iter()
+                .map(|field| field.name().to_owned())
+                .collect(),
+            field_values: values.values,
+        });
+        id
+    }
+
+    fn record(&self, id: &Id, values: &span::Record<'_>) {
+        let mut visitor = SpanFieldVisitor::default();
+        values.record(&mut visitor);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(captured) = state.spans.iter_mut().find(|span| span.id == *id) {
+            captured.field_values.extend(visitor.values);
+        }
+    }
+
+    fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+    fn event(&self, _event: &Event<'_>) {}
+
+    fn enter(&self, id: &Id) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stacks
+            .entry(std::thread::current().id())
+            .or_default()
+            .push(id.clone());
+    }
+
+    fn exit(&self, id: &Id) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(stack) = state.stacks.get_mut(&std::thread::current().id()) else {
+            return;
+        };
+        if let Some(position) = stack.iter().rposition(|entered| entered == id) {
+            stack.remove(position);
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct SpanFieldVisitor {
+    values: BTreeMap<String, String>,
+}
+
+impl FieldVisit for SpanFieldVisitor {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        self.values
+            .insert(field.name().to_owned(), format!("{value:?}"));
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        self.values
+            .insert(field.name().to_owned(), value.to_owned());
+    }
+}
+
+#[derive(Debug)]
+struct SpanCapture {
+    state: Arc<Mutex<CaptureState>>,
+    _guard: tracing::subscriber::DefaultGuard,
+}
+
+impl SpanCapture {
+    fn install() -> Self {
+        let state = Arc::new(Mutex::new(CaptureState::default()));
+        let subscriber = CapturingSubscriber {
+            state: Arc::clone(&state),
+            next_id: Arc::new(AtomicU64::new(1)),
+        };
+        let guard = tracing::subscriber::set_default(subscriber);
+        Self {
+            state,
+            _guard: guard,
+        }
+    }
+
+    fn span_tree(&self) -> Vec<(&'static str, Option<&'static str>, Level)> {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state
+            .spans
+            .iter()
+            .map(|span| {
+                let parent = span.parent.as_ref().and_then(|parent| {
+                    state
+                        .spans
+                        .iter()
+                        .find(|candidate| candidate.id == *parent)
+                        .map(|candidate| candidate.name)
+                });
+                (span.name, parent, span.level)
+            })
+            .collect()
+    }
+
+    fn all_field_names(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .spans
+            .iter()
+            .flat_map(|span| span.field_names.iter().cloned())
+            .collect()
+    }
+
+    fn all_field_values(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .spans
+            .iter()
+            .flat_map(|span| span.field_values.values().cloned())
+            .collect()
+    }
+}
+
 fn metadata(name: &str) -> ConnectionMetadata {
     ConnectionMetadata {
         name: name.parse().unwrap(),
@@ -574,6 +891,88 @@ fn parts(redaction: RedactionSettings) -> ServiceParts {
         audit: Arc::new(Sink),
         redaction,
         shutdown: CancellationToken::new(),
+    }
+}
+
+fn context() -> RequestContext {
+    RequestContext::new(
+        "req-span-1".parse().unwrap(),
+        "operator@example.com".parse().unwrap(),
+        "span-contract-test".parse().unwrap(),
+    )
+}
+
+fn request(sql: &str) -> QueryRequest {
+    QueryRequest::new(
+        "primary".parse().unwrap(),
+        sql.to_owned(),
+        Vec::new(),
+        &InputLimits::default(),
+    )
+    .unwrap()
+}
+
+fn services_with_fakes() -> Services {
+    let unused = Arc::new(UnusedPorts);
+    let runtime = Arc::new(
+        ConnectionRuntime::new(ConnectionRuntimeParts {
+            metadata: metadata("primary"),
+            capabilities: Capabilities {
+                read_only_transactions: true,
+                structured_explain: true,
+                server_statement_timeout: true,
+                schema_search: true,
+            },
+            limits: ExecutionLimits::default(),
+            analyzer: Arc::new(TestAnalyzer),
+            executor: Arc::new(TestExecutor),
+            inspector: Arc::clone(&unused) as Arc<dyn SchemaInspector>,
+            explainer: unused,
+        })
+        .unwrap(),
+    );
+    Services::new(ServiceParts {
+        registry: Arc::new(StaticConnectionRegistry::new(vec![runtime]).unwrap()),
+        engine: Arc::new(PolicyEngine::with_defaults(&PolicySettings::default()).unwrap()),
+        audit: Arc::new(Sink),
+        redaction: RedactionSettings::default(),
+        shutdown: CancellationToken::new(),
+    })
+    .unwrap()
+}
+
+#[tokio::test]
+async fn one_query_creates_the_documented_span_tree_and_leaks_no_statement() {
+    let capture = SpanCapture::install();
+    let services = services_with_fakes();
+    services
+        .query()
+        .execute(
+            &context(),
+            request("SELECT token FROM t WHERE k = 'hunter2'"),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        capture.span_tree(),
+        [
+            ("warden.query", None, Level::INFO),
+            ("connection.resolve", Some("warden.query"), Level::DEBUG),
+            ("sql.analyze", Some("warden.query"), Level::DEBUG),
+            ("policy.evaluate", Some("warden.query"), Level::DEBUG),
+            ("audit.attempt", Some("warden.query"), Level::DEBUG),
+            ("concurrency.acquire", Some("warden.query"), Level::DEBUG),
+            ("result.redact", Some("warden.query"), Level::DEBUG),
+            ("audit.outcome", Some("warden.query"), Level::DEBUG),
+        ]
+    );
+    for value in capture.all_field_values() {
+        assert!(!value.contains("hunter2"), "{value}");
+        assert!(!value.contains("SELECT"), "{value}");
+    }
+    for field in capture.all_field_names() {
+        assert!(!FORBIDDEN_SPAN_FIELDS.contains(&field.as_str()), "{field}");
     }
 }
 

@@ -26,6 +26,7 @@ use std::sync::Arc;
 
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument as _;
 use warden_core::context::RequestContext;
 use warden_core::error::PublicError;
 use warden_core::schema::{
@@ -105,34 +106,47 @@ impl SchemaService {
         context: &RequestContext,
         request: SchemaSearchRequest,
     ) -> Result<SchemaSearchResult, SchemaServiceError> {
-        let runtime = self.registry.get(request.connection())?;
-        if !runtime.capabilities().schema_search {
-            return Err(SchemaServiceError::SearchUnsupported);
-        }
-        let attempt = audit::attempt(
-            context,
-            runtime.metadata(),
-            AuditOperation::SearchSchema,
-            // A catalog read submits no statement. Object rules are applied inside
-            // the adapter (ADR-0036), so the denials this record could carry are
-            // not knowable before dispatch; the outcome reports the refusal.
-            StatementFacts::default(),
-            Vec::new(),
+        let span = tracing::info_span!(
+            "warden.search_schema",
+            request_id = %context.request_id(),
+            connection = %request.connection(),
         );
-        audit::record_attempt(self.audit.as_ref(), &attempt).await?;
+        async move {
+            let runtime = self.registry.get(request.connection())?;
+            if !runtime.capabilities().schema_search {
+                return Err(SchemaServiceError::SearchUnsupported);
+            }
+            let attempt = audit::attempt(
+                context,
+                runtime.metadata(),
+                AuditOperation::SearchSchema,
+                // A catalog read submits no statement. Object rules are applied inside
+                // the adapter (ADR-0036), so the denials this record could carry are
+                // not knowable before dispatch; the outcome reports the refusal.
+                StatementFacts::default(),
+                Vec::new(),
+            );
+            audit::record_attempt(self.audit.as_ref(), &attempt).await?;
 
-        let started = Instant::now();
-        let filter = ObjectFilter::new(
-            self.engine.as_ref(),
-            PolicyContext::new(context, runtime.metadata()),
-        );
-        let deadline = RequestBudget::new(runtime.limits()).deadline(started);
-        let found = runtime
-            .inspector()
-            .search_schema(&request, filter, deadline, self.shutdown.child_token())
-            .await;
-        self.complete(&attempt, started, &found).await;
-        Ok(found?)
+            let started = Instant::now();
+            let filter = ObjectFilter::new(
+                self.engine.as_ref(),
+                PolicyContext::new(context, runtime.metadata()),
+            );
+            let deadline = RequestBudget::new(runtime.limits()).deadline(started);
+            let found = runtime
+                .inspector()
+                .search_schema(&request, filter, deadline, self.shutdown.child_token())
+                .await;
+            self.complete(&attempt, started, &found).await;
+            let found = {
+                let _entered = tracing::debug_span!("result.redact").entered();
+                found?
+            };
+            Ok(found)
+        }
+        .instrument(span)
+        .await
     }
 
     /// Describes relations and redacts sensitive catalog text before returning it.
@@ -154,33 +168,45 @@ impl SchemaService {
         context: &RequestContext,
         request: SchemaDescribeRequest,
     ) -> Result<SchemaDescription, SchemaServiceError> {
-        let runtime = self.registry.get(request.connection())?;
-        let attempt = audit::attempt(
-            context,
-            runtime.metadata(),
-            AuditOperation::DescribeSchema,
-            // A catalog read submits no statement. Object rules are applied inside
-            // the adapter (ADR-0036), so the denials this record could carry are
-            // not knowable before dispatch; the outcome reports the refusal.
-            StatementFacts::default(),
-            Vec::new(),
+        let span = tracing::info_span!(
+            "warden.describe_schema",
+            request_id = %context.request_id(),
+            connection = %request.connection(),
         );
-        audit::record_attempt(self.audit.as_ref(), &attempt).await?;
+        async move {
+            let runtime = self.registry.get(request.connection())?;
+            let attempt = audit::attempt(
+                context,
+                runtime.metadata(),
+                AuditOperation::DescribeSchema,
+                // A catalog read submits no statement. Object rules are applied inside
+                // the adapter (ADR-0036), so the denials this record could carry are
+                // not knowable before dispatch; the outcome reports the refusal.
+                StatementFacts::default(),
+                Vec::new(),
+            );
+            audit::record_attempt(self.audit.as_ref(), &attempt).await?;
 
-        let started = Instant::now();
-        let filter = ObjectFilter::new(
-            self.engine.as_ref(),
-            PolicyContext::new(context, runtime.metadata()),
-        );
-        let deadline = RequestBudget::new(runtime.limits()).deadline(started);
-        let found = runtime
-            .inspector()
-            .describe_schema(&request, filter, deadline, self.shutdown.child_token())
-            .await;
-        self.complete(&attempt, started, &found).await;
-        let mut described = found?;
-        self.redactor.redact_description(&mut described);
-        Ok(described)
+            let started = Instant::now();
+            let filter = ObjectFilter::new(
+                self.engine.as_ref(),
+                PolicyContext::new(context, runtime.metadata()),
+            );
+            let deadline = RequestBudget::new(runtime.limits()).deadline(started);
+            let found = runtime
+                .inspector()
+                .describe_schema(&request, filter, deadline, self.shutdown.child_token())
+                .await;
+            self.complete(&attempt, started, &found).await;
+            let mut described = found?;
+            {
+                let _entered = tracing::debug_span!("result.redact").entered();
+                self.redactor.redact_description(&mut described);
+            }
+            Ok(described)
+        }
+        .instrument(span)
+        .await
     }
 
     /// Records the terminal outcome of a catalog read.

@@ -24,6 +24,7 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument as _;
 use warden_core::analysis::StatementKind;
 use warden_core::context::RequestContext;
 use warden_core::error::PublicError;
@@ -98,35 +99,49 @@ impl ExplainService {
         context: &RequestContext,
         request: ExplainRequest,
     ) -> Result<QueryPlan, ExplainServiceError> {
-        let query = request.query().clone();
-        let runtime = self.registry.get(query.connection())?;
+        let span = tracing::info_span!(
+            "warden.explain",
+            request_id = %context.request_id(),
+            connection = %request.query().connection(),
+        );
+        async move {
+            let query = request.query().clone();
+            let runtime = {
+                let _entered = tracing::debug_span!("connection.resolve").entered();
+                self.registry.get(query.connection())
+            }?;
 
-        let analyzed = match runtime.analyzer().analyze(query) {
-            Ok(analyzed) => analyzed,
-            Err(error) => {
-                let attempt = audit::attempt(
-                    context,
-                    runtime.metadata(),
-                    AuditOperation::Explain,
-                    StatementFacts {
-                        kind: Some(StatementKind::Unknown),
-                        fingerprint: None,
-                    },
-                    vec![error.deny_reason()],
-                );
-                self.refuse(&attempt, AuditOutcome::Denied, error.public_code())
-                    .await;
-                return Err(error.into());
-            }
-        };
+            let analysis_result = {
+                let _entered = tracing::debug_span!("sql.analyze").entered();
+                runtime.analyzer().analyze(query)
+            };
+            let analyzed = match analysis_result {
+                Ok(analyzed) => analyzed,
+                Err(error) => {
+                    let attempt = audit::attempt(
+                        context,
+                        runtime.metadata(),
+                        AuditOperation::Explain,
+                        StatementFacts {
+                            kind: Some(StatementKind::Unknown),
+                            fingerprint: None,
+                        },
+                        vec![error.deny_reason()],
+                    );
+                    self.refuse(&attempt, AuditOutcome::Denied, error.public_code())
+                        .await;
+                    return Err(error.into());
+                }
+            };
 
-        let statement_kind = analyzed.analysis().root_kind();
-        let fingerprint = analyzed.analysis().fingerprint().cloned();
-        let authorized =
-            match self
-                .engine
-                .authorize(context, runtime.metadata(), analyzed, runtime.limits())
-            {
+            let statement_kind = analyzed.analysis().root_kind();
+            let fingerprint = analyzed.analysis().fingerprint().cloned();
+            let authorization = {
+                let _entered = tracing::debug_span!("policy.evaluate").entered();
+                self.engine
+                    .authorize(context, runtime.metadata(), analyzed, runtime.limits())
+            };
+            let authorized = match authorization {
                 Ok(authorized) => authorized,
                 Err(rejection) => {
                     let attempt = audit::attempt(
@@ -145,94 +160,100 @@ impl ExplainService {
                 }
             };
 
-        let attempt = audit::attempt(
-            context,
-            runtime.metadata(),
-            AuditOperation::Explain,
-            StatementFacts {
-                kind: Some(statement_kind),
-                fingerprint,
-            },
-            Vec::new(),
-        );
-        let gate = match ExecutionGate::enter(
-            &runtime,
-            self.audit.as_ref(),
-            &attempt,
-            authorized,
-            self.shutdown.child_token(),
-        )
-        .await
-        {
-            Ok(gate) => gate,
-            Err(GateError::Audit(error)) => return Err(error.into()),
-            Err(GateError::Connection { error, queue_wait }) => {
-                let code = error.public_code();
-                self.complete(
-                    &attempt,
-                    AuditOutcome::NotStarted,
-                    None,
-                    Some(queue_wait),
-                    code,
-                )
-                .await;
-                return Err(error.into());
-            }
-        };
+            let attempt = audit::attempt(
+                context,
+                runtime.metadata(),
+                AuditOperation::Explain,
+                StatementFacts {
+                    kind: Some(statement_kind),
+                    fingerprint,
+                },
+                Vec::new(),
+            );
+            let gate = match ExecutionGate::enter(
+                &runtime,
+                self.audit.as_ref(),
+                &attempt,
+                authorized,
+                self.shutdown.child_token(),
+            )
+            .await
+            {
+                Ok(gate) => gate,
+                Err(GateError::Audit(error)) => return Err(error.into()),
+                Err(GateError::Connection { error, queue_wait }) => {
+                    let code = error.public_code();
+                    self.complete(
+                        &attempt,
+                        AuditOutcome::NotStarted,
+                        None,
+                        Some(queue_wait),
+                        code,
+                    )
+                    .await;
+                    return Err(error.into());
+                }
+            };
 
-        let guard = audit::OutcomeGuard::arm(Arc::clone(&self.audit), attempt.id);
-        // A service-side clock around the gated call: planning plus the adapter's own
-        // overhead, started after the permit was acquired so the queue wait is
-        // excluded. `QueryPlan` carries no adapter-measured duration the way
-        // `ResultSet::stats` does, so this is the only figure available here — it is
-        // wider than `query.rs`'s adapter-reported statement duration, and an auditor
-        // comparing `AuditOutcomeEvent.duration` across the two tools is comparing two
-        // different quantities.
-        let queue_wait = gate.queue_wait();
-        let started = Instant::now();
-        let planned = gate.explain().await;
-        let elapsed = started.elapsed();
-        match planned {
-            Ok(mut plan) => {
-                self.redactor.redact_plan(&mut plan);
-                let plan_bytes = plan.plan_bytes();
-                guard
-                    .complete(AuditOutcomeEvent {
-                        attempt_id: attempt.id,
-                        outcome: AuditOutcome::Succeeded,
-                        duration: Some(elapsed),
-                        queue_wait: Some(queue_wait),
-                        rows_returned: None,
-                        result_bytes: Some(plan_bytes),
-                        error_code: None,
-                    })
-                    .await;
-                Ok(plan)
-            }
-            Err(error) => {
-                let outcome = match &error {
-                    ExplainError::Timeout => AuditOutcome::TimedOut,
-                    ExplainError::Cancelled => AuditOutcome::Cancelled,
-                    ExplainError::PrefixVerificationFailed
-                    | ExplainError::MalformedPlan { .. }
-                    | ExplainError::PlanTooLarge { .. }
-                    | ExplainError::Database { .. } => AuditOutcome::Failed,
-                };
-                let code = error.public_code();
-                guard
-                    .complete(AuditOutcomeEvent {
-                        attempt_id: attempt.id,
-                        outcome,
-                        duration: None,
-                        queue_wait: Some(queue_wait),
-                        rows_returned: None,
-                        result_bytes: None,
-                        error_code: Some(code),
-                    })
-                    .await;
-                Err(error.into())
+            let guard = audit::OutcomeGuard::arm(Arc::clone(&self.audit), attempt.id);
+            // A service-side clock around the gated call: planning plus the adapter's own
+            // overhead, started after the permit was acquired so the queue wait is
+            // excluded. `QueryPlan` carries no adapter-measured duration the way
+            // `ResultSet::stats` does, so this is the only figure available here — it is
+            // wider than `query.rs`'s adapter-reported statement duration, and an auditor
+            // comparing `AuditOutcomeEvent.duration` across the two tools is comparing two
+            // different quantities.
+            let queue_wait = gate.queue_wait();
+            let started = Instant::now();
+            let planned = gate.explain().await;
+            let elapsed = started.elapsed();
+            match planned {
+                Ok(mut plan) => {
+                    {
+                        let _entered = tracing::debug_span!("result.redact").entered();
+                        self.redactor.redact_plan(&mut plan);
+                    }
+                    let plan_bytes = plan.plan_bytes();
+                    guard
+                        .complete(AuditOutcomeEvent {
+                            attempt_id: attempt.id,
+                            outcome: AuditOutcome::Succeeded,
+                            duration: Some(elapsed),
+                            queue_wait: Some(queue_wait),
+                            rows_returned: None,
+                            result_bytes: Some(plan_bytes),
+                            error_code: None,
+                        })
+                        .await;
+                    Ok(plan)
+                }
+                Err(error) => {
+                    let outcome = match &error {
+                        ExplainError::Timeout => AuditOutcome::TimedOut,
+                        ExplainError::Cancelled => AuditOutcome::Cancelled,
+                        ExplainError::PrefixVerificationFailed
+                        | ExplainError::MalformedPlan { .. }
+                        | ExplainError::PlanTooLarge { .. }
+                        | ExplainError::Database { .. } => AuditOutcome::Failed,
+                    };
+                    let code = error.public_code();
+                    guard
+                        .complete(AuditOutcomeEvent {
+                            attempt_id: attempt.id,
+                            outcome,
+                            duration: None,
+                            queue_wait: Some(queue_wait),
+                            rows_returned: None,
+                            result_bytes: None,
+                            error_code: Some(code),
+                        })
+                        .await;
+                    Err(error.into())
+                }
             }
         }
+        .instrument(span)
+        .await
     }
 
     /// Records a refused attempt and its terminal outcome together.

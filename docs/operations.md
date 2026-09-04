@@ -838,13 +838,31 @@ mcp.tool.query
     └── audit.outcome
 ```
 
-The child labels are code paths, and `mcp.tool.query`'s entry point exists as of
-Milestone 12: `warden-mcp`'s five `#[tool]` methods, four of which run in their own
-spawned task (`docs/security.md` section 14).
-Connection resolution, analysis, policy, attempt and outcome writes, permit acquisition,
-the adapter's read-only transaction and execution/normalization, and service-layer
-redaction all exist too. **None of them is a tracing span yet.** Milestone 13 adds the
-instrumentation; do not read this tree as claiming any span already exists.
+The other tool and service roots are:
+
+```text
+mcp.tool.explain
+└── warden.explain
+mcp.tool.search_schema
+└── warden.search_schema
+mcp.tool.describe_schema
+└── warden.describe_schema
+mcp.tool.list_connections
+```
+
+Tool and service roots are `info`; phase children are `debug`. The shipped
+`warn,warden=info` filter therefore records one span per request by default, and an
+operator opts into the phase tree when diagnosing a request. The other service
+roots use the same phase names shown in the canonical query tree whenever they
+traverse the same phase.
+
+Span fields are restricted to the audit record's identity fields: `request_id`,
+`principal_id`, `client`, `connection`, `dialect`, `environment`, and `operation`.
+A span never carries a statement, a parameter, or a `DenyReason` detail. The
+capturing subscriber in `crates/warden-service/tests/service_rules.rs` runs a real
+statement carrying a literal and verifies the ordering, parentage, field names, and
+field values. The architecture guard in `tests/architecture.rs` parses this section
+and keeps its names synchronized with code (Task 8).
 
 ### 10.2 Fields
 
