@@ -143,7 +143,7 @@ disallowed_methods = "deny"
 [package]
 name = "warden"
 version = "0.1.0"
-description = "Secure, read-only, auditable query gateway for AI agents"
+description = "A secure, read-only MCP gateway for AI agents to explore MySQL and PostgreSQL"
 edition.workspace = true
 rust-version.workspace = true
 authors.workspace = true
