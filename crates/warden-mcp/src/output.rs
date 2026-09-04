@@ -450,9 +450,24 @@ impl From<&PlanSummary> for PlanSummaryOutput {
 ///
 /// `docs/mcp.md` section 2: engine-specific detail belongs to the engine's own document,
 /// not to a shape Warden invents, so the schema accepts anything.
-#[derive(Debug, serde::Serialize)]
+#[derive(serde::Serialize)]
 #[serde(transparent)]
 pub struct PlanDocument(serde_json::Value);
+
+/// Prints shape, never content.
+///
+/// A plan document is database-derived: `warden_service::Redactor::redact_plan` runs over
+/// it before it leaves the service layer, and `docs/security.md` section 8 records that
+/// the pass matches JSON member keys and leaves free text such as a node's `Filter`
+/// string alone — so the document reaching this type can still hold statement literals
+/// under a key no rule names. Mirrors [`CellValue`]'s own hand-written `Debug` so a
+/// `tracing::debug!(?output, ..)` on an `ExplainOutput` cannot print in plaintext what
+/// the response path spent a redaction pass on.
+impl fmt::Debug for PlanDocument {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("PlanDocument(<redacted>)")
+    }
+}
 
 impl JsonSchema for PlanDocument {
     fn schema_name() -> std::borrow::Cow<'static, str> {
@@ -605,7 +620,7 @@ pub struct TableSummary {
 }
 
 /// One column of a discovered relation.
-#[derive(Debug, serde::Serialize, JsonSchema)]
+#[derive(serde::Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 pub struct ColumnDetail {
     /// The column name.
@@ -618,6 +633,38 @@ pub struct ColumnDetail {
     pub default: Option<String>,
     /// The bounded column comment, when one exists.
     pub comment: Option<String>,
+}
+
+/// Prints the column's identity, never its catalog text.
+///
+/// `docs/security.md` section 8 puts a column's default and comment behind
+/// `warden_service::Redactor::redact_description` because either can carry a secret;
+/// the name, type, and nullability are the identity `describe_schema` returns either
+/// way. Mirrors [`CellValue`]'s own hand-written `Debug` so a
+/// `tracing::debug!(?output, ..)` on a `DescribeSchemaOutput` cannot print in plaintext
+/// what the response path redacts.
+impl fmt::Debug for ColumnDetail {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ColumnDetail")
+            .field("name", &self.name)
+            .field("database_type", &self.database_type)
+            .field("nullable", &self.nullable)
+            .field("default", &RedactedText(self.default.as_deref()))
+            .field("comment", &RedactedText(self.comment.as_deref()))
+            .finish()
+    }
+}
+
+/// Prints an optional catalog string's shape and never its bytes.
+struct RedactedText<'a>(Option<&'a str>);
+
+impl fmt::Debug for RedactedText<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.0 {
+            None => f.write_str("None"),
+            Some(text) => write!(f, "Some(<redacted {} bytes>)", text.len()),
+        }
+    }
 }
 
 impl From<&ColumnDescription> for ColumnDetail {
@@ -800,6 +847,19 @@ mod tests {
             dialect: Dialect::MySql,
             summary: PlanSummary::default(),
             plan: serde_json::json!({ "query_block": { "select_id": 1 } }),
+        }
+    }
+
+    /// A plan whose document holds a statement literal under a member no redaction rule
+    /// names — the case `docs/security.md` section 8 says `redact_plan` does not cover,
+    /// and therefore the one a `Debug` rendering must not print.
+    fn plan_with_a_literal() -> QueryPlan {
+        QueryPlan {
+            dialect: Dialect::PostgreSql,
+            summary: PlanSummary {
+                estimated_rows: Some(1200),
+            },
+            plan: serde_json::json!({ "Node Type": "Seq Scan", "Filter": "(pw = 'hunter2')" }),
         }
     }
 
@@ -1033,6 +1093,63 @@ mod tests {
         let rendered = format!("{secret:?}");
         assert!(!rendered.contains("hunter2"), "{rendered}");
         assert_eq!(rendered, "String(<redacted 7 bytes>)");
+    }
+
+    #[test]
+    fn plan_document_debug_never_prints_the_document() {
+        // The same deliberate deviation from "every output type derives Debug" that
+        // `cell_value_debug_never_prints_a_value` guards, for the other type this
+        // module carries database-derived content in. Without this, restoring
+        // `#[derive(Debug)]` on `PlanDocument` breaks nothing else in the crate.
+        let output = ExplainOutput::from(&plan_with_a_literal());
+        let rendered = format!("{output:?}");
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        assert!(rendered.contains("PlanDocument(<redacted>)"), "{rendered}");
+        // The summary is counts and flags, so it stays readable in a log line.
+        assert!(rendered.contains("estimated_rows"), "{rendered}");
+    }
+
+    #[test]
+    fn column_detail_debug_prints_identity_and_redacts_catalog_text() {
+        // `docs/security.md` section 8 redacts a column's default and comment because
+        // either can carry a secret; the name and type are what `describe_schema`
+        // returns regardless, so they stay in the rendering that has to stay useful.
+        let column = ColumnDetail::from(&ColumnDescription {
+            name: "password".to_owned(),
+            database_type: "TEXT".to_owned(),
+            nullable: true,
+            default: Some("hunter2".to_owned()),
+            comment: Some("the seeded secret".to_owned()),
+        });
+        let rendered = format!("{column:?}");
+        assert!(!rendered.contains("hunter2"), "{rendered}");
+        assert!(!rendered.contains("the seeded secret"), "{rendered}");
+        assert!(rendered.contains("password"), "{rendered}");
+        assert!(rendered.contains("TEXT"), "{rendered}");
+        assert!(
+            rendered.contains("default: Some(<redacted 7 bytes>)"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("comment: Some(<redacted 17 bytes>)"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn column_detail_debug_distinguishes_an_absent_value_from_an_empty_one() {
+        // `None` and `Some("")` would render identically under a rendering that only
+        // said `<redacted>`, and "this column has no comment" is shape, not content.
+        let absent = ColumnDetail::from(&ColumnDescription {
+            name: "id".to_owned(),
+            database_type: "BIGINT".to_owned(),
+            nullable: false,
+            default: None,
+            comment: None,
+        });
+        let rendered = format!("{absent:?}");
+        assert!(rendered.contains("default: None"), "{rendered}");
+        assert!(rendered.contains("comment: None"), "{rendered}");
     }
 
     #[test]

@@ -76,9 +76,10 @@ async fn run_serve(config: &Path, transport: Transport) -> Result<ExitCode> {
     let resolved = warden_config::load_from_path(config)
         .with_context(|| format!("configuration {} could not be used", config.display()))?;
 
-    // Before anything opens a socket, and on stderr: the same sentence `warden check`
-    // prints (`docs/mcp.md` section 7).
-    for warning in check::stdio_exposure_warnings(&resolved) {
+    // Before anything opens a socket, and on stderr: the same sentences `warden check`
+    // prints, from the same function, so neither command can warn about less than the
+    // other (`docs/mcp.md` section 7; `docs/operations.md` section 3.1).
+    for warning in check::startup_warnings(&resolved) {
         tracing::warn!(target: "warden.startup", "{warning}");
     }
 

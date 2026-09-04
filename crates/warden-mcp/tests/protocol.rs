@@ -358,6 +358,31 @@ fn call(name: &str, arguments: Value) -> Value {
     })
 }
 
+/// The same call, carrying the MCP 2026-07-28 inline lifecycle's own `_meta`.
+///
+/// The two keys are `rmcp::model::RequestMetaObject::DRAFT_REQUIRED_KEYS`
+/// (`io.modelcontextprotocol/protocolVersion` and
+/// `io.modelcontextprotocol/clientCapabilities`), and they live inside `params` because
+/// that is where rmcp's `Request` deserializer reads `_meta` from. Sent as a session's
+/// **first** message, this is the lifecycle where no `initialize` ever arrives, so
+/// `WardenServer::initialize` never runs and ADR-0041's guarantee rests entirely on
+/// rmcp consulting `supported_protocol_versions()` per request.
+fn inline_call(name: &str, arguments: Value, version: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": next_id(),
+        "method": "tools/call",
+        "params": {
+            "name": name,
+            "arguments": arguments,
+            "_meta": {
+                "io.modelcontextprotocol/protocolVersion": version,
+                "io.modelcontextprotocol/clientCapabilities": {}
+            }
+        }
+    })
+}
+
 /// A session touching every response shape this file produces: every tool, a
 /// successful `query`, a denied one, and — the one that actually gives the leak scan
 /// something to catch — a `query` whose adapter fails with a driver-shaped error whose
@@ -546,6 +571,57 @@ async fn an_unimplemented_version_is_refused_with_the_supported_list() {
     assert_eq!(
         response["error"]["data"]["supported"],
         json!(["2025-11-25", "2026-07-28"])
+    );
+}
+
+#[tokio::test]
+async fn a_session_that_never_initializes_still_serves_a_supported_version() {
+    // ADR-0041's second entry. `initialization_reports_tools_and_echoes_the_requested
+    // _version` covers the `initialize` path; this is the other lifecycle the
+    // 2026-07-28 protocol defines, where the first message is a plain request carrying
+    // its own `_meta` and `WardenServer::initialize` is never called at all. The
+    // control here is not Warden's own code but rmcp's default
+    // `ServerHandler::handle_request`, which consults `supported_protocol_versions()`
+    // per request — so this test is what tells us if an SDK upgrade drops it.
+    let response = &exchange(&[inline_call(
+        "query",
+        json!({ "connection": CONNECTION, "sql": "SELECT id FROM orders" }),
+        LATEST,
+    )])
+    .await[0];
+    assert!(response["error"].is_null(), "{response}");
+    assert_eq!(response["result"]["isError"], json!(false), "{response}");
+    // The call really ran, rather than being answered by some earlier gate: the row the
+    // fake executor returns is in `structuredContent` (ADR-0040).
+    assert_eq!(
+        response["result"]["structuredContent"]["rows"][0][0],
+        json!(LEAKING_CELL_VALUE),
+        "{response}"
+    );
+}
+
+#[tokio::test]
+async fn an_unimplemented_version_declared_inline_is_refused_before_any_tool_runs() {
+    // The same refusal `an_unimplemented_version_is_refused_with_the_supported_list`
+    // measures at `initialize`, on the path where `initialize` never happens. Without
+    // this, ADR-0041's guarantee on the inline lifecycle is untested and a client could
+    // reach a tool while declaring a version Warden does not speak.
+    let response = &exchange(&[inline_call(
+        "query",
+        json!({ "connection": CONNECTION, "sql": "SELECT id FROM orders" }),
+        "2024-11-05",
+    )])
+    .await[0];
+    assert!(response["result"].is_null(), "{response}");
+    assert_eq!(
+        response["error"]["code"],
+        json!(rmcp::model::ErrorCode::UNSUPPORTED_PROTOCOL_VERSION.0),
+        "{response}"
+    );
+    assert_eq!(
+        response["error"]["data"]["supported"],
+        json!(["2025-11-25", "2026-07-28"]),
+        "{response}"
     );
 }
 
