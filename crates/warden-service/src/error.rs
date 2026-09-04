@@ -107,6 +107,13 @@ pub enum SchemaServiceError {
     /// honest.
     #[error("this connection does not support schema search")]
     SearchUnsupported,
+    /// The audit attempt could not be recorded, so the read did not happen (ADR-0022).
+    #[error("the audit attempt could not be recorded")]
+    Audit {
+        /// The sink's failure. Its `Display` prints no detail field.
+        #[from]
+        source: AuditError,
+    },
 }
 
 impl PublicError for SchemaServiceError {
@@ -115,6 +122,7 @@ impl PublicError for SchemaServiceError {
             Self::Connection(error) => error.public_code(),
             Self::Schema(error) => error.public_code(),
             Self::SearchUnsupported => PublicErrorCode::SchemaLookupError,
+            Self::Audit { source } => source.public_code(),
         }
     }
 }
@@ -341,6 +349,14 @@ mod tests {
                 SchemaServiceError::SearchUnsupported,
                 PublicErrorCode::SchemaLookupError,
             ),
+            (
+                AuditError::Unavailable {
+                    detail: "audit.internal".to_owned(),
+                }
+                .into(),
+                PublicErrorCode::InternalError,
+            ),
+            (AuditError::Timeout.into(), PublicErrorCode::InternalError),
         ];
         for (error, expected) in cases {
             assert_eq!(error.public_code(), expected, "{error}");
@@ -384,6 +400,13 @@ mod tests {
             ),
             (
                 ExplainServiceError::from(AuditError::Unavailable {
+                    detail: "audit.internal".to_owned(),
+                })
+                .to_string(),
+                "audit.internal",
+            ),
+            (
+                SchemaServiceError::from(AuditError::Unavailable {
                     detail: "audit.internal".to_owned(),
                 })
                 .to_string(),

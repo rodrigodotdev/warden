@@ -243,9 +243,11 @@ attempt.
 
 ### What Warden does not claim
 
-- **The audit trail does not cover every tool call.** `query` and `explain` record an
-  attempt and its outcome. Schema reads and `list_connections` do not currently leave an
-  audit record. See [`docs/open-questions.md`](docs/open-questions.md), item 21.
+- **The audit trail does not cover every tool call.** `query`, `explain`,
+  `search_schema`, and `describe_schema` each record an attempt and its outcome.
+  `list_connections` does not: it reads an in-memory map, reaches no database, and
+  returns configuration metadata the agent must already have to call anything else
+  (ADR-0042).
 - **Warden is not the final write boundary.** The dedicated role's database privileges
   are. SQL analysis is an additional barrier.
 - **The table allowlist is not a read-scope boundary.** An allowed view can read a denied

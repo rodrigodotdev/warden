@@ -1,20 +1,23 @@
 //! Bounded schema discovery.
 //!
-//! Two things this path deliberately does **not** do:
+//! One thing this path deliberately does **not** do: **it takes no `QueryPermit`.** A
+//! catalog read runs on `control_pool` with static adapter-owned SQL, not on the agent
+//! path, so it is not what SPEC section 6, invariant 17 bounds — and reserving agent
+//! slots for it is exactly the coupling ADR-0025's second pool exists to avoid.
 //!
-//! * **It takes no `QueryPermit`.** A catalog read runs on `control_pool` with static
-//!   adapter-owned SQL, not on the agent path, so it is not what SPEC section 6,
-//!   invariant 17 bounds — and reserving agent slots for it is exactly the coupling
-//!   ADR-0025's second pool exists to avoid.
-//! * **It records no audit attempt.** `AuditAttempt` is statement-shaped: it carries a
-//!   `StatementKind`, a fingerprint, and denial reasons, and a catalog read has none of
-//!   the three. SPEC section 6, invariant 24 binds query attempts; filling those fields
-//!   with invented values would break `docs/architecture.md` section 11. Auditing
-//!   schema reads needs its own event shape and belongs to Milestone 13
-//!   (`docs/open-questions.md`).
+//! It does record an attempt and an outcome, the same two-phase shape `query.rs` and
+//! `explain.rs` use (ADR-0022), but not as a statement: `search` and `describe` each
+//! build their attempt from `StatementFacts::default()`, so the record carries no
+//! `StatementKind` and no fingerprint, and an attempt that cannot be written refuses
+//! the read before it reaches the inspector. The attempt carries no denial reasons
+//! either — object rules are applied inside the adapter, not evaluated here, so a
+//! refusal is only knowable after dispatch and the outcome reports it instead
+//! (ADR-0036). `list_connections` stays outside this module and outside auditing
+//! entirely: it reads an in-memory map, reaches no database, and returns configuration
+//! metadata the agent must already have to call anything else (ADR-0042).
 //!
-//! What it does do is hand the adapter the request's object rules as a parameter, so a
-//! denied relation is filtered at the source rather than after the response was built
+//! What else it does is hand the adapter the request's object rules as a parameter, so
+//! a denied relation is filtered at the source rather than after the response was built
 //! (ADR-0036), and redact the description before it returns, because column defaults
 //! and comments can carry secrets (`docs/security.md` section 8).
 
@@ -24,12 +27,17 @@ use std::sync::Arc;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use warden_core::context::RequestContext;
+use warden_core::error::PublicError;
 use warden_core::schema::{
     SchemaDescribeRequest, SchemaDescription, SchemaSearchRequest, SchemaSearchResult,
 };
 use warden_policy::{ObjectFilter, PolicyContext, PolicyEngine};
-use warden_ports::ConnectionRegistry;
+use warden_ports::{
+    AuditAttempt, AuditOperation, AuditOutcome, AuditOutcomeEvent, AuditSink, ConnectionRegistry,
+    SchemaError,
+};
 
+use crate::audit::{self, StatementFacts};
 use crate::error::SchemaServiceError;
 use crate::limits::RequestBudget;
 use crate::redaction::Redactor;
@@ -38,6 +46,7 @@ use crate::redaction::Redactor;
 pub struct SchemaService {
     registry: Arc<dyn ConnectionRegistry>,
     engine: Arc<PolicyEngine>,
+    audit: Arc<dyn AuditSink>,
     redactor: Arc<Redactor>,
     shutdown: CancellationToken,
 }
@@ -61,12 +70,14 @@ impl SchemaService {
     pub fn new(
         registry: Arc<dyn ConnectionRegistry>,
         engine: Arc<PolicyEngine>,
+        audit: Arc<dyn AuditSink>,
         redactor: Arc<Redactor>,
         shutdown: CancellationToken,
     ) -> Self {
         Self {
             registry,
             engine,
+            audit,
             redactor,
             shutdown,
         }
@@ -80,6 +91,9 @@ impl SchemaService {
     /// - [`SchemaServiceError::SearchUnsupported`] if the connection's capabilities
     ///   do not advertise schema search (ADR-0041: Warden advertises only what it
     ///   implements).
+    /// - [`SchemaServiceError::Audit`] if the attempt record could not be written.
+    ///   This refuses the read: an unauditable catalog read does not happen, the same
+    ///   direction ADR-0022 chose for a statement.
     /// - [`SchemaServiceError::Schema`] if the inspector failed or the deadline
     ///   elapsed.
     ///
@@ -95,24 +109,42 @@ impl SchemaService {
         if !runtime.capabilities().schema_search {
             return Err(SchemaServiceError::SearchUnsupported);
         }
+        let attempt = audit::attempt(
+            context,
+            runtime.metadata(),
+            AuditOperation::SearchSchema,
+            // A catalog read submits no statement. Object rules are applied inside
+            // the adapter (ADR-0036), so the denials this record could carry are
+            // not knowable before dispatch; the outcome reports the refusal.
+            StatementFacts::default(),
+            Vec::new(),
+        );
+        audit::record_attempt(self.audit.as_ref(), &attempt).await?;
+
+        let started = Instant::now();
         let filter = ObjectFilter::new(
             self.engine.as_ref(),
             PolicyContext::new(context, runtime.metadata()),
         );
-        let deadline = RequestBudget::new(runtime.limits()).deadline(Instant::now());
+        let deadline = RequestBudget::new(runtime.limits()).deadline(started);
         let found = runtime
             .inspector()
             .search_schema(&request, filter, deadline, self.shutdown.child_token())
-            .await?;
-        Ok(found)
+            .await;
+        self.complete(&attempt, started, &found).await;
+        Ok(found?)
     }
 
     /// Describes relations and redacts sensitive catalog text before returning it.
     ///
     /// # Errors
     ///
-    /// [`SchemaServiceError::Connection`] if the name resolves to no connection, or
-    /// [`SchemaServiceError::Schema`] if the inspector failed or the deadline elapsed.
+    /// - [`SchemaServiceError::Connection`] if the name resolves to no connection.
+    /// - [`SchemaServiceError::Audit`] if the attempt record could not be written.
+    ///   This refuses the read: an unauditable catalog read does not happen, the same
+    ///   direction ADR-0022 chose for a statement.
+    /// - [`SchemaServiceError::Schema`] if the inspector failed or the deadline
+    ///   elapsed.
     ///
     /// Unlike [`SchemaService::search`], a denied relation **is** reported here: the
     /// agent named the object, so refusing it is an answer rather than a silence
@@ -123,17 +155,70 @@ impl SchemaService {
         request: SchemaDescribeRequest,
     ) -> Result<SchemaDescription, SchemaServiceError> {
         let runtime = self.registry.get(request.connection())?;
+        let attempt = audit::attempt(
+            context,
+            runtime.metadata(),
+            AuditOperation::DescribeSchema,
+            // A catalog read submits no statement. Object rules are applied inside
+            // the adapter (ADR-0036), so the denials this record could carry are
+            // not knowable before dispatch; the outcome reports the refusal.
+            StatementFacts::default(),
+            Vec::new(),
+        );
+        audit::record_attempt(self.audit.as_ref(), &attempt).await?;
+
+        let started = Instant::now();
         let filter = ObjectFilter::new(
             self.engine.as_ref(),
             PolicyContext::new(context, runtime.metadata()),
         );
-        let deadline = RequestBudget::new(runtime.limits()).deadline(Instant::now());
-        let mut described = runtime
+        let deadline = RequestBudget::new(runtime.limits()).deadline(started);
+        let found = runtime
             .inspector()
             .describe_schema(&request, filter, deadline, self.shutdown.child_token())
-            .await?;
+            .await;
+        self.complete(&attempt, started, &found).await;
+        let mut described = found?;
         self.redactor.redact_description(&mut described);
         Ok(described)
+    }
+
+    /// Records the terminal outcome of a catalog read.
+    ///
+    /// `rows_returned` and `result_bytes` stay absent: a matched relation is not a
+    /// row, and reporting a catalog count under a result set's field name would
+    /// make the record say something it does not mean.
+    async fn complete<T>(
+        &self,
+        attempt: &AuditAttempt,
+        started: Instant,
+        result: &Result<T, SchemaError>,
+    ) {
+        let (outcome, error_code) = match result {
+            Ok(_) => (AuditOutcome::Succeeded, None),
+            Err(error) => (
+                match error {
+                    SchemaError::Rejected(_) => AuditOutcome::Denied,
+                    SchemaError::Timeout => AuditOutcome::TimedOut,
+                    SchemaError::Cancelled => AuditOutcome::Cancelled,
+                    SchemaError::Database { .. } => AuditOutcome::Failed,
+                },
+                Some(error.public_code()),
+            ),
+        };
+        audit::record_outcome(
+            self.audit.as_ref(),
+            AuditOutcomeEvent {
+                attempt_id: attempt.id,
+                outcome,
+                duration: Some(started.elapsed()),
+                queue_wait: None,
+                rows_returned: None,
+                result_bytes: None,
+                error_code,
+            },
+        )
+        .await;
     }
 }
 
@@ -156,7 +241,9 @@ mod tests {
     use warden_core::limits::ExecutionLimits;
     use warden_core::schema::{MatchReason, SchemaMatch, TableKind};
     use warden_policy::{ObjectRules, PolicyEngine, PolicySettings};
-    use warden_ports::{ConnectionRegistry, QueryPermit, SchemaError, SchemaInspector};
+    use warden_ports::{
+        AuditOperation, AuditOutcome, ConnectionRegistry, QueryPermit, SchemaError, SchemaInspector,
+    };
 
     use super::*;
     use crate::StaticConnectionRegistry;
@@ -186,7 +273,13 @@ mod tests {
         let runtime = Arc::new(testing::runtime_from(parts));
         let registry: Arc<dyn ConnectionRegistry> =
             Arc::new(StaticConnectionRegistry::new(vec![runtime]).unwrap());
-        SchemaService::new(registry, engine, redactor, shutdown)
+        SchemaService::new(
+            registry,
+            engine,
+            Arc::new(testing::FakeAuditSink::new()),
+            redactor,
+            shutdown,
+        )
     }
 
     fn service_with_shutdown(
@@ -218,6 +311,7 @@ mod tests {
         let service = SchemaService::new(
             registry,
             testing::engine(),
+            Arc::new(testing::FakeAuditSink::new()),
             testing::redactor(&[]),
             CancellationToken::new(),
         );
@@ -439,6 +533,7 @@ mod tests {
         let service = SchemaService::new(
             registry,
             testing::engine(),
+            Arc::new(testing::FakeAuditSink::new()),
             testing::redactor(&[]),
             CancellationToken::new(),
         );
@@ -617,6 +712,73 @@ mod tests {
             (0, 1)
         );
         drop(held);
+    }
+
+    #[tokio::test]
+    async fn a_catalog_read_is_audited_as_an_attempt_and_an_outcome() {
+        let sink = Arc::new(testing::FakeAuditSink::new());
+        let service = testing::schema_service(testing::ServiceFakes {
+            audit: sink.clone(),
+            ..testing::ServiceFakes::default()
+        });
+        service
+            .search(&testing::request_context(), testing::search_request())
+            .await
+            .unwrap();
+        let attempts = sink.attempts();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].operation, AuditOperation::SearchSchema);
+        // A catalog read submits no statement, so the record claims none.
+        assert!(attempts[0].statement_kind.is_none());
+        assert!(attempts[0].fingerprint.is_none());
+        let outcomes = sink.outcomes();
+        assert_eq!(outcomes[0].attempt_id, attempts[0].id);
+        assert_eq!(outcomes[0].outcome, AuditOutcome::Succeeded);
+        // Matched relations are not rows: the fields that describe a result set stay
+        // absent rather than reporting a catalog count under a statement's name.
+        assert_eq!(outcomes[0].rows_returned, None);
+        assert_eq!(outcomes[0].result_bytes, None);
+    }
+
+    #[tokio::test]
+    async fn a_refused_describe_leaves_a_denied_outcome_behind() {
+        let sink = Arc::new(testing::FakeAuditSink::new());
+        let service = testing::schema_service(testing::ServiceFakes {
+            audit: sink.clone(),
+            // `FakeInspector::rejecting()` already answers with
+            // `SchemaError::Rejected`, which is what an object rule produces inside
+            // the adapter (ADR-0036).
+            inspector: Arc::new(testing::FakeInspector::rejecting()),
+            ..testing::ServiceFakes::default()
+        });
+        let error = service
+            .describe(&testing::request_context(), testing::describe_request())
+            .await
+            .unwrap_err();
+        assert_eq!(error.public_code(), PublicErrorCode::QueryRejected);
+        assert_eq!(sink.outcomes()[0].outcome, AuditOutcome::Denied);
+        assert_eq!(
+            sink.outcomes()[0].error_code,
+            Some(PublicErrorCode::QueryRejected)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unauditable_catalog_read_does_not_reach_the_inspector() {
+        // Fail closed, the same direction ADR-0022 chose for a statement: a read that
+        // cannot be recorded does not happen.
+        let inspector = Arc::new(testing::FakeInspector::new());
+        let service = testing::schema_service(testing::ServiceFakes {
+            audit: Arc::new(testing::FakeAuditSink::broken_attempts()),
+            inspector: inspector.clone(),
+            ..testing::ServiceFakes::default()
+        });
+        let error = service
+            .search(&testing::request_context(), testing::search_request())
+            .await
+            .unwrap_err();
+        assert_eq!(error.public_code(), PublicErrorCode::InternalError);
+        assert_eq!(inspector.search_calls(), 0);
     }
 
     #[test]

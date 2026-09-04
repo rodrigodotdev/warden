@@ -171,16 +171,18 @@ otherwise, none blocks M0–M5.
     exchange for a number the full document already contains. Decide it against
     measured demand.
 
-21. **Should schema reads produce an audit event?** `AuditAttempt` is
-    statement-shaped: it requires a `StatementKind`, fingerprint, and denial reasons.
-    Milestone 11 deliberately records no schema event rather than invent a statement
-    kind or fingerprint that does not describe the catalog read. A denied
-    `describe_schema` is therefore unaudited today. Milestone 12 changed nothing here:
-    it exposed `search_schema` and `describe_schema` over MCP and wired the Milestone 12
-    tracing sink beneath them, but `SchemaService` still records no attempt and no
-    outcome, so putting the tools in an agent's hands widened who can reach an unaudited
-    catalog read without changing the question. Milestone 13 owns the event-shape and
-    policy decision.
+21. **Resolved in Milestone 13 by ADR-0042 — should schema reads produce an audit
+    event?** `AuditAttempt` was statement-shaped: it required a `StatementKind`,
+    fingerprint, and denial reasons. Milestone 11 deliberately recorded no schema event
+    rather than invent a statement kind or fingerprint that does not describe the
+    catalog read. A denied `describe_schema` was therefore unaudited. Milestone 12
+    changed nothing here: it exposed `search_schema` and `describe_schema` over MCP and
+    wired the Milestone 12 tracing sink beneath them, but `SchemaService` still recorded
+    no attempt and no outcome, so putting the tools in an agent's hands widened who could
+    reach an unaudited catalog read without changing the question. ADR-0042 gave the
+    attempt an `AuditOperation` and made `StatementKind` optional, so `search_schema` and
+    `describe_schema` now record an attempt before dispatch and an outcome after it, the
+    same as `query` and `explain`.
 
 22. **Should each connection have its own policy engine?** ADR-0039 made a policy
     disagreement between two referenced profiles a startup failure, because

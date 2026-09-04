@@ -1007,7 +1007,13 @@ pub(crate) fn schema_service(fakes: ServiceFakes) -> SchemaService {
     let runtime = Arc::new(runtime_from(parts));
     let registry: Arc<dyn ConnectionRegistry> =
         Arc::new(StaticConnectionRegistry::new(vec![runtime]).unwrap());
-    SchemaService::new(registry, engine(), fakes.redactor, fakes.shutdown)
+    SchemaService::new(
+        registry,
+        engine(),
+        fakes.audit,
+        fakes.redactor,
+        fakes.shutdown,
+    )
 }
 
 /// Builds a query service whose only connection has no free query slot.

@@ -140,6 +140,7 @@ impl Services {
         let schema = SchemaService::new(
             Arc::clone(&parts.registry),
             Arc::clone(&parts.engine),
+            Arc::clone(&parts.audit),
             redactor,
             parts.shutdown,
         );

@@ -532,6 +532,11 @@ This guarantees a trace for every attempt even if the process dies during execut
 and prevents an unavailable sink from creating an unaudited operation window. A
 single-event model loses the attempt in exactly the most important case.
 
+The fail-closed rule is not limited to a statement: `search_schema` and
+`describe_schema` record an attempt before dispatch exactly as `query` and `explain`
+do, and a catalog read whose attempt cannot be written does not reach the inspector
+either (ADR-0042).
+
 ### 11.2 Events
 
 ```rust
