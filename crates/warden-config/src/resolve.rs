@@ -2,8 +2,8 @@
 //!
 //! [`Config::resolve`] applies every startup rule in `docs/operations.md` section 3.2, in
 //! the order that puts the cheapest and most operator-visible failures first: at least
-//! one connection, no duplicate names, every profile defined, every referenced profile
-//! agreeing about policy (ADR-0039), exactly one DSN source, the DSN itself, its
+//! one connection, a valid audit destination, no duplicate names, every profile defined,
+//! every referenced profile agreeing about policy (ADR-0039), exactly one DSN source, the DSN itself, its
 //! dialect, `search_path`, and finally the limit, pool, and TLS checks `warden-core`
 //! already owns — the same four calls `MySqlConnectionPools::connect` makes, run here so
 //! a bad number fails before any network I/O.
@@ -11,6 +11,8 @@
 //! [`ResolvedConfig`] is what survives: metadata and settings the composition root can
 //! hand to an adapter. `Capabilities` are **not** built here — they describe an
 //! adapter, and this crate names no adapter (`src/startup.rs` supplies them, Task 8).
+
+use std::path::PathBuf;
 
 use warden_core::connection::{ConnectionMetadata, ConnectionName, Environment};
 use warden_core::dialect::Dialect;
@@ -20,7 +22,10 @@ use warden_core::secret::Dsn;
 use warden_core::tls::TlsSettings;
 
 use crate::error::ConfigError;
-use crate::model::{AuditMode, Config, ConnectionEntry, PolicyProfile, RedactionStrategyEntry};
+use crate::model::{
+    AuditDestinationEntry, AuditEntry, AuditMode, Config, ConnectionEntry, PolicyProfile,
+    RedactionStrategyEntry,
+};
 use crate::secrets::{self, SecretSource};
 
 /// One connection, fully resolved: its DSN read and parsed, and every setting
@@ -63,6 +68,24 @@ pub struct ResolvedPolicy {
     pub deny_tables: Vec<String>,
 }
 
+/// Audit settings after the destination and path have been validated together.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedAudit {
+    /// Which safe subset of an attempt record the sink writes.
+    pub mode: AuditMode,
+    /// Where the sink writes each record.
+    pub destination: AuditDestination,
+}
+
+/// A validated audit destination the composition root can open directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuditDestination {
+    /// Write structured audit events through the process's stderr subscriber.
+    Stderr,
+    /// Append JSON Lines records to this path.
+    File(PathBuf),
+}
+
 /// What survives `docs/operations.md` section 3.2's startup validation: everything the
 /// composition root needs, and nothing it has to re-derive.
 #[derive(Debug)]
@@ -77,8 +100,8 @@ pub struct ResolvedConfig {
     pub redaction_columns: Vec<String>,
     /// What a redaction match does.
     pub redaction_strategy: RedactionStrategyEntry,
-    /// What the audit sink records.
-    pub audit: AuditMode,
+    /// What the audit sink records and where it writes those records.
+    pub audit: ResolvedAudit,
 }
 
 impl ResolvedConfig {
@@ -103,6 +126,7 @@ impl Config {
         if self.connections.is_empty() {
             return Err(ConfigError::NoConnections);
         }
+        let audit = resolve_audit(self.audit)?;
 
         let mut seen_names: Vec<ConnectionName> = Vec::with_capacity(self.connections.len());
         for connection in &self.connections {
@@ -152,15 +176,29 @@ impl Config {
             allow_tables: representative.allow_tables.clone(),
             deny_tables: representative.deny_tables.clone(),
         };
-
         Ok(ResolvedConfig {
             connections,
             policy,
             redaction_columns: self.redaction.columns,
             redaction_strategy: self.redaction.strategy,
-            audit: self.audit.mode,
+            audit,
         })
     }
+}
+
+/// Validates the two audit destination keys as one setting.
+fn resolve_audit(entry: AuditEntry) -> Result<ResolvedAudit, ConfigError> {
+    let destination = match (entry.destination, entry.path) {
+        (AuditDestinationEntry::Stderr, None) => AuditDestination::Stderr,
+        (AuditDestinationEntry::File, Some(path)) => AuditDestination::File(path),
+        (AuditDestinationEntry::File, None) => return Err(ConfigError::AuditPathMissing),
+        (AuditDestinationEntry::Stderr, Some(_)) => return Err(ConfigError::AuditPathUnused),
+    };
+
+    Ok(ResolvedAudit {
+        mode: entry.mode,
+        destination,
+    })
 }
 
 /// Checks the five fields `Services`' one `PolicyEngine` cannot hold two answers for.
@@ -343,6 +381,22 @@ mod tests {
             .replace("{MYSQL_DSN}", &mysql_path.display().to_string())
             .replace("{POSTGRES_DSN}", &postgres_path.display().to_string());
         Config::from_toml_str(&text).unwrap()
+    }
+
+    /// Resolves an audit-focused literal with one otherwise valid connection.
+    fn load(template: &str) -> Result<ResolvedConfig, ConfigError> {
+        let complete = format!(
+            "{template}\n\
+             [[connections]]\n\
+             name = \"db\"\n\
+             dialect = \"mysql\"\n\
+             environment = \"development\"\n\
+             database = \"app\"\n\
+             dsn_file = \"{{MYSQL_DSN}}\"\n\
+             policy = \"p\"\n\
+             [policies.p]\n"
+        );
+        config_with(&complete).resolve()
     }
 
     const PROFILES_AGREE: &str = r#"
@@ -595,6 +649,38 @@ policy = "p"
         assert_eq!(resolved.connections[1].search_path, ["app", "public"]);
         assert!(!resolved.policy.allow_locking_reads);
         assert!(resolved.has_production_connection());
+    }
+
+    #[test]
+    fn a_file_destination_needs_a_path_and_a_stderr_one_refuses_it() {
+        let missing = load(
+            r#"
+                version = 1
+                [audit]
+                destination = "file"
+            "#,
+        );
+        assert!(matches!(
+            missing.unwrap_err(),
+            ConfigError::AuditPathMissing
+        ));
+
+        let extra = load(
+            r#"
+                version = 1
+                [audit]
+                destination = "stderr"
+                path = "/var/log/warden/audit.jsonl"
+            "#,
+        );
+        assert!(matches!(extra.unwrap_err(), ConfigError::AuditPathUnused));
+    }
+
+    #[test]
+    fn the_default_destination_is_stderr_in_fingerprint_mode() {
+        let resolved = load("version = 1").unwrap();
+        assert_eq!(resolved.audit.mode, AuditMode::Fingerprint);
+        assert_eq!(resolved.audit.destination, AuditDestination::Stderr);
     }
 
     #[test]

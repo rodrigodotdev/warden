@@ -1,14 +1,15 @@
 //! `warden check`: everything `warden serve` would do, minus serving.
 //!
-//! `docs/operations.md` section 11 gives this command four jobs — configuration, secret
-//! references, connectivity, and server settings — and one prohibition: it **never
-//! executes arbitrary user SQL**. It therefore takes no [`warden_ports::QueryPermit`]
+//! `docs/operations.md` section 11 gives this command five jobs — configuration, secret
+//! references, the audit destination, connectivity, and server settings — and one
+//! prohibition: it **never executes arbitrary user SQL**. It therefore takes no [`warden_ports::QueryPermit`]
 //! and dispatches no query. The only statements it causes are the two fixed ones each
 //! adapter already owns: the readiness probe `docs/operations.md` section 10.4 requires to
 //! run on `control_pool`, and the session-setting read-back of section 5.1.
 //!
 //! ```text
 //! load and resolve configuration   ← every static rule, from warden-config
+//!     ↓ open audit destination     ← prove the configured volume is writable
 //!     ↓ open every connection      ← the same eager connect `serve` performs
 //!     ↓ health_check               ← control_pool, fixed statement, bounded
 //!     ↓ verify_session_settings    ← detects a proxy that discarded startup options
@@ -59,9 +60,9 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(2 * POOL_ACQUIRE_TIMEOUT.as_
 ///
 /// # Errors
 ///
-/// Returns an operator-facing error when the configuration cannot be used, a connection
-/// cannot be opened, or a probe fails. No message carries a DSN, a password, a host, or a
-/// user.
+/// Returns an operator-facing error when the configuration cannot be used, the audit
+/// destination or a connection cannot be opened, or a probe fails. No message carries a
+/// DSN, a password, a host, or a user.
 pub(crate) async fn run(config: &Path, out: &mut dyn Write) -> Result<bool> {
     let resolved = warden_config::load_from_path(config)
         .with_context(|| format!("configuration {} could not be used", config.display()))?;
@@ -70,6 +71,17 @@ pub(crate) async fn run(config: &Path, out: &mut dyn Write) -> Result<bool> {
     // Collected before `build` consumes the configuration, reported after the probes so
     // the report reads in the order `docs/operations.md` section 11 lists the jobs.
     let warnings = startup_warnings(&resolved);
+
+    match crate::audit::build(&resolved.audit).await {
+        Ok(sink) => {
+            drop(sink);
+            writeln!(out, "ok    audit destination opened")?;
+        }
+        Err(error) => {
+            writeln!(out, "FAIL  {error:#}")?;
+            return Err(error);
+        }
+    }
 
     let deployment = startup::build(resolved, CancellationToken::new()).await?;
     writeln!(

@@ -10,15 +10,6 @@
 //! Unlike Milestone 12's stderr sink, **this one can fail** — a full volume, a
 //! revoked permission, a full quota — which is what turns ADR-0022's fail-closed
 //! attempt from a structural claim into a tested behaviour.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "reachable only from its own tests until Task 6 wires it up from \
-                  configuration"
-    )
-)]
-
 use std::fmt;
 use std::path::PathBuf;
 
@@ -28,6 +19,7 @@ use warden_ports::{AuditAttempt, AuditError, AuditOutcomeEvent, AuditSink, BoxFu
 
 use super::record::{AttemptRecord, OutcomeRecord};
 
+/// Appends the shared audit record shape to a JSON Lines file.
 pub(crate) struct FileAuditSink {
     mode: AuditMode,
     /// The open file, held across write and flush so two concurrent records cannot

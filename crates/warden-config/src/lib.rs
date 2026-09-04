@@ -35,10 +35,12 @@ mod secrets;
 pub use duration::HumanDuration;
 pub use error::ConfigError;
 pub use model::{
-    AuditEntry, AuditMode, Config, ConnectionEntry, PolicyProfile, PoolProfile, RedactionEntry,
-    RedactionStrategyEntry, SUPPORTED_VERSION, TlsEntry,
+    AuditDestinationEntry, AuditEntry, AuditMode, Config, ConnectionEntry, PolicyProfile,
+    PoolProfile, RedactionEntry, RedactionStrategyEntry, SUPPORTED_VERSION, TlsEntry,
 };
-pub use resolve::{ResolvedConfig, ResolvedConnection, ResolvedPolicy};
+pub use resolve::{
+    AuditDestination, ResolvedAudit, ResolvedConfig, ResolvedConnection, ResolvedPolicy,
+};
 pub use secrets::SecretSource;
 
 use std::path::Path;

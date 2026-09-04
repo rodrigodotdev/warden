@@ -161,6 +161,8 @@ fn assert_every_variant_is_covered(error: &ConfigError) {
         | ConfigError::Malformed { .. }
         | ConfigError::UnsupportedVersion { .. }
         | ConfigError::MalformedDuration { .. }
+        | ConfigError::AuditPathMissing
+        | ConfigError::AuditPathUnused
         | ConfigError::NoConnections
         | ConfigError::DuplicateConnection { .. }
         | ConfigError::UnknownProfile { .. }
@@ -195,6 +197,8 @@ fn config_error_display_never_carries_a_secret() {
         ConfigError::MalformedDuration {
             value: "5".to_owned(),
         },
+        ConfigError::AuditPathMissing,
+        ConfigError::AuditPathUnused,
         ConfigError::NoConnections,
         ConfigError::DuplicateConnection { name: name.clone() },
         ConfigError::UnknownProfile {

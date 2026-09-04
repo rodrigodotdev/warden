@@ -221,6 +221,8 @@ columns = ["*.password", "*.password_hash", "*.access_token", "*.refresh_token",
 
 [audit]
 mode = "fingerprint"
+destination = "file"
+path = "/var/log/warden/audit.jsonl"
 ```
 
 This is the file Warden parses. `crates/warden-config/tests/fixtures/example.toml` is a
@@ -242,12 +244,13 @@ reduce attack surface and improve error messages; they are **not** the read-scop
 boundary, which is the role's `SELECT` privilege alone (`docs/security.md` section 5,
 ADR-0023).
 
-**`audit.mode` has no effect in this release.** `src/startup.rs` reads it and discards it,
-because Milestone 12's sink writes one shape of event and cannot fail; Milestone 13's
-persistent sink is what gives the mode meaning. The sink behaves as `fingerprint`
-whatever is written, so setting `none` does **not** reduce what is recorded. That
-direction is the safe one — it over-records rather than under-protects — but an operator
-who sets `none` expecting less should know it is inert until Milestone 13.
+**`audit.mode` controls which safe attempt fields are recorded, and `audit.destination`
+controls where both attempt and outcome records are written.** The destination defaults
+to `stderr`; `file` requires `audit.path`, opens that path for append before any database
+pool, and writes one JSON object per line. A path is refused for the `stderr` destination.
+With a file destination, an unwritable audit volume denies queries whose attempt cannot
+be recorded (ADR-0022, ADR-0043). Rotation must append or use `copytruncate`, rather than
+move the open file: Warden continues writing the inode it already has open.
 
 ### 3.1 Structural rules
 
@@ -281,9 +284,11 @@ files; forcing environment variables pushes operators toward the worse pattern.
 ### 3.2 Startup validation
 
 Fail startup on duplicate connection names, unsupported dialects, missing DSN
-environment variables or files, empty DSNs, invalid durations, zero or invalid hard
-limits, pool maxima below required concurrency, unknown policy profiles, malformed
-schema or table rules, unknown fields, and explicitly prohibited configuration.
+environment variables or files, empty DSNs, a file audit destination without
+`audit.path`, `audit.path` under the stderr destination, invalid durations, zero or
+invalid hard limits, pool maxima below required concurrency, unknown policy profiles,
+malformed schema or table rules, unknown fields, and explicitly prohibited
+configuration.
 
 **A DSN names only the connection target** (ADR-0031). It must carry a supported
 scheme, a TCP host, a user and a database; it may carry a port and a password; and it
@@ -906,8 +911,9 @@ warden help
 parses and exits with the usage code, naming the transport this build does not serve.
 
 `warden check` is everything `warden serve` would do, minus serving. It loads and
-validates the configuration, resolves every secret reference, opens every connection with
-the same eager connect `serve` performs, runs each adapter's fixed readiness probe on
+validates the configuration, resolves every secret reference, opens and drops the
+configured audit destination to prove it is writable, opens every connection with the
+same eager connect `serve` performs, runs each adapter's fixed readiness probe on
 `control_pool` (section 10.4), reads the session settings back on **both** pools to catch
 a pooler or proxy that discarded the connection-time options (section 5.2), and closes
 every pool it opened before it returns. It **never executes arbitrary user SQL**: it takes

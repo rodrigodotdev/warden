@@ -45,6 +45,12 @@ pub enum ConfigError {
         /// The rejected text. A duration is never a secret.
         value: String,
     },
+    /// `audit.destination` selects a file but `audit.path` is absent.
+    #[error("audit.destination selects a file, so audit.path must be set")]
+    AuditPathMissing,
+    /// `audit.path` was set while `audit.destination` selects stderr.
+    #[error("audit.path may only be set when audit.destination selects a file")]
+    AuditPathUnused,
     /// No connection was configured.
     #[error("no connections are configured")]
     NoConnections,

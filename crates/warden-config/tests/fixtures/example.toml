@@ -49,3 +49,5 @@ columns = [
 
 [audit]
 mode = "fingerprint"
+destination = "file"
+path = "/var/log/warden/audit.jsonl"

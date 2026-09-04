@@ -49,7 +49,7 @@ pub struct Config {
     /// Deterministic column redaction.
     #[serde(default)]
     pub redaction: RedactionEntry,
-    /// What the audit sink records.
+    /// What the audit sink records and where it writes those records.
     #[serde(default)]
     pub audit: AuditEntry,
 }
@@ -308,19 +308,35 @@ pub enum RedactionStrategyEntry {
     Null,
 }
 
-/// What the audit sink records.
+/// What the audit sink records and where it writes those records.
 #[derive(Debug, Clone, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct AuditEntry {
     /// The audit mode.
     #[serde(default)]
     pub mode: AuditMode,
+    /// Where audit records are written.
+    #[serde(default)]
+    pub destination: AuditDestinationEntry,
+    /// The append-only audit file, required only for a file destination.
+    #[serde(default)]
+    pub path: Option<PathBuf>,
+}
+
+/// Where the audit sink writes records, exactly as an operator selects it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditDestinationEntry {
+    /// Write structured audit events through the process's stderr subscriber.
+    #[default]
+    Stderr,
+    /// Append JSON Lines records to `audit.path`.
+    File,
 }
 
 /// What the audit sink records.
 ///
-/// M12 has only a tracing sink (`src/audit.rs`) that writes structured events to stderr;
-/// M13 gives the mode its full meaning against a persistent sink.
+/// Both stderr and file destinations apply this mode to the same record shape.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AuditMode {
@@ -377,6 +393,13 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.to_string().contains("allow_locking_read"), "{error}");
+    }
+
+    #[test]
+    fn a_misspelled_audit_key_fails_startup_rather_than_being_ignored() {
+        // `deny_unknown_fields`: an operator who wrote `destinaton` must be told, not
+        // silently given stderr (`docs/operations.md` section 3.1).
+        assert!(Config::from_toml_str("version = 1\n[audit]\ndestinaton = \"file\"").is_err());
     }
 
     #[test]

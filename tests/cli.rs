@@ -147,6 +147,55 @@ fn check_reports_a_configuration_error_and_exits_non_zero() {
 }
 
 #[test]
+fn check_reports_an_audit_destination_that_cannot_be_opened_and_exits_non_zero() {
+    let path = write_temp_config("");
+    let missing_directory = path.with_file_name(format!(
+        "{}-missing-audit-directory",
+        path.file_name().unwrap().to_string_lossy()
+    ));
+    let audit_path = missing_directory.join("audit.jsonl");
+    let config = format!(
+        r#"version = 1
+
+[[connections]]
+name = "db"
+dialect = "mysql"
+environment = "development"
+database = "app"
+dsn_env = "WARDEN_TEST_DSN"
+policy = "p"
+
+[policies.p]
+
+[audit]
+destination = "file"
+path = "{}"
+"#,
+        audit_path.display()
+    );
+    std::fs::write(&path, config).unwrap();
+
+    let output = Command::new(env!("CARGO_BIN_EXE_warden"))
+        .env_remove("RUST_LOG")
+        .env("WARDEN_TEST_DSN", "mysql://warden_ro:pw@127.0.0.1:1/app")
+        .args(["check", "--config", path.to_str().unwrap()])
+        .output()
+        .expect("failed to execute the warden binary");
+    let _ = std::fs::remove_file(&path);
+
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty(), "stdout: {:?}", output.stdout);
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains(&format!(
+            "FAIL  the audit trail at {} could not be opened",
+            audit_path.display()
+        )),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
 fn an_unknown_subcommand_still_exits_with_the_usage_code() {
     assert_eq!(warden(&["serv"]).status.code(), Some(2));
 }

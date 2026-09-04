@@ -55,7 +55,7 @@ use warden_mysql::{
     MySqlSchemaInspector,
 };
 use warden_policy::{ObjectRules, PolicyEngine, PolicySettings, Relaxations};
-use warden_ports::{AuditSink, ConnectionRegistry, ConnectionRuntime, ConnectionRuntimeParts};
+use warden_ports::{ConnectionRegistry, ConnectionRuntime, ConnectionRuntimeParts};
 use warden_postgres::{
     PostgreSqlAnalyzer, PostgreSqlConnectionConfig, PostgreSqlConnectionPools, PostgreSqlExplainer,
     PostgreSqlQueryExecutor, PostgreSqlSchemaInspector, SearchPath,
@@ -64,8 +64,6 @@ use warden_service::{
     MAX_ADAPTER_CLEANUP, RedactionSettings, RedactionStrategy, ServiceParts, Services,
     StaticConnectionRegistry,
 };
-
-use crate::audit::TracingAuditSink;
 
 /// One running Warden: its services, the pools behind them, and the token that stops both.
 ///
@@ -217,9 +215,9 @@ impl PoolHandle {
 ///
 /// # Errors
 ///
-/// Returns an operator-facing error naming the connection, the registry, the policy
-/// profile, or the redaction rules — whichever refused to be built. No message carries a
-/// DSN. Every connection opened before a later one failed is closed before the error
+/// Returns an operator-facing error naming the audit destination, connection, registry,
+/// policy profile, or redaction rules — whichever refused to be built. No message carries
+/// a DSN. Every connection opened before a later one failed is closed before the error
 /// propagates, so a failed startup leaves no session for a server to time out.
 pub(crate) async fn build(
     config: ResolvedConfig,
@@ -230,14 +228,12 @@ pub(crate) async fn build(
         policy,
         redaction_columns,
         redaction_strategy,
-        // `audit.mode` finally does something (`crate::audit::record`): it selects
-        // which fields the record describes, never whether one is written.
-        audit: audit_mode,
+        audit,
     } = config;
 
     // The sink comes first: `docs/architecture.md` section 12 puts it before any pool, so
     // a connection that fails to open is the first thing an audit-capable process sees.
-    let audit: Arc<dyn AuditSink> = Arc::new(TracingAuditSink::new(audit_mode));
+    let audit = crate::audit::build(&audit).await?;
 
     let mut runtimes = Vec::with_capacity(connections.len());
     let mut pools: Vec<PoolHandle> = Vec::with_capacity(connections.len());
