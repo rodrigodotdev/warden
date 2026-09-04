@@ -4,8 +4,10 @@
 //! its key order, and the names no record may ever carry. `tracing_sink` is the
 //! stderr sink that has existed since Milestone 12, rebuilt on that declaration so
 //! the field list is no longer duplicated between a `tracing` call and a constant
-//! beside it. A second sink joins this module later without touching either.
+//! beside it. `file` is the append-only sink Milestone 13 adds beside it, on the
+//! same declaration.
 
+mod file;
 mod record;
 mod tracing_sink;
 

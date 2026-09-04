@@ -176,12 +176,17 @@ warden-service = { workspace = true }
 # else (AGENTS.md).
 anyhow = { workspace = true }
 # The one runtime (ADR-0003). `signal` is what makes graceful shutdown a real signal
-# handler rather than a comment (`docs/architecture.md` section 13).
+# handler rather than a comment (`docs/architecture.md` section 13). `fs`, `io-util`
+# and `sync` are what `audit::FileAuditSink` (`src/audit/file.rs`) opens, writes, and
+# locks its file with.
 tokio = { workspace = true, features = [
   "rt-multi-thread",
   "macros",
   "signal",
   "time",
+  "fs",
+  "io-util",
+  "sync",
 ] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }

@@ -230,6 +230,19 @@ mod tests {
     }
 
     #[test]
+    fn a_persisted_outcome_carries_exactly_the_documented_keys() {
+        // `AttemptRecord`'s wire key order is pinned above against `ATTEMPT_FIELDS`;
+        // nothing did the same for `OutcomeRecord` until now, so a field renamed or
+        // reordered without updating `OUTCOME_FIELDS` would pass every other test in
+        // this module and still lie about the wire format Task 5's file sink writes.
+        let record = OutcomeRecord::new(&outcome_event(AuditOutcome::Succeeded));
+        let json = serde_json::to_string(&record).unwrap();
+        let RecordKeys(keys) = serde_json::from_str(&json).unwrap();
+        let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+        assert_eq!(keys, OUTCOME_FIELDS);
+    }
+
+    #[test]
     fn no_record_has_a_field_a_statement_or_a_secret_could_occupy() {
         for fields in [ATTEMPT_FIELDS, OUTCOME_FIELDS] {
             for forbidden in FORBIDDEN_FIELDS {
