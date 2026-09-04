@@ -62,6 +62,12 @@ pub fn default_policies(relaxations: Relaxations) -> Vec<Box<dyn Policy>> {
 /// A policy is built only when the corresponding rules exist, so an unrestricted
 /// deployment carries no object policy at all instead of one that permits
 /// everything.
+///
+/// # Errors
+///
+/// [`ObjectRuleError`] for the first entry of `allow_tables` or `deny_tables` that is
+/// not `name` or `schema.name`. Configuration is refused at startup rather than
+/// silently dropping a rule the operator meant to enforce.
 pub fn default_object_policies(
     rules: &ObjectRules,
 ) -> Result<Vec<Box<dyn ObjectAccessPolicy>>, ObjectRuleError> {

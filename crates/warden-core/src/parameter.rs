@@ -61,6 +61,13 @@ impl ParameterValue {
     /// integral range at or above 2^53 is conservative and keeps the promise in
     /// `docs/data-model.md` section 3.1 that Warden never silently wraps or truncates
     /// a value.
+    ///
+    /// # Errors
+    ///
+    /// - [`ParameterError::NotFinite`] for `NaN` or either infinity, none of which
+    ///   JSON can represent.
+    /// - [`ParameterError::InexactInteger`] for an integral value at or beyond
+    ///   2^53, where `f64` can no longer distinguish consecutive integers.
     pub fn float(value: f64) -> Result<Self, ParameterError> {
         if !value.is_finite() {
             return Err(ParameterError::NotFinite);

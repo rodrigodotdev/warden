@@ -94,6 +94,15 @@ impl ConnectionRuntime {
     /// request instead of failing at startup. (`Semaphore::new` also panics above
     /// `Semaphore::MAX_PERMITS`, but that ceiling is far beyond any value validation
     /// needs to guard against.)
+    ///
+    /// # Errors
+    ///
+    /// - [`RuntimeError::Limits`] if the execution limits do not validate.
+    /// - [`RuntimeError::DialectMismatch`] if a wired port speaks a different dialect
+    ///   than the connection's metadata names — a MySQL analyzer on a PostgreSQL
+    ///   connection fails here, at startup, rather than parsing with the wrong grammar.
+    ///
+    /// Both are startup failures with no public code, so neither reaches the agent.
     pub fn new(parts: ConnectionRuntimeParts) -> Result<Self, RuntimeError> {
         parts
             .limits
@@ -145,9 +154,10 @@ impl ConnectionRuntime {
     ///
     /// This is the connection's own configured bound. `AuthorizedQuery::limits()` is
     /// whatever value the caller passed into `PolicyEngine::authorize`, and nothing
-    /// checks the two agree — so Milestone 11 must pass this value into `authorize`
-    /// rather than any other source, or a query could run under a different budget
-    /// than the connection it targets actually has.
+    /// checks the two agree — so this value, and no other source, is what the service
+    /// passes into `authorize` (`warden_service::query` and `warden_service::explain`).
+    /// Any other source would let a query run under a different budget than the
+    /// connection it targets actually has.
     #[must_use]
     pub fn limits(&self) -> ExecutionLimits {
         self.limits
@@ -195,6 +205,13 @@ impl ConnectionRuntime {
     /// queueing: without this bound, callers beyond `max_concurrent_queries` would
     /// wait indefinitely and client-perceived latency would include an unbounded
     /// queue (`docs/data-model.md` section 7).
+    ///
+    /// # Errors
+    ///
+    /// - [`ConnectionError::Busy`] if no slot came free within `max_queue_wait`. This
+    ///   is the `server_busy` the agent sees, and it is a load signal, not a fault.
+    /// - [`ConnectionError::Unavailable`] if the semaphore is closed, which happens
+    ///   only during shutdown.
     pub async fn acquire_query_permit(&self) -> Result<QueryPermit, ConnectionError> {
         let semaphore = Arc::clone(&self.query_semaphore);
         match timeout(self.limits.max_queue_wait, semaphore.acquire_owned()).await {

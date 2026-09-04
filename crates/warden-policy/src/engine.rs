@@ -54,6 +54,12 @@ impl PolicyEngine {
     ///
     /// Object policies may legitimately be empty, which means the deployment
     /// configured no object rules.
+    ///
+    /// # Errors
+    ///
+    /// - [`PolicyEngineError::NoPolicies`] if `policies` is empty.
+    /// - [`PolicyEngineError::TooManyPolicies`] if the two lists together exceed
+    ///   `u16::MAX`, the width `AllowDecision` records the evaluated count in.
     pub fn new(
         policies: Vec<Box<dyn Policy>>,
         object_policies: Vec<Box<dyn ObjectAccessPolicy>>,
@@ -77,6 +83,12 @@ impl PolicyEngine {
     /// that assembled its own list could quietly omit one, so it calls this instead
     /// and `PolicyEngine::new` stays available for tests and for a future profile
     /// that genuinely needs a different set.
+    ///
+    /// # Errors
+    ///
+    /// [`PolicyEngineError::ObjectRule`] if a configured object rule does not parse,
+    /// plus whatever [`PolicyEngine::new`] returns. The default statement list is
+    /// never empty, so `NoPolicies` is unreachable from here.
     pub fn with_defaults(settings: &PolicySettings) -> Result<Self, PolicyEngineError> {
         let policies = crate::policies::default_policies(settings.relaxations);
         let object_policies = crate::policies::default_object_policies(&settings.objects)?;
@@ -111,6 +123,14 @@ impl PolicyEngine {
     /// against" (`crate::policies::analysis_integrity`). A mismatch is appended to
     /// the same aggregate `evaluate` produced rather than returned early, so it
     /// joins other denials instead of pre-empting them (ADR-0012).
+    ///
+    /// # Errors
+    ///
+    /// [`PolicyRejection`] carrying **every** reason the query was refused, not the
+    /// first — a denial is an aggregate so the agent can fix one query rather than
+    /// discover one rule per round trip. A `query` whose analysis targets a different
+    /// connection than `connection` is denied under [`DenyCode::UnknownConstruct`],
+    /// since nothing the policies concluded applies to the wrong connection's rules.
     pub fn authorize(
         &self,
         context: &RequestContext,
@@ -151,6 +171,11 @@ impl PolicyEngine {
     /// This is how `search_schema` and `describe_schema` reach the same rules
     /// `query` does, so a denied table is not merely unreadable but also
     /// undescribable (`docs/security.md` section 5.2).
+    ///
+    /// # Errors
+    ///
+    /// [`PolicyRejection`] carrying every object rule that refused `object`. A
+    /// deployment with no object rules configured refuses nothing here.
     pub fn check_object(
         &self,
         object: &ObjectRef,

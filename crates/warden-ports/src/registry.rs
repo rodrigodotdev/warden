@@ -16,8 +16,10 @@ use crate::runtime::ConnectionRuntime;
 pub trait ConnectionRegistry: Send + Sync {
     /// Looks up one connection.
     ///
-    /// Returns `ConnectionError::NotFound` for an unknown name. The name is
-    /// untrusted input, and the caller maps the failure to `connection_not_found`
+    /// # Errors
+    ///
+    /// [`ConnectionError::NotFound`] for an unknown name. The name is untrusted
+    /// input, and the caller maps the failure to `connection_not_found`
     /// (`docs/security.md` section 10).
     fn get(&self, name: &ConnectionName) -> Result<Arc<ConnectionRuntime>, ConnectionError>;
 

@@ -7,7 +7,7 @@
 //! because Cargo unifies features across a workspace build
 //! (`docs/architecture.md` section 4.3): a feature that exposed these to this
 //! crate's tests would expose them to `warden-mcp` too. `warden-service` writes its
-//! own fakes in Milestone 11 for the same reason.
+//! own fakes for the same reason.
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 // Helpers are shared by tests in several modules. One that the module you are

@@ -47,6 +47,15 @@ pub struct SearchPath(String);
 
 impl SearchPath {
     /// Validates a list of schema names and joins them in order.
+    ///
+    /// # Errors
+    ///
+    /// - [`SearchPathError::TooLong`] if a name exceeds [`MAX_SCHEMA_NAME_LEN`].
+    /// - [`SearchPathError::NotAnIdentifier`] if a name is not an unquoted
+    ///   identifier. The path is interpolated into a startup option, so a name that
+    ///   would need quoting is refused rather than quoted — nothing here builds SQL
+    ///   from a string it had to escape.
+    /// - [`SearchPathError::Empty`] if the list yields no schema.
     pub fn new<I, S>(schemas: I) -> Result<Self, SearchPathError>
     where
         I: IntoIterator<Item = S>,
@@ -154,6 +163,19 @@ pub struct PostgreSqlConnectionPools {
 
 impl PostgreSqlConnectionPools {
     /// Validates the configuration and opens both pools.
+    ///
+    /// Connects eagerly, so a bad DSN or an unreachable database is a startup failure
+    /// rather than the first agent query's error (`docs/architecture.md` section 12).
+    ///
+    /// # Errors
+    ///
+    /// Configuration first, before any socket: [`ConnectError::Limits`],
+    /// [`ConnectError::PoolSettings`], [`ConnectError::Tls`],
+    /// [`ConnectError::DialectMismatch`] if the DSN's scheme names MySQL, and
+    /// [`ConnectError::AmbientConnectionInput`] if a `PG*` variable would still
+    /// influence the connection (ADR-0031). Then [`ConnectError::Driver`] if either
+    /// pool cannot open a connection; its message is held in a field `Display` does
+    /// not print.
     pub async fn connect(config: PostgreSqlConnectionConfig) -> Result<Self, ConnectError> {
         config.limits.validate()?;
         config.agent_pool.validate_concurrency(&config.limits)?;
@@ -208,6 +230,16 @@ impl PostgreSqlConnectionPools {
     }
 
     /// Confirms the database answers, using a fixed adapter query.
+    ///
+    /// Runs on `control_pool`, never on `agent_pool`: readiness must not execute an
+    /// agent query (`docs/operations.md` section 10.4), and keeping it off the agent
+    /// pool is what stops saturated agent traffic from making a healthy connection
+    /// look unhealthy (ADR-0025).
+    ///
+    /// # Errors
+    ///
+    /// [`ConnectError::Timeout`] if the probe does not answer by `deadline`, or
+    /// [`ConnectError::Driver`] if the control pool cannot serve it.
     pub async fn health_check(&self, deadline: Instant) -> Result<(), ConnectError> {
         let probe = sqlx::query_scalar::<_, i32>("SELECT 1").fetch_one(self.control());
         match timeout_at(deadline, probe).await {
@@ -218,6 +250,19 @@ impl PostgreSqlConnectionPools {
     }
 
     /// Confirms every startup setting survived to the server, on both pools.
+    ///
+    /// `docs/operations.md` section 5.2 requires this check because a pooler or proxy
+    /// between Warden and the server can discard startup options, leaving a deployment
+    /// that believes it has a server-side deadline and a fixed `search_path` it does
+    /// not have. This is what `warden check` calls; it is not part of readiness, which
+    /// must stay cheap.
+    ///
+    /// # Errors
+    ///
+    /// [`ConnectError::SessionSettingRejected`] naming the first setting whose value
+    /// at the server differs from what was configured. Otherwise
+    /// [`ConnectError::Timeout`] or [`ConnectError::Driver`] as for
+    /// [`PostgreSqlConnectionPools::health_check`].
     pub async fn verify_session_settings(&self, deadline: Instant) -> Result<(), ConnectError> {
         let expected = options::expected_settings(self.statement_timeout, &self.search_path);
         for pool in [self.agent(), self.control()] {

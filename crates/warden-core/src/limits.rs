@@ -110,6 +110,16 @@ impl Default for ExecutionLimits {
 
 impl ExecutionLimits {
     /// Rejects limits that disable a bound, exceed the ceiling, or contradict.
+    ///
+    /// # Errors
+    ///
+    /// - [`LimitsError::Zero`] if any field is zero. Every field is a bound, and a
+    ///   zero bound disables it rather than tightening it.
+    /// - [`LimitsError::TimeoutAboveCeiling`] if `timeout` exceeds
+    ///   [`MAX_QUERY_TIMEOUT`], or [`LimitsError::AboveCeiling`] if
+    ///   `max_result_bytes` exceeds [`MAX_RESULT_BYTES_CEILING`].
+    /// - [`LimitsError::ValueAboveTotal`] if `max_value_bytes` exceeds
+    ///   `max_result_bytes`, which would let one value defeat the total.
     pub fn validate(&self) -> Result<(), LimitsError> {
         for (field, is_zero) in [
             ("timeout", self.timeout.is_zero()),

@@ -109,6 +109,12 @@ pub struct Redactor {
 
 impl Redactor {
     /// Parses every configured rule, failing on the first malformed one.
+    ///
+    /// # Errors
+    ///
+    /// [`RedactionRuleError::Malformed`] for a rule that is not `table.column` or
+    /// `*.column`, or [`RedactionRuleError::EmptyPart`] if either side is empty. A
+    /// rule the operator meant to enforce is refused at startup rather than skipped.
     pub fn new(settings: &RedactionSettings) -> Result<Self, RedactionRuleError> {
         let rules = settings
             .columns

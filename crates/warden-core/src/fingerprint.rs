@@ -31,6 +31,12 @@ pub struct QueryFingerprint(String);
 
 impl QueryFingerprint {
     /// Builds a `v1` fingerprint from a SHA-256 digest in lowercase hexadecimal.
+    ///
+    /// # Errors
+    ///
+    /// [`FingerprintError::MalformedDigest`] if `digest` is not exactly 64 characters
+    /// drawn from `0-9a-f`. Uppercase hexadecimal is refused rather than lowered, so
+    /// one statement has one spelling.
     pub fn v1(digest: &str) -> Result<Self, FingerprintError> {
         if digest.len() != DIGEST_LEN
             || !digest

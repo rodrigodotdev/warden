@@ -39,6 +39,12 @@ prevails.
 Every rule in this table is deliberately mechanical. If proceeding requires
 disabling one, stop and report it; do not annotate it with `#[allow]`.
 
+**The one standing exception** is `#![allow(clippy::unwrap_used, clippy::expect_used)]`
+at the top of a `#[cfg(test)]` module or a `tests/` file. A test asserts by panicking,
+and the two lints exist to keep panics out of the request path, not out of assertions.
+The allow is module-scoped and never appears on a production item, so a new `unwrap`
+in shipping code still fails the build. No other lint may be allowed anywhere.
+
 ## Code rules
 
 **Modeling**

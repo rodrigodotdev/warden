@@ -127,6 +127,10 @@ missing_debug_implementations = "warn"
 missing_docs = "warn"
 
 [workspace.lints.clippy]
+# A fallible public function documents what makes it fail. The prose usually said so
+# already; this makes the `# Errors` heading the mechanical rule rather than a habit,
+# so rustdoc renders it and CI — which denies warnings — enforces it.
+missing_errors_doc = "warn"
 print_stdout = "deny"
 print_stderr = "allow"
 unwrap_used = "deny"

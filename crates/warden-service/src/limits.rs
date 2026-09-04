@@ -4,10 +4,10 @@
 //! `ExecutionLimits::timeout` bounds the *query*, not the call. Both adapters run
 //! cancellation, `ROLLBACK`, and — on PostgreSQL — `DEALLOCATE ALL` under their own
 //! budgets *after* the query has resolved, so a truncated or failed request can
-//! outlast its deadline (`docs/operations.md` section 5.3, which asks Milestone 11
-//! for exactly this figure). A caller that wants an aggregate request timeout —
-//! Milestone 12's stdio handler, Milestone 14's HTTP transport — needs
-//! [`RequestBudget::total`], never `limits.timeout` alone.
+//! outlast its deadline (`docs/operations.md` section 5.3, which asks this crate for
+//! exactly this figure). A caller that wants an aggregate request timeout — the stdio
+//! handler today, Milestone 14's HTTP transport later — needs [`RequestBudget::total`],
+//! never `limits.timeout` alone.
 
 use std::time::Duration;
 

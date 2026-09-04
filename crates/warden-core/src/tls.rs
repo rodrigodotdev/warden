@@ -142,6 +142,17 @@ impl Default for TlsSettings {
 
 impl TlsSettings {
     /// Rejects a configuration this environment may not use.
+    ///
+    /// # Errors
+    ///
+    /// - [`TlsError::RootCertificateWithoutTls`] if a root certificate is configured
+    ///   alongside [`TlsMode::Disabled`], which reads as TLS but is not.
+    /// - [`TlsError::CleartextOutsideDevelopment`] for [`TlsMode::Disabled`] anywhere
+    ///   but [`Environment::Development`]. Default deny: `Other("canary")` is not
+    ///   development.
+    /// - [`TlsError::CertificateVerificationRequired`] for [`TlsMode::Required`]
+    ///   outside development, which encrypts without authenticating the peer
+    ///   (ADR-0030).
     pub fn validate(&self, environment: &Environment) -> Result<(), TlsError> {
         match self.mode {
             TlsMode::Disabled => {

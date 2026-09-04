@@ -79,6 +79,21 @@ impl QueryService {
     }
 
     /// Executes one validated statement and returns a bounded, redacted result.
+    ///
+    /// # Errors
+    ///
+    /// In pipeline order, which is also the order the audit records them:
+    /// - [`QueryServiceError::Connection`] if the name resolves to no connection, or
+    ///   if no concurrency slot came free within `max_queue_wait`.
+    /// - [`QueryServiceError::Analyze`] if the statement does not parse.
+    /// - [`QueryServiceError::Rejected`] if policy denied it, carrying every reason.
+    /// - [`QueryServiceError::Audit`] if the *attempt* record could not be written.
+    ///   This denies the query: an unauditable execution does not happen (ADR-0022).
+    /// - [`QueryServiceError::Execute`] if the database refused or the deadline
+    ///   elapsed.
+    ///
+    /// A failed *outcome* record is not an error here — execution already happened,
+    /// so it raises an alarm and the result is still returned.
     pub async fn execute(
         &self,
         context: &RequestContext,

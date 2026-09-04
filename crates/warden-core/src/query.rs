@@ -82,6 +82,17 @@ impl QueryRequest {
     /// Limits are passed explicitly rather than read from a default so that no call
     /// site can silently use a looser bound than the operator configured
     /// (SPEC section 4, "explicit paths").
+    ///
+    /// # Errors
+    ///
+    /// - [`QueryRequestError::EmptySql`] if `sql` is empty or only whitespace.
+    /// - [`QueryRequestError::SqlTooLarge`] if `sql` exceeds
+    ///   `limits.max_sql_bytes`.
+    /// - [`QueryRequestError::TooManyParameters`] if `parameters` exceeds
+    ///   `limits.max_parameters`.
+    ///
+    /// No variant quotes the statement or a bound parameter (SPEC section 6,
+    /// invariants 22–23).
     pub fn new(
         connection: ConnectionName,
         sql: String,

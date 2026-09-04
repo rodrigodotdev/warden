@@ -62,6 +62,12 @@ pub async fn serve_stdio(
 /// to every crate in the workspace (`docs/architecture.md` section 4.3) — so the
 /// visibility of this function is what makes the transport testable from outside the
 /// crate, not a new escape hatch.
+///
+/// # Errors
+///
+/// The same two as [`serve_stdio`]: [`StdioError::Start`] if the handshake never
+/// completes on `stream`, and [`StdioError::Shutdown`] if the session task is lost. A
+/// cancelled token is not an error.
 pub async fn serve_duplex<S>(
     server: WardenServer,
     stream: S,

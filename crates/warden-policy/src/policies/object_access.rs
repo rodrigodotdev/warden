@@ -59,6 +59,14 @@ pub struct ObjectRule {
 
 impl ObjectRule {
     /// Parses `name` or `schema.name`.
+    ///
+    /// # Errors
+    ///
+    /// - [`ObjectRuleError::Empty`] if `rule` is empty or only whitespace.
+    /// - [`ObjectRuleError::EmptyPart`] if any dot-separated part is empty, so
+    ///   `.users` and `app.` are refused rather than read as one-part names.
+    /// - [`ObjectRuleError::TooManyParts`] for three or more parts, which are
+    ///   rejected rather than guessed at.
     pub fn parse(rule: &str) -> Result<Self, ObjectRuleError> {
         let trimmed = rule.trim();
         if trimmed.is_empty() {

@@ -193,7 +193,7 @@ pub struct AuditOutcomeEvent {
 /// Where audit records go.
 ///
 /// The two methods differ in consequence, not in shape, and the caller enforces the
-/// difference (Milestone 11): a failed [`AuditSink::record_attempt`] denies the
+/// difference (`warden-service`): a failed [`AuditSink::record_attempt`] denies the
 /// query, and a failed [`AuditSink::record_outcome`] raises an alarm and returns the
 /// result anyway, because execution has already happened and there is nothing left
 /// to prevent (ADR-0022).

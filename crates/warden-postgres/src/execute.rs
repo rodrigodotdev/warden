@@ -102,7 +102,7 @@ impl Drop for RetiringConnection {
 #[derive(Debug)]
 pub struct PostgreSqlQueryExecutor {
     pools: Arc<PostgreSqlConnectionPools>,
-    #[cfg(test)]
+    #[cfg(all(test, feature = "docker"))]
     cleanup_fault: CleanupFault,
 }
 
@@ -112,13 +112,13 @@ impl PostgreSqlQueryExecutor {
     pub fn new(pools: Arc<PostgreSqlConnectionPools>) -> Self {
         Self {
             pools,
-            #[cfg(test)]
+            #[cfg(all(test, feature = "docker"))]
             cleanup_fault: CleanupFault::None,
         }
     }
 
     /// Builds a test-only executor whose cleanup cannot be confirmed.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "docker"))]
     fn with_unconfirmed_cleanup(pools: Arc<PostgreSqlConnectionPools>) -> Self {
         Self {
             pools,
@@ -128,12 +128,16 @@ impl PostgreSqlQueryExecutor {
 }
 
 /// The narrowly scoped fault needed to prove that unknown cleanup retires a session.
-#[cfg(test)]
+///
+/// Gated on `docker` as well as `test`: the only test that constructs
+/// [`CleanupFault::Unconfirmed`] needs a real server, so without the feature this
+/// machinery would be dead code that `-D warnings` rejects.
+#[cfg(all(test, feature = "docker"))]
 #[derive(Debug)]
 enum CleanupFault {
     /// Run the ordinary production cleanup.
     None,
-    /// Make the cleanup status unknown without relying on timing a real server.
+    /// Makes the cleanup status unknown without relying on timing a real server.
     Unconfirmed,
 }
 
@@ -244,7 +248,7 @@ impl PostgreSqlQueryExecutor {
     /// runs only after rollback has restored the session. A false return retires the
     /// physical connection rather than returning unknown state to the pool.
     async fn deallocate_agent_statement(&self, connection: &mut sqlx::PgConnection) -> bool {
-        #[cfg(test)]
+        #[cfg(all(test, feature = "docker"))]
         if matches!(self.cleanup_fault, CleanupFault::Unconfirmed) {
             return false;
         }

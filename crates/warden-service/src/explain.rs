@@ -79,6 +79,19 @@ impl ExplainService {
     }
 
     /// Plans one validated statement and returns a bounded, redacted plan.
+    ///
+    /// # Errors
+    ///
+    /// The same pipeline as [`crate::QueryService::execute`], with
+    /// [`ExplainServiceError::Explain`] in place of the execution variant:
+    /// [`ExplainServiceError::Connection`], [`ExplainServiceError::Analyze`],
+    /// [`ExplainServiceError::Rejected`], then [`ExplainServiceError::Audit`] if the
+    /// attempt record could not be written — which denies the plan, since planning is
+    /// an attempt too.
+    ///
+    /// The statement is planned, never run: `EXPLAIN ANALYZE` is not reachable from
+    /// here (SPEC section 6, invariant 11), and the prefixed statement is reparsed and
+    /// verified before it goes to the database (ADR-0037).
     pub async fn explain(
         &self,
         context: &RequestContext,

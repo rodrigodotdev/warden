@@ -248,8 +248,8 @@ impl From<PlanError> for ExplainError {
 /// Why an audit record could not be written.
 ///
 /// The consequence depends on the phase, not on the variant: a failed attempt denies
-/// the query and a failed outcome raises an alarm (ADR-0022). The service enforces
-/// that in Milestone 11; this type only says that the write did not happen.
+/// the query and a failed outcome raises an alarm (ADR-0022). `warden-service`
+/// enforces that; this type only says that the write did not happen.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum AuditError {
     /// The sink could not accept the record.

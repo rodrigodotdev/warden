@@ -158,6 +158,13 @@ impl ResultSet {
     /// Adapters call this before a result leaves the crate. It is defense in depth,
     /// not a type-level guarantee: the fields are public because they are the tool
     /// response shape.
+    ///
+    /// # Errors
+    ///
+    /// The first violation any row commits: [`NormalizationError::RowWidthMismatch`]
+    /// if a row's width differs from the column count,
+    /// [`NormalizationError::ArrayTooDeep`] if a value nests beyond
+    /// [`MAX_ARRAY_DEPTH`], or whatever else `check_row` enforces per value.
     pub fn validate(&self) -> Result<(), NormalizationError> {
         for (index, row) in self.rows.iter().enumerate() {
             check_row(index, row, &self.columns)?;
@@ -231,6 +238,11 @@ pub enum ResultValue {
 
 impl ResultValue {
     /// Builds an array, rejecting nesting deeper than [`MAX_ARRAY_DEPTH`].
+    ///
+    /// # Errors
+    ///
+    /// [`NormalizationError::ArrayTooDeep`] if any element nests beyond
+    /// [`MAX_ARRAY_DEPTH`].
     pub fn array(values: Vec<ResultValue>) -> Result<Self, NormalizationError> {
         let value = Self::Array(values);
         value.validate_depth()?;
@@ -241,6 +253,11 @@ impl ResultValue {
     ///
     /// The walk uses an explicit stack. A recursive check on a hostile value could
     /// overflow the stack, which is the exact failure this bound exists to prevent.
+    ///
+    /// # Errors
+    ///
+    /// [`NormalizationError::ArrayTooDeep`] on the first array found deeper than
+    /// [`MAX_ARRAY_DEPTH`].
     pub fn validate_depth(&self) -> Result<(), NormalizationError> {
         let mut stack = vec![(self, 1usize)];
         while let Some((value, depth)) = stack.pop() {
@@ -532,6 +549,18 @@ impl ResultBuilder {
     }
 
     /// Adds one row, or reports that a bound stopped the result here.
+    ///
+    /// A row bound is not an error: reaching `max_rows` or `max_result_bytes` returns
+    /// `Ok(RowOutcome::Truncated)`, because a truncated result is a successful answer
+    /// that says so. Only a row that cannot be represented at all fails.
+    ///
+    /// # Errors
+    ///
+    /// - Whatever `check_row` reports — a [`NormalizationError`] for a row whose width
+    ///   does not match the columns, or a value nested beyond [`MAX_ARRAY_DEPTH`].
+    /// - [`ResultBuildError::ValueTooLarge`] if one value's JSON encoding exceeds
+    ///   `max_value_bytes`. This is the one bound that fails rather than truncates: a
+    ///   single oversized value has no smaller honest form.
     pub fn push_row(&mut self, row: Vec<ResultValue>) -> Result<RowOutcome, ResultBuildError> {
         // The `max_rows + 1`-th row is read only to learn that it exists
         // (`docs/operations.md` section 6.5) and is never stored.

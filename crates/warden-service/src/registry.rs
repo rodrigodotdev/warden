@@ -47,6 +47,13 @@ pub struct StaticConnectionRegistry {
 
 impl StaticConnectionRegistry {
     /// Indexes the runtimes by name, rejecting an empty set and any duplicate.
+    ///
+    /// # Errors
+    ///
+    /// [`RegistryError::Empty`] if `runtimes` is empty, or
+    /// [`RegistryError::Duplicate`] on the first repeated name. A duplicate is
+    /// refused rather than resolved last-wins, which would silently route a
+    /// connection's queries to another connection's credentials.
     pub fn new(runtimes: Vec<Arc<ConnectionRuntime>>) -> Result<Self, RegistryError> {
         if runtimes.is_empty() {
             return Err(RegistryError::Empty);

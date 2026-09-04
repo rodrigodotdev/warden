@@ -4,10 +4,12 @@
 //! agent must be able to learn tables, columns, keys, indexes, and types before it
 //! writes a query (`docs/data-model.md` section 9).
 //!
-//! Nothing here can hold connection data. Column defaults and comments remain
-//! unredacted until Milestone 11, but Milestone 9 bounds them before caching and
-//! serialization because database-controlled text cannot be allowed to grow without
-//! limit (`docs/security.md` section 8).
+//! Nothing here can hold connection data. Column defaults and comments are
+//! database-controlled text, so this crate bounds them before caching and
+//! serialization — text that cannot be allowed to grow without limit
+//! (`docs/security.md` section 8). Bounding is not redaction: whether a default or
+//! a comment reaches the agent at all is a configured rule, applied downstream by
+//! `warden_service::redaction::Redactor::redact_description`.
 
 pub mod cache;
 pub mod search;
@@ -197,6 +199,11 @@ pub struct SchemaDescribeRequest {
 
 impl SchemaDescribeRequest {
     /// Validates the table cap from `docs/mcp.md` section 2.
+    ///
+    /// # Errors
+    ///
+    /// [`SchemaRequestError::Empty`] if `tables` is empty, or
+    /// [`SchemaRequestError::TooMany`] if it exceeds [`MAX_DESCRIBE_TABLES`].
     pub fn new(
         connection: ConnectionName,
         tables: Vec<TableSelector>,
@@ -239,6 +246,16 @@ impl SchemaSearchRequest {
     /// Splits free text into terms and bounds both the term count and the result
     /// count, because a broad search must never return the whole catalog
     /// (`docs/mcp.md` section 2).
+    ///
+    /// # Errors
+    ///
+    /// - [`SchemaRequestError::Empty`] if `query` yields no term. A term longer than
+    ///   [`MAX_IDENTIFIER_PART_LEN`] is dropped rather than rejected, so a query made
+    ///   only of overlong words reaches this arm.
+    /// - [`SchemaRequestError::TooMany`] if the terms exceed [`MAX_SEARCH_TERMS`], or
+    ///   if `limit` exceeds [`MAX_SEARCH_RESULTS`].
+    /// - [`SchemaRequestError::Empty`] for a zero `limit`, which would ask for a
+    ///   search that can return nothing.
     pub fn new(
         connection: ConnectionName,
         query: &str,

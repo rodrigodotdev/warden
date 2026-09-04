@@ -119,6 +119,16 @@ impl PoolSettings {
     }
 
     /// Rejects settings that remove a bound or contradict another one.
+    ///
+    /// # Errors
+    ///
+    /// - [`PoolSettingsError::Zero`] if `max_connections` or `acquire_timeout` is
+    ///   zero, or if `idle_timeout` or `max_lifetime` is `Some(0)`. A zero duration
+    ///   is not "no limit" to SQLx; it is a bound nothing can satisfy.
+    /// - [`PoolSettingsError::MinAboveMax`] if `min_connections` exceeds
+    ///   `max_connections`.
+    /// - [`PoolSettingsError::IdleAboveLifetime`] if `idle_timeout` exceeds
+    ///   `max_lifetime`, where the idle sweep could never fire first.
     pub fn validate(&self) -> Result<(), PoolSettingsError> {
         for (field, is_zero) in [
             ("max_connections", self.max_connections == 0),
@@ -155,6 +165,13 @@ impl PoolSettings {
 
     /// Validates the settings and checks that the pool can serve the connection's
     /// concurrency bound. Use this for the agent pool.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`PoolSettings::validate`] returns, plus
+    /// [`PoolSettingsError::BelowConcurrency`] if `max_connections` is smaller than
+    /// `limits.max_concurrent_queries` — a pool that hands out fewer connections than
+    /// the semaphore hands out permits turns a configured bound into queue wait.
     pub fn validate_concurrency(&self, limits: &ExecutionLimits) -> Result<(), PoolSettingsError> {
         self.validate()?;
 

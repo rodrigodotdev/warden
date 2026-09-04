@@ -61,7 +61,7 @@ impl PostgreSqlSchemaInspector {
     }
 
     /// Builds an inspector with an explicit cache for expiry tests.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "docker"))]
     pub(crate) fn with_cache_for_tests(
         pools: Arc<PostgreSqlConnectionPools>,
         connection: ConnectionName,

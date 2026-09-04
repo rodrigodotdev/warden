@@ -68,6 +68,17 @@ impl MySqlConnectionPools {
     /// startup failure rather than the first agent query's error
     /// (`docs/architecture.md` section 12). Warden therefore does not start while the
     /// database is unreachable, which is the intended trade for a security gateway.
+    ///
+    /// # Errors
+    ///
+    /// Configuration is checked before a socket is opened, so the first four are
+    /// decided without touching the network:
+    /// [`ConnectError::Limits`], [`ConnectError::PoolSettings`], [`ConnectError::Tls`]
+    /// and [`ConnectError::DialectMismatch`] if the DSN's scheme names PostgreSQL.
+    /// Then [`ConnectError::Driver`] if either pool cannot open a connection — a
+    /// refused handshake, a missing database, an unknown role. `Driver` keeps the
+    /// driver's message in a field `Display` does not print, so a DSN in a `sqlx`
+    /// message cannot reach a log line.
     pub async fn connect(config: MySqlConnectionConfig) -> Result<Self, ConnectError> {
         config.limits.validate()?;
         config.agent_pool.validate_concurrency(&config.limits)?;
@@ -112,6 +123,11 @@ impl MySqlConnectionPools {
     /// agent query (`docs/operations.md` section 10.4), and routing it through the
     /// control pool is also what keeps saturated agent traffic from making a healthy
     /// connection look unhealthy — the whole argument of ADR-0025.
+    ///
+    /// # Errors
+    ///
+    /// [`ConnectError::Timeout`] if the probe does not answer by `deadline`, or
+    /// [`ConnectError::Driver`] if the control pool cannot serve it.
     pub async fn health_check(&self, deadline: Instant) -> Result<(), ConnectError> {
         let probe = sqlx::query_scalar::<_, i64>("SELECT 1").fetch_one(self.control());
         match timeout_at(deadline, probe).await {
@@ -128,6 +144,13 @@ impl MySqlConnectionPools {
     /// deployment that believes it has a server-side deadline it does not have. This
     /// is what `warden check` calls; it is not part of readiness, which must stay
     /// cheap.
+    ///
+    /// # Errors
+    ///
+    /// [`ConnectError::SessionSettingRejected`] if either pool reports a
+    /// `MAX_EXECUTION_TIME` other than the configured one — the pooler case above.
+    /// Otherwise [`ConnectError::Timeout`] or [`ConnectError::Driver`] as for
+    /// [`MySqlConnectionPools::health_check`].
     pub async fn verify_session_settings(&self, deadline: Instant) -> Result<(), ConnectError> {
         let expected = statement_timeout_millis(self.statement_timeout);
 

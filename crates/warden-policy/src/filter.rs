@@ -38,6 +38,11 @@ impl<'a> ObjectFilter<'a> {
     ///
     /// Used where the agent named the object itself, so that refusing it is an
     /// answer rather than a silence — `describe_schema`.
+    ///
+    /// # Errors
+    ///
+    /// [`PolicyRejection`] carrying every object rule that refused `object`, exactly
+    /// as [`PolicyEngine::check_object`] returns it.
     pub fn check(&self, object: &ObjectRef) -> Result<(), PolicyRejection> {
         self.engine.check_object(object, &self.context)
     }

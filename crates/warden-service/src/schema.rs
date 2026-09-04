@@ -73,6 +73,19 @@ impl SchemaService {
     }
 
     /// Searches relation names through the selected connection's inspector.
+    ///
+    /// # Errors
+    ///
+    /// - [`SchemaServiceError::Connection`] if the name resolves to no connection.
+    /// - [`SchemaServiceError::SearchUnsupported`] if the connection's capabilities
+    ///   do not advertise schema search (ADR-0041: Warden advertises only what it
+    ///   implements).
+    /// - [`SchemaServiceError::Schema`] if the inspector failed or the deadline
+    ///   elapsed.
+    ///
+    /// A denied relation is **not** an error: the agent named no object, so a refusal
+    /// must not become a distinguishable response. Denied relations are dropped from
+    /// the results before the limit applies (ADR-0036).
     pub async fn search(
         &self,
         context: &RequestContext,
@@ -95,6 +108,15 @@ impl SchemaService {
     }
 
     /// Describes relations and redacts sensitive catalog text before returning it.
+    ///
+    /// # Errors
+    ///
+    /// [`SchemaServiceError::Connection`] if the name resolves to no connection, or
+    /// [`SchemaServiceError::Schema`] if the inspector failed or the deadline elapsed.
+    ///
+    /// Unlike [`SchemaService::search`], a denied relation **is** reported here: the
+    /// agent named the object, so refusing it is an answer rather than a silence
+    /// (`docs/security.md` section 5.2).
     pub async fn describe(
         &self,
         context: &RequestContext,

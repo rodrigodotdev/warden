@@ -117,6 +117,10 @@ impl QueryPlan {
     /// The adapter calls this before returning, exactly as `ResultSet::validate`
     /// guards a result set. There is no truncating variant: a partial plan document
     /// is not a smaller plan, it is a wrong one.
+    ///
+    /// # Errors
+    ///
+    /// [`PlanError::TooLarge`] if the serialized plan exceeds [`MAX_PLAN_BYTES`].
     pub fn validate(&self) -> Result<(), PlanError> {
         let actual = self.plan_bytes();
         if actual > MAX_PLAN_BYTES {

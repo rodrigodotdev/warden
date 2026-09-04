@@ -33,6 +33,12 @@ pub trait QueryAnalyzer: Send + Sync {
     /// becomes evidence — an `Unknown` statement kind, a risk flag, an unclassified
     /// function — and `warden-policy` denies it with a code the audit can explain
     /// (ADR-0011). Only a statement that produced no evidence at all fails here.
+    ///
+    /// # Errors
+    ///
+    /// [`AnalyzeError`] when the statement cannot be turned into evidence: it does
+    /// not parse, or it is not exactly one statement. No variant carries the SQL
+    /// (SPEC section 6, invariant 22).
     fn analyze(&self, request: QueryRequest) -> Result<AnalyzedQuery, AnalyzeError>;
 }
 

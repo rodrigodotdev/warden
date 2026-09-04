@@ -274,8 +274,8 @@ fn an_audit_record_cannot_be_serialized() {
 }
 
 /// `ConnectionRuntime` crosses task boundaries as `Arc<ConnectionRuntime>`, and a
-/// `QueryPermit` is held across an await inside a spawned task once Milestone 11
-/// exists. Both hold today because every field happens to be `Send + Sync`, but that
+/// `QueryPermit` is held across an await inside the task `warden-service` spawns per
+/// request. Both hold today because every field happens to be `Send + Sync`, but that
 /// is incidental to the current field set rather than guaranteed by it — a future
 /// `Rc` or `RefCell` field should fail this test, not surface as a hard-to-diagnose
 /// compile error three milestones later.
