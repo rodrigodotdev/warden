@@ -1,31 +1,31 @@
-//! The Milestone 12 audit sink.
+//! The stderr audit sink: Milestone 12's, rebuilt on Milestone 13's record.
 //!
-//! `warden_service::Services` requires an `AuditSink`, and Milestone 13 owns the
-//! persistent one. This writes structured `tracing` events to stderr under the field list
-//! `docs/operations.md` section 10.2 allows, which is enough to make every attempt and
-//! outcome observable in a local session and honest about what it is not: a `tracing` macro
-//! returns unit, so this sink cannot fail, and ADR-0022's fail-closed attempt therefore has
-//! nothing to fail on yet. That is why the definition-of-done box for two-phase auditing
-//! stays unchecked at the end of this milestone.
+//! `warden_service::Services` requires an `AuditSink`, and this is the sink that has
+//! served every deployment since Milestone 12. It no longer declares its own field
+//! list: `ATTEMPT_FIELDS` and `OUTCOME_FIELDS` below are `record::ATTEMPT_FIELDS`
+//! and `record::OUTCOME_FIELDS` with the two keys `record::TRACING_OMITS` names
+//! removed, because the subscriber stamps its own time and the `warden.audit`
+//! target already identifies the stream a `schema` key would repeat.
 //!
-//! It records deny **codes**, not `DenyReason::internal_detail`. The detail exists so an
-//! auditor can see why a rule fired without the agent seeing it
-//! (`docs/security.md` section 6); which of it belongs in a durable record is a decision
-//! Milestone 13's sink makes with its own format, not one a stderr line should make first.
+//! A `tracing` macro returns unit, so this sink still cannot fail, and ADR-0022's
+//! fail-closed attempt therefore still has nothing to fail on. That is why the
+//! definition-of-done box for two-phase auditing stays unchecked until Milestone 13
+//! ships a sink that can.
+//!
+//! It records deny **codes**, not `DenyReason::internal_detail`, for the same reason
+//! `record::AttemptRecord` does (`docs/security.md` section 6): the detail names the
+//! object or function that tripped a rule, and it stays on the auditor's side of
+//! that line. `audit.mode` now has an effect here too, and the same one it has on
+//! the record: `none` drops `statement_kind` and `fingerprint` and keeps everything
+//! else (ADR-0026 — the record itself is invariant 24, so the mode can narrow what
+//! it describes but never switch it off).
 
+use warden_config::AuditMode;
 use warden_ports::{AuditAttempt, AuditError, AuditOutcomeEvent, AuditSink, BoxFuture};
 
-/// The target both events carry, matching `warden-service`'s own audit alarm.
-const AUDIT_TARGET: &str = "warden.audit";
-
-/// Every field [`TracingAuditSink::record_attempt`] emits, in the order it emits them.
-///
-/// `docs/operations.md` section 10.2 forbids `raw_sql`, `raw_parameters`, `password`, and
-/// `dsn`; [`AuditAttempt`] carries no field that could hold any of them, so this list is
-/// what the module's own test pins instead. It extends section 10.2's allowed set with
-/// `attempt_id`, which correlates the two phases, `client`, `fingerprint`, and
-/// `deny_codes` — all four already public or already non-reversible, and the first is the
-/// only thing that makes a pair of stderr lines readable as one record.
+/// Every field [`TracingAuditSink::record_attempt`] emits, in the order it emits
+/// them: `record::ATTEMPT_FIELDS` minus `record::TRACING_OMITS`, which the module's
+/// own test proves.
 #[cfg_attr(
     not(test),
     expect(
@@ -34,6 +34,7 @@ const AUDIT_TARGET: &str = "warden.audit";
     )
 )]
 const ATTEMPT_FIELDS: &[&str] = &[
+    "event",
     "attempt_id",
     "request_id",
     "principal_id",
@@ -47,11 +48,8 @@ const ATTEMPT_FIELDS: &[&str] = &[
     "deny_codes",
 ];
 
-/// Every field [`TracingAuditSink::record_outcome`] emits, in the order it emits them.
-///
-/// `rows`, `result_bytes`, and `duration_ms` are section 10.2's measurements under
-/// section 10.2's names. They stay absent rather than becoming zero when the statement
-/// never ran, because [`AuditOutcomeEvent`] leaves them absent for exactly that reason.
+/// Every field [`TracingAuditSink::record_outcome`] emits, in the order it emits
+/// them: `record::OUTCOME_FIELDS` minus `record::TRACING_OMITS`.
 #[cfg_attr(
     not(test),
     expect(
@@ -60,6 +58,7 @@ const ATTEMPT_FIELDS: &[&str] = &[
     )
 )]
 const OUTCOME_FIELDS: &[&str] = &[
+    "event",
     "attempt_id",
     "outcome",
     "duration_ms",
@@ -69,13 +68,26 @@ const OUTCOME_FIELDS: &[&str] = &[
     "error_code",
 ];
 
+/// The target both events carry, matching `warden-service`'s own audit alarm.
+const AUDIT_TARGET: &str = "warden.audit";
+
 /// Writes every audit record to stderr as a structured `tracing` event.
 ///
-/// A unit struct: it holds no handle, no buffer, and no configuration, which is the
-/// whole reason it cannot fail. `warden_config::AuditMode` therefore has no effect here
-/// yet — Milestone 13's sink is what gives the mode its meaning.
+/// Holds only the mode: no handle, no buffer, nothing that could fail to open,
+/// which is still the whole reason [`AuditSink::record_attempt`] and
+/// [`AuditSink::record_outcome`] cannot fail here.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct TracingAuditSink;
+pub(crate) struct TracingAuditSink {
+    mode: AuditMode,
+}
+
+impl TracingAuditSink {
+    /// Builds a sink that gates `statement_kind` and `fingerprint` on `mode`, the
+    /// same way `record::AttemptRecord::new` gates them.
+    pub(crate) fn new(mode: AuditMode) -> Self {
+        Self { mode }
+    }
+}
 
 impl AuditSink for TracingAuditSink {
     fn record_attempt<'a>(
@@ -84,15 +96,20 @@ impl AuditSink for TracingAuditSink {
     ) -> BoxFuture<'a, Result<(), AuditError>> {
         Box::pin(async move {
             // Codes, not reasons: `DenyReason`'s `internal_detail` names the object or
-            // function that tripped a rule, and Milestone 13 decides where that belongs.
+            // function that tripped a rule, and `docs/security.md` section 6 keeps it
+            // off every surface but the auditor's own investigation.
             let deny_codes = event
                 .deny_reasons
                 .iter()
                 .map(|reason| reason.code().as_str())
                 .collect::<Vec<_>>()
                 .join(",");
+            // The same gate `record::AttemptRecord::new` applies: `none` records that
+            // a request happened and nothing about the statement it carried.
+            let describes_statement = matches!(self.mode, AuditMode::Fingerprint);
             tracing::info!(
                 target: AUDIT_TARGET,
+                event = "attempt",
                 attempt_id = %event.id,
                 request_id = %event.request_id,
                 principal_id = %event.principal,
@@ -101,10 +118,16 @@ impl AuditSink for TracingAuditSink {
                 dialect = %event.dialect,
                 environment = %event.environment,
                 operation = event.operation.as_str(),
-                statement_kind = event
-                    .statement_kind
-                    .map(warden_core::analysis::StatementKind::as_str),
-                fingerprint = event.fingerprint.as_ref().map(|value| value.as_str()),
+                statement_kind = describes_statement
+                    .then(|| {
+                        event
+                            .statement_kind
+                            .map(warden_core::analysis::StatementKind::as_str)
+                    })
+                    .flatten(),
+                fingerprint = describes_statement
+                    .then(|| event.fingerprint.as_ref().map(|value| value.as_str()))
+                    .flatten(),
                 deny_codes = %deny_codes,
                 "audit attempt"
             );
@@ -119,6 +142,7 @@ impl AuditSink for TracingAuditSink {
         Box::pin(async move {
             tracing::info!(
                 target: AUDIT_TARGET,
+                event = "outcome",
                 attempt_id = %event.attempt_id,
                 outcome = event.outcome.as_str(),
                 // Saturating rather than truncating: a duration beyond `u64` milliseconds
@@ -157,6 +181,7 @@ mod tests {
     use tracing::{Event, Metadata, Subscriber};
     use warden_ports::AuditEventId;
 
+    use super::super::record;
     use super::*;
 
     #[tokio::test]
@@ -166,7 +191,7 @@ mod tests {
         // unchecked until Milestone 13 ships a sink that can (ADR-0022).
         install_capture();
         let id = AuditEventId::generate();
-        let sink = TracingAuditSink;
+        let sink = TracingAuditSink::new(AuditMode::Fingerprint);
         assert!(sink.record_attempt(&attempt(id)).await.is_ok());
         sink.record_outcome(&outcome(id)).await.unwrap();
     }
@@ -181,6 +206,7 @@ mod tests {
         assert_eq!(
             ATTEMPT_FIELDS,
             [
+                "event",
                 "attempt_id",
                 "request_id",
                 "principal_id",
@@ -194,10 +220,20 @@ mod tests {
                 "deny_codes",
             ]
         );
-        for forbidden in ["raw_sql", "raw_parameters", "password", "dsn", "sql"] {
-            assert!(!ATTEMPT_FIELDS.contains(&forbidden), "{forbidden}");
-            assert!(!OUTCOME_FIELDS.contains(&forbidden), "{forbidden}");
+        for forbidden in record::FORBIDDEN_FIELDS {
+            assert!(!ATTEMPT_FIELDS.contains(forbidden), "{forbidden}");
+            assert!(!OUTCOME_FIELDS.contains(forbidden), "{forbidden}");
         }
+    }
+
+    #[test]
+    fn the_stderr_sink_emits_the_record_format_minus_the_two_keys_it_does_not_repeat() {
+        let expected: Vec<&str> = record::ATTEMPT_FIELDS
+            .iter()
+            .filter(|field| !record::TRACING_OMITS.contains(field))
+            .copied()
+            .collect();
+        assert_eq!(ATTEMPT_FIELDS, expected.as_slice());
     }
 
     #[tokio::test]
@@ -210,7 +246,7 @@ mod tests {
         // Milestone 13 has yet to design.
         install_capture();
         let id = AuditEventId::generate();
-        let sink = TracingAuditSink;
+        let sink = TracingAuditSink::new(AuditMode::Fingerprint);
         sink.record_attempt(&attempt(id)).await.unwrap();
         sink.record_outcome(&outcome(id)).await.unwrap();
         let recorded = events_for(id);
@@ -231,6 +267,21 @@ mod tests {
                 assert!(!value.contains("app.secrets"), "{name} = {value}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn the_none_mode_drops_statement_kind_and_fingerprint_from_the_wire() {
+        // `audit.mode` is invariant 24's own knob (ADR-0026): it narrows what the
+        // record describes, and this sink honors it exactly as `record::AttemptRecord`
+        // does — the same two keys, nothing more.
+        install_capture();
+        let id = AuditEventId::generate();
+        let sink = TracingAuditSink::new(AuditMode::None_);
+        sink.record_attempt(&attempt(id)).await.unwrap();
+        let recorded = events_for(id);
+
+        assert_eq!(recorded[0].values.get("statement_kind"), None);
+        assert_eq!(recorded[0].values.get("fingerprint"), None);
     }
 
     /// The two events carrying `id`, in the order they were emitted.

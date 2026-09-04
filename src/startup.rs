@@ -230,15 +230,14 @@ pub(crate) async fn build(
         policy,
         redaction_columns,
         redaction_strategy,
-        // Milestone 12's sink writes one shape of event and cannot fail; the mode is what
-        // Milestone 13's persistent sink varies, and honouring it here would mean
-        // inventing a meaning for it a milestone early (`crate::audit`).
-        audit: _mode,
+        // `audit.mode` finally does something (`crate::audit::record`): it selects
+        // which fields the record describes, never whether one is written.
+        audit: audit_mode,
     } = config;
 
     // The sink comes first: `docs/architecture.md` section 12 puts it before any pool, so
     // a connection that fails to open is the first thing an audit-capable process sees.
-    let audit: Arc<dyn AuditSink> = Arc::new(TracingAuditSink);
+    let audit: Arc<dyn AuditSink> = Arc::new(TracingAuditSink::new(audit_mode));
 
     let mut runtimes = Vec::with_capacity(connections.len());
     let mut pools: Vec<PoolHandle> = Vec::with_capacity(connections.len());

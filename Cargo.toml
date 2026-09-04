@@ -106,8 +106,15 @@ secrecy = "0.10"
 # it convert a wire integer into a date with checked arithmetic instead of handing
 # the value to a `sqlx` decoder that panics on `infinity` (SPEC section 6,
 # invariant 31). `time-macros` is already in `Cargo.lock` through `sqlx`, so the
-# dependency graph does not grow.
-time = { version = "0.3", features = ["formatting", "macros", "parsing"] }
+# dependency graph does not grow. `serde-well-known` is what lets an audit
+# timestamp serialize as RFC 3339 through `#[serde(with = "time::serde::rfc3339")]`
+# without a fallible `format` call on the request path.
+time = { version = "0.3", features = [
+  "formatting",
+  "macros",
+  "parsing",
+  "serde-well-known",
+] }
 uuid = { version = "1.24", features = ["v4"] }
 bigdecimal = "0.4"
 base64 = "0.23"
@@ -180,6 +187,14 @@ tokio-util = { workspace = true }
 tracing = { workspace = true }
 # stderr only: stdout carries MCP (`docs/mcp.md` section 5.1).
 tracing-subscriber = { workspace = true }
+# `warden.audit.v1` (`src/audit/record.rs`) is a `serde` struct; the audit module is
+# no longer test-only code that can borrow the dev-dependency.
+serde = { workspace = true }
+serde_json = { workspace = true }
+# `AuditAttempt::timestamp` and every record's own `timestamp` are the concrete
+# `time::OffsetDateTime` the port and the record expose; production code names it
+# now, not only the sink's tests.
+time = { workspace = true }
 
 [features]
 default = []
@@ -188,7 +203,6 @@ default = []
 docker = []
 
 [dev-dependencies]
-serde_json = { workspace = true }
 sha2 = { workspace = true }
 toml = { workspace = true }
 # The end-to-end tests drive Warden's own binary as a subprocess against real
@@ -201,9 +215,6 @@ tokio = { workspace = true, features = [
   "io-util",
   "time",
 ] }
-# `AuditAttempt::timestamp` is the concrete `time::OffsetDateTime` the port exposes,
-# so the audit sink's own tests have to name it. Production code here never does.
-time = { workspace = true }
 # `tests/mcp_database.rs` provisions the fixture and the least-privileged role each
 # container test runs as, and then sends a write to that role with every Warden layer
 # removed — the second half of `AGENTS.md`'s rule that an integration test proves the
