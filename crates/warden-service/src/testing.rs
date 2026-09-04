@@ -387,6 +387,7 @@ pub(crate) struct FakeExecutor {
     calls: Arc<AtomicUsize>,
     observations: Mutex<Vec<(Instant, CancellationToken)>>,
     observed_limits: Mutex<Option<ExecutionLimits>>,
+    panics: bool,
 }
 
 impl Default for FakeExecutor {
@@ -405,6 +406,7 @@ impl FakeExecutor {
             calls: Arc::new(AtomicUsize::new(0)),
             observations: Mutex::new(Vec::new()),
             observed_limits: Mutex::new(None),
+            panics: false,
         }
     }
     /// Creates an executor that takes the given duration.
@@ -425,6 +427,13 @@ impl FakeExecutor {
     pub(crate) fn returning(result: ResultSet) -> Self {
         Self {
             result,
+            ..Self::new()
+        }
+    }
+    /// A fake executor whose call panics with a value a log must never repeat.
+    pub(crate) fn panicking() -> Self {
+        Self {
+            panics: true,
             ..Self::new()
         }
     }
@@ -457,6 +466,9 @@ impl QueryExecutor for FakeExecutor {
                 .unwrap()
                 .push((deadline, cancel.clone()));
             *self.observed_limits.lock().unwrap() = Some(query.limits());
+            if self.panics {
+                panic!("hunter2");
+            }
             tokio::select! { () = sleep(self.duration) => {}, () = cancel.cancelled() => return Err(ExecuteError::Cancelled), () = sleep_until(deadline) => return Err(ExecuteError::Timeout) }
             match &self.failure {
                 Some(error) => Err(error.clone()),
@@ -809,6 +821,23 @@ impl AuditSink for FakeAuditSink {
             Ok(())
         })
     }
+}
+
+/// Waits for the guard's detached write, which lands on a spawned task.
+///
+/// A real sleep rather than [`tokio::task::yield_now`]: the write it is waiting for
+/// is itself behind [`FakeAuditSink`]'s own `sleep`, which needs the time driver to
+/// turn at least once. Cooperative yielding alone never gives it that turn on an
+/// unpaused runtime; under `#[tokio::test(start_paused = true)]` this still resolves
+/// instantly, because paused time auto-advances to the next timer when idle.
+pub(crate) async fn await_outcome(sink: &FakeAuditSink) -> AuditOutcomeEvent {
+    for _ in 0..64 {
+        if let Some(outcome) = sink.outcomes().first().copied() {
+            return outcome;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    panic!("the audit outcome was never written");
 }
 
 /// Swappable fixtures for a runtime's four ports.

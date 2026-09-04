@@ -187,17 +187,27 @@ pub enum AuditOutcome {
     /// [`AuditOutcome::Failed`] would say the database failed the statement, which
     /// is a different fact, and an audit record must not state one for the other.
     NotStarted,
+    /// The request ended without reporting an outcome of its own.
+    ///
+    /// The attempt is on record, the request future was polled at least once, and
+    /// then it was dropped or it panicked. Neither [`AuditOutcome::Failed`] — the
+    /// database failed the statement — nor [`AuditOutcome::NotStarted`] — it never
+    /// reached the database — is true, and an audit record must not state one fact
+    /// for another. Written by `warden-service`'s drop guard (ADR-0038's remaining
+    /// gap).
+    Abandoned,
 }
 
 impl AuditOutcome {
     /// Every outcome. Milestone 13's sink iterates this to prove each has a mapping.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Denied,
         Self::Succeeded,
         Self::Failed,
         Self::TimedOut,
         Self::Cancelled,
         Self::NotStarted,
+        Self::Abandoned,
     ];
 
     /// The stable name used in audit records, trace fields, and metric labels.
@@ -213,6 +223,7 @@ impl AuditOutcome {
             Self::TimedOut => "timed_out",
             Self::Cancelled => "cancelled",
             Self::NotStarted => "not_started",
+            Self::Abandoned => "abandoned",
         }
     }
 }

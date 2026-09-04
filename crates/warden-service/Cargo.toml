@@ -20,9 +20,10 @@ time = { workspace = true }
 thiserror = { workspace = true }
 # `time` for `tokio::time::{timeout, Instant}`: the audit sink takes no deadline, so
 # the caller bounds its writes (`crates/warden-ports/src/audit.rs`), and every port
-# that runs SQL takes a `tokio::time::Instant` deadline (ADR-0024). No runtime
-# feature: this crate orchestrates, it never starts a runtime.
-tokio = { workspace = true, features = ["time"] }
+# that runs SQL takes a `tokio::time::Instant` deadline (ADR-0024). `rt` is for
+# `Handle::try_current` in the audit drop guard, which detaches one write during
+# unwinding; this crate still starts no runtime.
+tokio = { workspace = true, features = ["time", "rt"] }
 # `CancellationToken` lives in the ungated `tokio_util::sync` module.
 tokio-util = { workspace = true }
 # The redaction matcher walks `QueryPlan::plan`, which is a `serde_json::Value`.

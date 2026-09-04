@@ -180,6 +180,7 @@ impl ExplainService {
             }
         };
 
+        let guard = audit::OutcomeGuard::arm(Arc::clone(&self.audit), attempt.id);
         // A service-side clock around the gated call: planning plus the adapter's own
         // overhead, started after the permit was acquired so the queue wait is
         // excluded. `QueryPlan` carries no adapter-measured duration the way
@@ -195,9 +196,8 @@ impl ExplainService {
             Ok(mut plan) => {
                 self.redactor.redact_plan(&mut plan);
                 let plan_bytes = plan.plan_bytes();
-                audit::record_outcome(
-                    self.audit.as_ref(),
-                    AuditOutcomeEvent {
+                guard
+                    .complete(AuditOutcomeEvent {
                         attempt_id: attempt.id,
                         outcome: AuditOutcome::Succeeded,
                         duration: Some(elapsed),
@@ -205,9 +205,8 @@ impl ExplainService {
                         rows_returned: None,
                         result_bytes: Some(plan_bytes),
                         error_code: None,
-                    },
-                )
-                .await;
+                    })
+                    .await;
                 Ok(plan)
             }
             Err(error) => {
@@ -220,7 +219,16 @@ impl ExplainService {
                     | ExplainError::Database { .. } => AuditOutcome::Failed,
                 };
                 let code = error.public_code();
-                self.complete(&attempt, outcome, None, Some(queue_wait), code)
+                guard
+                    .complete(AuditOutcomeEvent {
+                        attempt_id: attempt.id,
+                        outcome,
+                        duration: None,
+                        queue_wait: Some(queue_wait),
+                        rows_returned: None,
+                        result_bytes: None,
+                        error_code: Some(code),
+                    })
                     .await;
                 Err(error.into())
             }

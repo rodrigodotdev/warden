@@ -189,13 +189,13 @@ impl QueryService {
             }
         };
 
+        let guard = audit::OutcomeGuard::arm(Arc::clone(&self.audit), attempt.id);
         let queue_wait = gate.queue_wait();
         match gate.execute().await {
             Ok(mut result) => {
                 self.redactor.redact_result(&mut result);
-                audit::record_outcome(
-                    self.audit.as_ref(),
-                    AuditOutcomeEvent {
+                guard
+                    .complete(AuditOutcomeEvent {
                         attempt_id: attempt.id,
                         outcome: AuditOutcome::Succeeded,
                         // The adapter's own clock over the whole database call, not a
@@ -215,9 +215,8 @@ impl QueryService {
                         // actually receives.
                         result_bytes: Some(result.stats.bytes),
                         error_code: None,
-                    },
-                )
-                .await;
+                    })
+                    .await;
                 Ok(result)
             }
             Err(error) => {
@@ -229,7 +228,16 @@ impl QueryService {
                     | ExecuteError::Database { .. } => AuditOutcome::Failed,
                 };
                 let code = error.public_code();
-                self.complete(&attempt, outcome, None, Some(queue_wait), code)
+                guard
+                    .complete(AuditOutcomeEvent {
+                        attempt_id: attempt.id,
+                        outcome,
+                        duration: None,
+                        queue_wait: Some(queue_wait),
+                        rows_returned: None,
+                        result_bytes: None,
+                        error_code: Some(code),
+                    })
                     .await;
                 Err(error.into())
             }
@@ -697,6 +705,70 @@ mod tests {
         assert_eq!(outcomes.len(), 1);
         assert_eq!(outcomes[0].outcome, AuditOutcome::Denied);
         assert_eq!(outcomes[0].error_code, Some(PublicErrorCode::QueryRejected));
+    }
+
+    #[tokio::test]
+    async fn a_panicking_adapter_still_completes_the_audit_record_it_opened() {
+        // ADR-0038's remaining gap: containment kept the process alive, but the
+        // attempt it recorded never received an outcome, so the audit trail's most
+        // interesting record was its most incomplete one.
+        let sink = Arc::new(testing::FakeAuditSink::new());
+        let service = Arc::new(testing::query_service(testing::ServiceFakes {
+            executor: Arc::new(testing::FakeExecutor::panicking()),
+            audit: sink.clone(),
+            ..testing::ServiceFakes::default()
+        }));
+        let task = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move {
+                let context = testing::request_context();
+                service.execute(&context, testing::request()).await
+            }
+        });
+        assert!(task.await.unwrap_err().is_panic());
+
+        let outcome = testing::await_outcome(&sink).await;
+        assert_eq!(outcome.attempt_id, sink.attempts()[0].id);
+        assert_eq!(outcome.outcome, AuditOutcome::Abandoned);
+        assert_eq!(outcome.error_code, Some(PublicErrorCode::InternalError));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_request_completes_its_audit_record_too() {
+        let sink = Arc::new(testing::FakeAuditSink::new());
+        let service = testing::query_service(testing::ServiceFakes {
+            executor: Arc::new(testing::FakeExecutor::taking(Duration::from_secs(600))),
+            audit: sink.clone(),
+            ..testing::ServiceFakes::default()
+        });
+        let context = testing::request_context();
+        let mut execution = Box::pin(service.execute(&context, testing::request()));
+        tokio::select! {
+            result = &mut execution => panic!("query completed early: {result:?}"),
+            () = tokio::time::sleep(Duration::from_millis(1)) => {}
+        }
+        drop(execution);
+
+        let outcome = testing::await_outcome(&sink).await;
+        assert_eq!(outcome.outcome, AuditOutcome::Abandoned);
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_request_records_exactly_one_outcome() {
+        // The guard must disarm on the normal path, or every successful query would
+        // be followed by a contradictory `abandoned` record.
+        let sink = Arc::new(testing::FakeAuditSink::new());
+        let service = testing::query_service(testing::ServiceFakes {
+            audit: sink.clone(),
+            ..testing::ServiceFakes::default()
+        });
+        service
+            .execute(&testing::request_context(), testing::request())
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(sink.outcomes().len(), 1);
+        assert_eq!(sink.outcomes()[0].outcome, AuditOutcome::Succeeded);
     }
 
     #[test]

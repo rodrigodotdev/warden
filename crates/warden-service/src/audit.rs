@@ -12,14 +12,19 @@
 //! accidentally fail a request because the second write failed after execution had
 //! already succeeded.
 
+use std::fmt;
+use std::sync::Arc;
+
 use tokio::time::timeout;
 use warden_core::analysis::StatementKind;
 use warden_core::connection::ConnectionMetadata;
 use warden_core::context::RequestContext;
+use warden_core::error::PublicErrorCode;
 use warden_core::fingerprint::QueryFingerprint;
 use warden_policy::DenyReason;
 use warden_ports::{
-    AuditAttempt, AuditError, AuditEventId, AuditOperation, AuditOutcomeEvent, AuditSink,
+    AuditAttempt, AuditError, AuditEventId, AuditOperation, AuditOutcome, AuditOutcomeEvent,
+    AuditSink,
 };
 
 use crate::limits::AUDIT_WRITE_TIMEOUT;
@@ -99,6 +104,90 @@ pub(crate) async fn record_outcome(sink: &dyn AuditSink, event: AuditOutcomeEven
             %error,
             "the audit outcome could not be recorded"
         );
+    }
+}
+
+/// Guarantees that a recorded attempt receives a terminal outcome.
+///
+/// `docs/architecture.md` section 8 states the gap this closes: an attempt is
+/// completed only if the request future is polled to completion, so a dropped or
+/// panicking request left the audit trail's most interesting record half-written.
+/// The guard is armed after the attempt is on record and disarmed by
+/// [`OutcomeGuard::complete`]; the only way to reach its `Drop` is a request that
+/// ended without saying how.
+///
+/// **Scope, stated honestly:** the guard is armed by the caller after
+/// `ExecutionGate::enter` returns, so a panic *inside* permit acquisition — a
+/// semaphore acquire under a timeout, with no user code in it — is still
+/// unguarded. Closing that would mean the gate constructing the guard and handing
+/// it back through both result arms, which buys nothing this path can exercise.
+pub(crate) struct OutcomeGuard {
+    sink: Arc<dyn AuditSink>,
+    pending: Option<AuditEventId>,
+}
+
+/// Prints only the pending attempt id.
+///
+/// `AuditSink` is not `Debug` — the same reason `QueryService`, `ExplainService`, and
+/// `SchemaService` all hand-write this impl and omit the port (`query.rs`).
+impl fmt::Debug for OutcomeGuard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OutcomeGuard")
+            .field("pending", &self.pending)
+            .finish_non_exhaustive()
+    }
+}
+
+impl OutcomeGuard {
+    /// Arms the guard for an attempt that is already on record.
+    pub(crate) fn arm(sink: Arc<dyn AuditSink>, attempt_id: AuditEventId) -> Self {
+        Self {
+            sink,
+            pending: Some(attempt_id),
+        }
+    }
+
+    /// Records the outcome the request actually had and disarms.
+    pub(crate) async fn complete(mut self, event: AuditOutcomeEvent) {
+        self.pending = None;
+        record_outcome(self.sink.as_ref(), event).await;
+    }
+}
+
+impl Drop for OutcomeGuard {
+    fn drop(&mut self) {
+        let Some(attempt_id) = self.pending.take() else {
+            return;
+        };
+        // Always on stderr, whether or not the durable write below survives: a
+        // runtime that is shutting down accepts a spawn and never polls it, and an
+        // abandoned attempt must not depend on that task for its only trace.
+        tracing::error!(
+            target: "warden.audit",
+            attempt_id = %attempt_id,
+            outcome = AuditOutcome::Abandoned.as_str(),
+            "a request ended without recording its own outcome"
+        );
+        let event = AuditOutcomeEvent {
+            attempt_id,
+            outcome: AuditOutcome::Abandoned,
+            duration: None,
+            queue_wait: None,
+            rows_returned: None,
+            result_bytes: None,
+            error_code: Some(PublicErrorCode::InternalError),
+        };
+        // `Drop` cannot await, so the durable write is detached. It is bounded by
+        // `AUDIT_WRITE_TIMEOUT` like every other write, and there is no runtime to
+        // spawn on when a request is dropped during shutdown — the alarm above is
+        // what covers that case.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                let sink = Arc::clone(&self.sink);
+                handle.spawn(async move { record_outcome(sink.as_ref(), event).await });
+            }
+            Err(_no_runtime) => {}
+        }
     }
 }
 

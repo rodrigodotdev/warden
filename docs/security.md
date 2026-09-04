@@ -664,8 +664,10 @@ would add a hop and a failure mode without containing anything.
 `docs/architecture.md` section 8 and ADR-0038 both assign this to Milestone 12 by name,
 because a recorded audit attempt receives its terminal outcome only if the request future
 is polled to completion. Containment is all it buys: a task that panics still leaves its
-attempt without an outcome, which ADR-0038 states and Milestone 13's audit work owns. The
-payload-free panic hook is Milestone 13's too, so until it exists a panic message reaches
+attempt half-written, which ADR-0038 states — `warden-service`'s drop guard writes an
+`abandoned` outcome for an attempt whose request was dropped or panicked, and the write
+is detached because `Drop` cannot await. The payload-free panic hook is Milestone 13's
+too, so until it exists a panic message reaches
 stderr with whatever the panicking expression formatted into it.
 
 Do not globally catch every panic and continue as if nothing happened. Add parser
