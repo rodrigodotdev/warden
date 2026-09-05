@@ -7,10 +7,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use proc_macro2::{TokenStream, TokenTree};
+use proc_macro2::TokenStream;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use syn::parse::{Parse, ParseStream};
 use syn::visit::Visit;
 
 /// Forbidden dependency-graph edges from `docs/architecture.md` section 3 and SPEC
@@ -150,6 +152,24 @@ fn module_directory(source: &Path) -> PathBuf {
     }
 }
 
+fn path_override(attributes: &[syn::Attribute]) -> Option<PathBuf> {
+    attributes.iter().find_map(|attribute| {
+        let syn::Meta::NameValue(name_value) = &attribute.meta else {
+            return None;
+        };
+        if !name_value.path.is_ident("path") {
+            return None;
+        }
+        let syn::Expr::Lit(expression) = &name_value.value else {
+            return None;
+        };
+        let syn::Lit::Str(path) = &expression.lit else {
+            return None;
+        };
+        Some(PathBuf::from(path.value()))
+    })
+}
+
 fn cfg_test_module_roots(items: &[syn::Item], directory: &Path, roots: &mut Vec<PathBuf>) {
     for item in items {
         let syn::Item::Mod(module) = item else {
@@ -157,7 +177,14 @@ fn cfg_test_module_roots(items: &[syn::Item], directory: &Path, roots: &mut Vec<
         };
         let module_path = directory.join(module.ident.to_string());
         if is_cfg_test(&module.attrs) {
-            if module.content.is_none() {
+            if module.content.is_some() {
+                roots.push(module_path);
+            } else if let Some(path) = path_override(&module.attrs) {
+                let source = directory.join(path);
+                roots.push(module_directory(&source));
+                roots.push(source);
+                roots.push(module_path);
+            } else {
                 roots.push(module_path.with_extension("rs"));
                 roots.push(module_path);
             }
@@ -169,23 +196,49 @@ fn cfg_test_module_roots(items: &[syn::Item], directory: &Path, roots: &mut Vec<
     }
 }
 
-fn first_string_literal(tokens: TokenStream) -> Option<String> {
-    for token in tokens {
-        match token {
-            TokenTree::Group(group) => {
-                if let Some(literal) = first_string_literal(group.stream()) {
-                    return Some(literal);
-                }
-            }
-            TokenTree::Literal(literal) => {
-                if let Ok(literal) = syn::parse_str::<syn::LitStr>(&literal.to_string()) {
-                    return Some(literal.value());
-                }
-            }
-            TokenTree::Ident(_) | TokenTree::Punct(_) => {}
+fn next_is_metadata(input: ParseStream<'_>, expected: &str) -> bool {
+    let ahead = input.fork();
+    let Ok(name) = ahead.parse::<syn::Ident>() else {
+        return false;
+    };
+    name == expected && ahead.peek(syn::Token![:])
+}
+
+fn parse_metadata(input: ParseStream<'_>) -> syn::Result<()> {
+    let _name: syn::Ident = input.parse()?;
+    let _colon: syn::Token![:] = input.parse()?;
+    let _value: syn::Expr = input.parse()?;
+    let _comma: syn::Token![,] = input.parse()?;
+    Ok(())
+}
+
+struct SpanMacroHeader {
+    name: syn::Expr,
+}
+
+impl Parse for SpanMacroHeader {
+    fn parse(input: ParseStream<'_>) -> syn::Result<Self> {
+        if next_is_metadata(input, "target") {
+            parse_metadata(input)?;
         }
+        if next_is_metadata(input, "parent") {
+            parse_metadata(input)?;
+        }
+        let name = input.parse()?;
+        let _remaining: TokenStream = input.parse()?;
+        Ok(Self { name })
     }
-    None
+}
+
+fn span_name_literal(tokens: TokenStream) -> Option<String> {
+    let header = syn::parse2::<SpanMacroHeader>(tokens).ok()?;
+    let syn::Expr::Lit(expression) = header.name else {
+        return None;
+    };
+    let syn::Lit::Str(name) = expression.lit else {
+        return None;
+    };
+    Some(name.value())
 }
 
 #[derive(Default)]
@@ -208,7 +261,7 @@ impl<'ast> Visit<'ast> for SpanNameVisitor {
                 "info_span" | "debug_span" | "trace_span" | "warn_span" | "error_span"
             )
         });
-        if is_span && let Some(name) = first_string_literal(node.tokens.clone()) {
+        if is_span && let Some(name) = span_name_literal(node.tokens.clone()) {
             self.names.insert(name);
         }
         syn::visit::visit_macro(self, node);
@@ -861,4 +914,123 @@ fn span_source_parser_ignores_test_only_modules() {
         visitor.names,
         BTreeSet::from(["production.phase".to_owned()])
     );
+}
+
+#[test]
+fn span_source_parser_reads_the_name_slot_for_every_supported_macro() {
+    let syntax = syn::parse_file(
+        r#"
+        fn production(parent: &tracing::Span, dynamic_name: &'static str) {
+            tracing::info_span!("plain.info", detail = "not.a.name");
+            tracing::debug_span!(
+                target: "warden.db",
+                "targeted.debug",
+                detail = "also.not.a.name"
+            );
+            tracing::trace_span!(parent: parent, "parented.trace", detail = "not.this");
+            tracing::warn_span!(
+                target: "warden.db",
+                parent: parent,
+                "targeted.parented.warn",
+                detail = "nor.this"
+            );
+            tracing::error_span!("plain.error");
+            tracing::debug_span!(dynamic_name, detail = "field.value.is.not.a.name");
+        }
+        "#,
+    )
+    .unwrap();
+    let mut visitor = SpanNameVisitor::default();
+    visitor.visit_file(&syntax);
+    assert_eq!(
+        visitor.names,
+        BTreeSet::from([
+            "parented.trace".to_owned(),
+            "plain.error".to_owned(),
+            "plain.info".to_owned(),
+            "targeted.debug".to_owned(),
+            "targeted.parented.warn".to_owned(),
+        ])
+    );
+}
+
+#[test]
+fn span_source_discovery_skips_direct_nested_and_path_test_modules() {
+    let fixture = SourceFixture::new();
+    fixture.write(
+        "lib.rs",
+        r#"
+        fn production() {
+            tracing::info_span!("production.root");
+        }
+
+        #[cfg(test)]
+        mod direct;
+
+        #[cfg(test)]
+        mod tests {
+            mod support;
+        }
+
+        #[cfg(test)]
+        #[path = "custom.rs"]
+        mod custom_tests;
+        "#,
+    );
+    fixture.write(
+        "direct.rs",
+        r#"fn helper() { tracing::debug_span!("test.direct"); }"#,
+    );
+    fixture.write(
+        "tests/support.rs",
+        r#"fn helper() { tracing::trace_span!("test.nested.support"); }"#,
+    );
+    fixture.write(
+        "custom.rs",
+        r#"fn helper() { tracing::warn_span!("test.path.override"); }"#,
+    );
+
+    assert_eq!(
+        created_span_names(&fixture.source_files()),
+        BTreeSet::from(["production.root".to_owned()])
+    );
+}
+
+static NEXT_SOURCE_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+struct SourceFixture {
+    root: PathBuf,
+}
+
+impl SourceFixture {
+    fn new() -> Self {
+        let sequence = NEXT_SOURCE_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "warden-architecture-span-source-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir(&root).unwrap();
+        Self { root }
+    }
+
+    fn write(&self, relative: &str, source: &str) {
+        let path = self.root.join(relative);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).unwrap();
+        }
+        fs::write(path, source).unwrap();
+    }
+
+    fn source_files(&self) -> Vec<PathBuf> {
+        let mut files = Vec::new();
+        rust_source_files_at(&self.root, &mut files);
+        files.sort();
+        files
+    }
+}
+
+impl Drop for SourceFixture {
+    fn drop(&mut self) {
+        let _cleanup = fs::remove_dir_all(&self.root);
+    }
 }
