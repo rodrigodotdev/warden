@@ -269,9 +269,11 @@ PostgreSQL.
 
 Milestone 13 makes that audit trail durable and reviewable: `query`, `explain`, and both
 catalog reads record two phases to a versioned, append-only audit file; raw SQL and
-parameters have no record or span field; a failed attempt write denies the request; and
-the documented tracing tree and payload-free panic reporting give operators safe
-diagnostics.
+parameters have no record or span field; a read-only regular-file fixture proves a real
+attempt write maps to `AuditError::Unavailable`, and the execution gate separately proves
+a failing attempt takes neither permit nor executor; the documented tracing tree and
+payload-free panic reporting give operators safe diagnostics. `/dev/full` is rejected at
+open time as a special-file destination rather than used as the write-failure fixture.
 
 Streamable HTTP and its authorization model are planned for Milestone 14. Until then,
 remote production deployment is not supported. There is no published binary, container

@@ -199,10 +199,13 @@ otherwise, none blocks M0–M5.
     `CancellationToken` that fires on `notifications/cancelled`, and `warden-service`
     derives its per-request token from the process-wide shutdown token it was built with,
     offering no seam to pass another in. Aborting the spawned task instead would release
-    the permit and write no outcome, which is exactly the hole ADR-0038 names. Every
-    request is already bounded by `warden_service::RequestBudget::total`, so the exposure
-    is one budget rather than an unbounded wait. Milestone 14, where long-lived HTTP
-    requests make it matter, should add the seam rather than the abort.
+    the permit; since Milestone 13, an `OutcomeGuard` writes an `abandoned` outcome for
+    an already recorded attempt, so it no longer recreates ADR-0038's missing-outcome
+    hole. It remains a blunt substitute for propagating client cancellation to the
+    running database query. Every request is already bounded by
+    `warden_service::RequestBudget::total`, so the exposure is one budget rather than an
+    unbounded wait. Milestone 14, where long-lived HTTP requests make it matter, should
+    add the seam rather than the abort.
 
 24. **Should `InputLimits` be configurable?** `warden-core` calls them configurable and no
     configuration key exposes them. Milestone 12 passes `InputLimits::default()` — the

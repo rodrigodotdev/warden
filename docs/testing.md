@@ -42,8 +42,11 @@ Milestone 13 adds these no-database observability rows through Task 8:
 | Span-tree guard | `tests/architecture.rs` parses every fenced `text` tree in `docs/operations.md` section 10.1 and production `*_span!` macros with `syn`, rather than comparing either side with a hard-coded name list |
 
 The milestone close also ties its two audit claims to behavior rather than prose: the
-record field allowlist has no raw-statement or parameter field, and the file sink's
-`/dev/full` regression surfaces a failed attempt write to the service before dispatch.
+record field allowlist has no raw-statement or parameter field. The file sink's
+read-only regular-file fixture proves that a real attempt write becomes
+`AuditError::Unavailable`; independently, the execution-gate fixture's failing sink
+proves that the error takes no permit and reaches no executor. `/dev/full` is instead a
+special-file destination refused at open time.
 
 ## 2. Policy
 

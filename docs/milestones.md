@@ -205,7 +205,8 @@ format gives attempts and outcomes a field allowlist, including the non-reversib
 `v1:` fingerprint, request identity, and public error codes, with no field for a raw
 statement or parameter. The append-only file sink can fail; its configured
 `audit.destination` and `audit.path` keys are validated and proved writable by
-`warden check` before any database pool opens.
+`warden check` before any database pool opens. Non-regular special destinations such
+as `/dev/full` are refused at open time rather than accepted as audit files.
 
 Tracing now follows the documented service and database phase tree. Request identity
 fields flow into the allowed span fields, while the architecture guard derives the
@@ -215,11 +216,15 @@ half with the drop guard and installs the process panic hook after tracing. That
 keeps location, thread name, payload shape, and an available backtrace, but never reads
 or emits a panic payload.
 
-Measured, not asserted: the file sink's `/dev/full` test observes an actual failed
-attempt write that the caller receives as an error; the capturing-subscriber test
-`one_query_creates_the_documented_span_tree_and_leaks_no_statement` observes the real
-phase order, parentage, fields, and absence of its statement literal; the span-tree
-guard parses the operations documentation and production macros; and
+Measured, not asserted: the file-sink test
+`a_regular_file_write_failure_is_reported_so_the_caller_can_fail_closed` injects a
+read-only regular-file handle and observes a real write map to `AuditError::Unavailable`;
+separately, the pipeline test
+`a_broken_attempt_write_takes_no_permit_and_reaches_no_executor` uses a failing sink and
+proves an attempt-write failure takes neither a permit nor an executor. The
+capturing-subscriber test `one_query_creates_the_documented_span_tree_and_leaks_no_statement`
+observes the real phase order, parentage, fields, and absence of its statement literal;
+the span-tree guard parses the operations documentation and production macros; and
 `a_panicking_adapter_still_completes_the_audit_record_it_opened` and
 `a_dropped_request_completes_its_audit_record_too` observe the `abandoned` outcome.
 
@@ -293,7 +298,8 @@ that the supposedly generic core was secretly shaped around MySQL.
 - [x] Security documentation states that database privileges are mandatory
 
 Both claims are now reviewable against the versioned audit-record format and its field
-allowlist, not only against structure. The persistent file sink also gives the attempt
-write a real failure mode: its `/dev/full` regression returns an error before dispatch,
-which demonstrates that a query is denied when its fail-closed attempt cannot be
-recorded.
+allowlist, not only against structure. The persistent file sink's read-only
+regular-file fixture proves that an actual attempt write reports `AuditError::Unavailable`.
+Separately, the execution-gate fixture uses a failing sink and proves that this attempt
+error takes no permit and reaches no executor, so a query cannot dispatch without its
+fail-closed attempt.
