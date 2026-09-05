@@ -7,6 +7,7 @@
 mod audit;
 mod check;
 mod cli;
+mod panic;
 mod startup;
 
 use std::io::{self, Write};
@@ -28,6 +29,7 @@ const DEFAULT_LOG_FILTER: &str = "warn,warden=info";
 
 fn main() -> ExitCode {
     install_tracing();
+    panic::install();
     // Not a banner: `docs/mcp.md` section 5.1 forbids printing one, and this is a
     // `debug` event on stderr that the default filter above does not even enable.
     tracing::debug!(
@@ -219,6 +221,7 @@ fn report(outcome: Result<ExitCode>) -> ExitCode {
 /// `tracing_subscriber::fmt()` defaults to stdout, so naming the writer here is what
 /// keeps a log line out of a JSON-RPC stream (`docs/mcp.md` section 5.1). The other
 /// half, `clippy::print_stdout = "deny"`, catches a stray `println!` at build time.
+/// The process panic hook also logs through this stderr subscriber.
 ///
 /// `docs/operations.md` section 10.3 asks for one logging ecosystem, so this is the only
 /// subscriber the process installs.

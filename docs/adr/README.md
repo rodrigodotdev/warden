@@ -49,6 +49,7 @@ supersedes it; never change it silently.
 | [0042](0042-every-database-touching-tool-is-audited.md) | Every database-touching tool is audited |
 | [0043](0043-the-persistent-audit-sink.md) | The persistent audit sink |
 | [0044](0044-spans-are-the-observability-surface.md) | Spans are the observability surface |
+| [0045](0045-panic-reports-carry-a-location-never-a-payload.md) | Panic reports carry a location, never a payload |
 
 ADRs 0021–0026 are new in v0.3. ADR-0002 supersedes the v0.2 MSRV definition;
 ADR-0022 supersedes the single-event audit model; ADR-0023 resolves v0.2 open
@@ -58,5 +59,5 @@ in Milestone 10. ADR-0038 resolves open question 14's remaining half and is new 
 Milestone 11. ADR-0039, ADR-0040, and ADR-0041 are new in Milestone 12; ADR-0039
 raises open question 22. ADR-0042, ADR-0043, and ADR-0044 are new in Milestone 13;
 ADR-0042 resolves open question 21, ADR-0043 is what makes ADR-0022's fail-closed
-attempt a tested behaviour rather than a structural claim, and ADR-0044 fixes the
-span taxonomy and levels.
+attempt a tested behaviour rather than a structural claim, ADR-0044 fixes the span
+taxonomy and levels, and ADR-0045 keeps panic reports free of data-bearing payloads.

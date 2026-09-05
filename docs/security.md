@@ -49,7 +49,7 @@ control is accepted risk and must say so explicitly.
 | Describing a relation or FK target the role cannot read | catalog queries filter on `has_table_privilege`/`has_schema_privilege`; MySQL's `information_schema` hides unprivileged objects itself; FK targets also pass per-request object rules | integration (MySQL tested: `foreign_key_target_policy_is_reapplied_on_cold_and_warm_cache_reads`; PostgreSQL tested: the same plus `a_relation_the_role_cannot_select_is_invisible`, `a_foreign_key_to_a_target_without_select_is_omitted_as_truncated`) |
 | Oversized catalog default or comment | 64 KiB per UTF-8 value and 256 KiB accumulated per cached table and description response; static SQL fetches one sentinel character; `Table.truncated` | core/adapter unit tests, PostgreSQL Docker at 64 KiB + 1, and MySQL real `LEFT` boundary plus supported catalog/cache path |
 | DSN in a tool response | non-serializable secret types; MCP models have no DSN field | unit + E2E |
-| Credential in log, trace, or error | sanitized error mapping; trace-field allowlist; panic hook without payload | unit + E2E |
+| Credential in log, trace, or error | sanitized error mapping; trace-field allowlist; panic hook without payload | `src/panic.rs`: `a_string_payload_is_described_by_its_type_and_never_by_its_content`, `every_payload_shape_is_classified_without_being_read`, `a_location_is_kept_because_it_names_code_and_not_data`; E2E |
 | Raw SQL in an operator log through the driver | `ConnectOptions::disable_statement_logging` on every connect options value | unit |
 | Connection setting smuggled through a DSN parameter or a `PG*` variable | `Dsn` rejects query strings and fragments; adapters build options field by field; PostgreSQL refuses an ambient environment (ADR-0031) | unit + AST guard |
 | Password logged by the driver's own URL or `.pgpass` parser | neither is ever called; `PgConnectOptions::new_without_pgpass` only (ADR-0031) | AST guard |
@@ -655,7 +655,7 @@ Two complementary controls are mandatory:
 - **Panic hook:** panic messages can contain data, such as an `expect` formatting a row
   value, and stderr is the log destination. Record location and type, **not payload**.
 
-**Containment shipped in Milestone 12; the panic hook did not.** Every `#[tool]` method in
+**Both controls shipped by Milestone 13.** Every `#[tool]` method in
 `crates/warden-mcp/src/server.rs` that reaches an adapter runs through
 `WardenServer::run_in_task`, which `tokio::spawn`s the call, awaits the handle, and maps a
 `JoinError` to `internal_error` while logging no payload. `list_connections` is the one
@@ -666,9 +666,10 @@ because a recorded audit attempt receives its terminal outcome only if the reque
 is polled to completion. Containment is all it buys: a task that panics still leaves its
 attempt half-written, which ADR-0038 states — `warden-service`'s drop guard writes an
 `abandoned` outcome for an attempt whose request was dropped or panicked, and the write
-is detached because `Drop` cannot await. The payload-free panic hook is Milestone 13's
-too, so until it exists a panic message reaches
-stderr with whatever the panicking expression formatted into it.
+is detached because `Drop` cannot await. Milestone 13 installs the process panic hook
+after tracing, so it emits source location, thread name, payload shape, and only a
+runtime-captured backtrace. It neither reads nor emits the payload; ADR-0045 records the
+deliberate trade-off of message convenience for data safety.
 
 Do not globally catch every panic and continue as if nothing happened. Add parser
 panic containment only if fuzzing demonstrates a dependency panic that can be safely
