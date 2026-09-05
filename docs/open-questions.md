@@ -222,10 +222,19 @@ otherwise, none blocks M0–M5.
     agent-visible failure that is not one of the fourteen public codes, which the global
     rule otherwise makes universal. Closing it means every tool taking a raw
     `serde_json::Value` and hand-rolling deserialization so the failure can be mapped, a
-    structural change Milestone 12 declined to make at its end. Decide it in Milestone 13
-    or 14, alongside whichever of them next reworks the tool signatures;
+    structural change Milestone 12 declined to make at its end. **Decision: defer this
+    to Milestone 14**, which reworks the tool signatures for HTTP anyway; intercepting
+    rmcp's deserialization refusal means every tool would have to take a raw
+    `serde_json::Value`. Until then,
     `crates/warden-mcp/tests/protocol.rs` pins the current framing so an SDK change reads
     as a decision point rather than a mystery failure.
+
+26. **Should Warden export OpenTelemetry metrics?** `docs/operations.md` section 10.3
+    names eleven metrics and defers OpenTelemetry until after the first vertical slice.
+    Milestone 13 shipped the span taxonomy an exporter needs first (ADR-0044), and no
+    metrics, so this is now a wiring decision rather than a design one.
+    `warden_audit_write_failures_total` is the alarm ADR-0022 names, and it is a
+    `tracing` event today.
 
 ## 3. Future work deliberately outside v0.x
 

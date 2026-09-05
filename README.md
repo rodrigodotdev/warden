@@ -267,6 +267,12 @@ Warden has reached its first developer-usable release. Milestone 12 ships
 `warden serve --transport stdio`, `warden check`, and all five MCP tools for MySQL and
 PostgreSQL.
 
+Milestone 13 makes that audit trail durable and reviewable: `query`, `explain`, and both
+catalog reads record two phases to a versioned, append-only audit file; raw SQL and
+parameters have no record or span field; a failed attempt write denies the request; and
+the documented tracing tree and payload-free panic reporting give operators safe
+diagnostics.
+
 Streamable HTTP and its authorization model are planned for Milestone 14. Until then,
 remote production deployment is not supported. There is no published binary, container
 image, or selected license yet. Follow progress in
@@ -291,7 +297,7 @@ mise tasks
 | `mise run check` | Type-check every workspace target | No |
 | `mise run lint` | Run Clippy with warnings denied | No |
 | `mise run test` | Run the fast workspace test suite | No |
-| `mise run test:docker` | Verify both adapters and the MCP server against real databases | Yes |
+| `RUST_TEST_THREADS=4 mise run test:docker` | Verify both adapters and the MCP server against real databases at the documented container-capacity limit | Yes |
 | `mise run coverage` | Build the HTML report and enforce 95% line coverage | Yes |
 | `mise run ci` | Run the complete local CI-equivalent gate | No |
 

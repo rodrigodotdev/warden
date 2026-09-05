@@ -196,9 +196,36 @@ cancellation does not reach a running query — open questions 22, 23, and 24.
 
 ## M13 — Auditing and tracing
 
-Implement two-phase audit events, a versioned fingerprint, spans, raw SQL disabled by
-default, safe error mapping, request IDs, a panic hook without payloads, and per-task
-panic containment.
+**The audit trail became a durable, inspectable control.** The widened audit port now
+names `query`, `explain`, `search_schema`, and `describe_schema`, so catalog reads join
+statements in two-phase auditing; `list_connections` remains intentionally outside it
+because it never reaches a database. An `OutcomeGuard` completes an opened record as
+`abandoned` when the request is dropped or panics. The one versioned JSON Lines record
+format gives attempts and outcomes a field allowlist, including the non-reversible
+`v1:` fingerprint, request identity, and public error codes, with no field for a raw
+statement or parameter. The append-only file sink can fail; its configured
+`audit.destination` and `audit.path` keys are validated and proved writable by
+`warden check` before any database pool opens.
+
+Tracing now follows the documented service and database phase tree. Request identity
+fields flow into the allowed span fields, while the architecture guard derives the
+span-name set from both section 10.1 of `docs/operations.md` and production macros.
+Per-request task containment was delivered in M12; this milestone closes its audit
+half with the drop guard and installs the process panic hook after tracing. That hook
+keeps location, thread name, payload shape, and an available backtrace, but never reads
+or emits a panic payload.
+
+Measured, not asserted: the file sink's `/dev/full` test observes an actual failed
+attempt write that the caller receives as an error; the capturing-subscriber test
+`one_query_creates_the_documented_span_tree_and_leaks_no_statement` observes the real
+phase order, parentage, fields, and absence of its statement literal; the span-tree
+guard parses the operations documentation and production macros; and
+`a_panicking_adapter_still_completes_the_audit_record_it_opened` and
+`a_dropped_request_completes_its_audit_record_too` observe the `abandoned` outcome.
+
+Deliberately left: OpenTelemetry metrics from `docs/operations.md` section 10.3;
+rmcp's deserialization framing (open question 25, deferred to M14's tool-signature
+work); and client cancellation reaching a running query (open question 23, also M14).
 
 ---
 
@@ -256,8 +283,8 @@ that the supposedly generic core was secretly shaped around MySQL.
 - [x] MCP over stdio exposes generic tools with annotations and output schemas
 - [x] Tool schemas do not vary by database and are snapshotted in CI
 - [x] DSNs never appear in tool responses
-- [ ] Raw SQL and parameters are disabled in logs and audits by default
-- [ ] Two-phase auditing uses fail-closed attempts
+- [x] Raw SQL and parameters are disabled in logs and audits by default
+- [x] Two-phase auditing uses fail-closed attempts
 - [x] SQLx errors are sanitized at the MCP boundary
 - [x] Integration tests use real containers
 - [x] MCP E2E tests exist
@@ -265,18 +292,8 @@ that the supposedly generic core was secretly shaped around MySQL.
 - [x] README documents secure deployment and the SPEC section 7 guarantee boundaries
 - [x] Security documentation states that database privileges are mandatory
 
-The two unticked boxes are both about a sink Milestone 13 owns, not about a control that
-is missing.
-
-"Raw SQL and parameters are disabled in logs and audits by default" is structurally true
-today: `warden_ports::AuditAttempt` has no field a statement or a bound parameter could
-occupy, and `src/audit.rs` emits none. It stays unticked because a claim about what an
-audit record does *not* contain is only reviewable against a record format, and Milestone
-13 owns the sink that has one.
-
-"Two-phase auditing uses fail-closed attempts" is ordered structurally — `warden-service`
-records the attempt before it acquires a permit or dispatches, and
-`crates/warden-service/tests/service_rules.rs` keeps that the only call path (ADR-0038).
-It stays unticked because `src/audit.rs` writes `tracing` events and a `tracing` macro
-returns unit: a sink that cannot fail cannot demonstrate failing closed. Milestone 13's
-persistent sink can.
+Both claims are now reviewable against the versioned audit-record format and its field
+allowlist, not only against structure. The persistent file sink also gives the attempt
+write a real failure mode: its `/dev/full` regression returns an error before dispatch,
+which demonstrates that a query is denied when its fail-closed attempt cannot be
+recorded.

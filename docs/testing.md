@@ -41,6 +41,10 @@ Milestone 13 adds these no-database observability rows through Task 8:
 | Span tree | a capturing subscriber proves phase order, parentage, levels, the field allowlist, and absence of the statement literal |
 | Span-tree guard | `tests/architecture.rs` parses every fenced `text` tree in `docs/operations.md` section 10.1 and production `*_span!` macros with `syn`, rather than comparing either side with a hard-coded name list |
 
+The milestone close also ties its two audit claims to behavior rather than prose: the
+record field allowlist has no raw-statement or parameter field, and the file sink's
+`/dev/full` regression surfaces a failed attempt write to the service before dispatch.
+
 ## 2. Policy
 
 Use synthetic `QueryAnalysis`. Test each policy separately **and** composed in the
@@ -223,7 +227,8 @@ that many simultaneous containers still exhaust Docker and host resources on a
 standard CI runner and produce spurious `PoolTimedOut` failures, not a defect in the
 tests themselves. This is host capacity, not test isolation, so the fix belongs in how
 the job invokes `cargo test`, not as a per-test workaround: the dedicated Docker job
-passes `--test-threads=4`, which removed the contention when measured.
+passes `--test-threads=4`, which removed the contention when measured. Run the local
+task with the same capacity contract: `RUST_TEST_THREADS=4 mise run test:docker`.
 
 The PostgreSQL deadline/cancellation tests do not compare the whole executor call with
 a query deadline. The call can legitimately continue through separately bounded

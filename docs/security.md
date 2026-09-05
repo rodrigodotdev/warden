@@ -679,7 +679,7 @@ isolated.
 
 - [ ] Review the threat model and complete the section 3 matrix
 - [ ] Document database privileges; example roles use least privilege
-- [ ] No DSNs in logs; no raw SQL or parameters by default
+- [x] No DSNs in logs; no raw SQL or parameters by default
 - [ ] Parser corpus includes adversarial SQL; fuzz both analyzers
 - [ ] Nested-write bypass tests exist
 - [ ] Function side-effect tests exist
@@ -694,7 +694,7 @@ isolated.
 - [x] Pool reuse after cancellation is tested
 - [x] Database-role write rejection is tested
 - [x] MCP error sanitization is tested
-- [ ] Fail-closed audit attempts are tested
+- [x] Fail-closed audit attempts are tested
 - [ ] HTTP authorization is tested before publishing remote-production guidance
 - [ ] `cargo deny check` is clean
 - [ ] No first-party `unsafe`
