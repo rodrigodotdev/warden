@@ -4,11 +4,14 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use proc_macro2::{TokenStream, TokenTree};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use syn::visit::Visit;
 
 /// Forbidden dependency-graph edges from `docs/architecture.md` section 3 and SPEC
 /// section 6, invariants 27–28.
@@ -43,6 +46,206 @@ const WEBPKI_ROOTS_LICENSE: &str =
     include_str!("../LICENSES/webpki-roots-1.0.9-CDLA-Permissive-2.0.txt");
 const WEBPKI_ROOTS_LICENSE_SHA256: &str =
     "e271993808fec50ab29350b39539cdec611a9103f827e0aa26d61da70e2d33f8";
+
+fn rust_source_files_at(directory: &Path, files: &mut Vec<PathBuf>) {
+    for entry in fs::read_dir(directory)
+        .unwrap_or_else(|error| panic!("could not read {}: {error}", directory.display()))
+    {
+        let entry = entry.unwrap_or_else(|error| panic!("could not read directory entry: {error}"));
+        let path = entry.path();
+        if path.is_dir() {
+            rust_source_files_at(&path, files);
+        } else if path.extension().is_some_and(|extension| extension == "rs") {
+            files.push(path);
+        }
+    }
+}
+
+fn workspace_source_files() -> Vec<PathBuf> {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+
+    rust_source_files_at(&root.join("src"), &mut files);
+    for entry in fs::read_dir(root.join("crates")).expect("could not read workspace crates") {
+        let path = entry.expect("could not read crate directory entry").path();
+        let source = path.join("src");
+        if source.is_dir() {
+            rust_source_files_at(&source, &mut files);
+        }
+    }
+
+    files.sort();
+    files
+}
+
+fn documented_span_names(operations: &str) -> BTreeSet<String> {
+    let section = operations
+        .split_once("### 10.1 Spans")
+        .expect("docs/operations.md has no section 10.1")
+        .1
+        .split("\n### ")
+        .next()
+        .expect("docs/operations.md section 10.1 has no body");
+    let mut in_text_block = false;
+    let mut names = BTreeSet::new();
+
+    for line in section.lines() {
+        match line.trim() {
+            "```text" => in_text_block = true,
+            "```" if in_text_block => in_text_block = false,
+            line if in_text_block => {
+                if let Some(name) = line.split_whitespace().last()
+                    && name.contains('.')
+                    && name.chars().all(|character| {
+                        character.is_ascii_lowercase()
+                            || character.is_ascii_digit()
+                            || character == '_'
+                            || character == '.'
+                    })
+                {
+                    names.insert(name.to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    names
+}
+
+fn cfg_requires_test(meta: &syn::Meta) -> bool {
+    match meta {
+        syn::Meta::Path(path) => path.is_ident("test"),
+        syn::Meta::List(list) if list.path.is_ident("all") => list
+            .parse_args_with(
+                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+            )
+            .is_ok_and(|conditions| conditions.iter().any(cfg_requires_test)),
+        syn::Meta::List(list) if list.path.is_ident("any") => list
+            .parse_args_with(
+                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+            )
+            .is_ok_and(|conditions| {
+                !conditions.is_empty() && conditions.iter().all(cfg_requires_test)
+            }),
+        syn::Meta::List(_) | syn::Meta::NameValue(_) => false,
+    }
+}
+
+fn is_cfg_test(attributes: &[syn::Attribute]) -> bool {
+    attributes.iter().any(|attribute| {
+        attribute.path().is_ident("cfg")
+            && attribute
+                .parse_args::<syn::Meta>()
+                .is_ok_and(|meta| cfg_requires_test(&meta))
+    })
+}
+
+fn module_directory(source: &Path) -> PathBuf {
+    let parent = source.parent().expect("Rust source file has no parent");
+    match source.file_stem().and_then(|stem| stem.to_str()) {
+        Some("lib" | "main" | "mod") => parent.to_owned(),
+        Some(stem) => parent.join(stem),
+        None => panic!("Rust source file has no UTF-8 stem: {}", source.display()),
+    }
+}
+
+fn cfg_test_module_roots(items: &[syn::Item], directory: &Path, roots: &mut Vec<PathBuf>) {
+    for item in items {
+        let syn::Item::Mod(module) = item else {
+            continue;
+        };
+        let module_path = directory.join(module.ident.to_string());
+        if is_cfg_test(&module.attrs) {
+            if module.content.is_none() {
+                roots.push(module_path.with_extension("rs"));
+                roots.push(module_path);
+            }
+            continue;
+        }
+        if let Some((_brace, items)) = &module.content {
+            cfg_test_module_roots(items, &module_path, roots);
+        }
+    }
+}
+
+fn first_string_literal(tokens: TokenStream) -> Option<String> {
+    for token in tokens {
+        match token {
+            TokenTree::Group(group) => {
+                if let Some(literal) = first_string_literal(group.stream()) {
+                    return Some(literal);
+                }
+            }
+            TokenTree::Literal(literal) => {
+                if let Ok(literal) = syn::parse_str::<syn::LitStr>(&literal.to_string()) {
+                    return Some(literal.value());
+                }
+            }
+            TokenTree::Ident(_) | TokenTree::Punct(_) => {}
+        }
+    }
+    None
+}
+
+#[derive(Default)]
+struct SpanNameVisitor {
+    names: BTreeSet<String>,
+}
+
+impl<'ast> Visit<'ast> for SpanNameVisitor {
+    fn visit_item_mod(&mut self, module: &'ast syn::ItemMod) {
+        if is_cfg_test(&module.attrs) {
+            return;
+        }
+        syn::visit::visit_item_mod(self, module);
+    }
+
+    fn visit_macro(&mut self, node: &'ast syn::Macro) {
+        let is_span = node.path.segments.last().is_some_and(|segment| {
+            matches!(
+                segment.ident.to_string().as_str(),
+                "info_span" | "debug_span" | "trace_span" | "warn_span" | "error_span"
+            )
+        });
+        if is_span && let Some(name) = first_string_literal(node.tokens.clone()) {
+            self.names.insert(name);
+        }
+        syn::visit::visit_macro(self, node);
+    }
+}
+
+fn created_span_names(paths: &[PathBuf]) -> BTreeSet<String> {
+    let sources: Vec<_> = paths
+        .iter()
+        .map(|path| {
+            let source = fs::read_to_string(path)
+                .unwrap_or_else(|error| panic!("could not read {}: {error}", path.display()));
+            let syntax = syn::parse_file(&source)
+                .unwrap_or_else(|error| panic!("could not parse {}: {error}", path.display()));
+            (path, syntax)
+        })
+        .collect();
+    let mut test_module_roots = Vec::new();
+    for (path, syntax) in &sources {
+        cfg_test_module_roots(
+            &syntax.items,
+            &module_directory(path),
+            &mut test_module_roots,
+        );
+    }
+
+    let mut visitor = SpanNameVisitor::default();
+    for (path, syntax) in sources {
+        let is_test_module = test_module_roots
+            .iter()
+            .any(|root| path == root || path.starts_with(root));
+        if !is_test_module {
+            visitor.visit_file(&syntax);
+        }
+    }
+    visitor.names
+}
 
 /// The notice CDLA-Permissive-2.0 requires a redistribution to carry.
 const REQUIRED_NOTICE: &str = "LICENSES/webpki-roots-1.0.9-CDLA-Permissive-2.0.txt";
@@ -621,4 +824,41 @@ fn docker_copy_parser_rejects_a_notice_copied_only_into_a_builder_stage() {
         "COPY --from=builder /app/warden /usr/local/bin/warden\n",
     );
     assert!(!dockerfile_copies_licenses(fixture));
+}
+
+/// Span names Warden creates, read out of the workspace's own source.
+///
+/// `docs/operations.md` section 10.1 is the tree an operator reads, and a tree that
+/// drifts from the code is worse than no tree: it sends someone hunting for a span
+/// that no longer exists. This parses both and compares them (ADR-0044).
+#[test]
+fn the_documented_span_tree_is_the_one_the_workspace_creates() {
+    let documented = documented_span_names(&fs::read_to_string("docs/operations.md").unwrap());
+    let created = created_span_names(&workspace_source_files());
+    assert_eq!(created, documented);
+}
+
+#[test]
+fn span_source_parser_ignores_test_only_modules() {
+    let syntax = syn::parse_file(
+        r#"
+        fn production() {
+            tracing::debug_span!("production.phase");
+        }
+
+        #[cfg(test)]
+        mod tests {
+            fn helper() {
+                tracing::debug_span!("test.helper");
+            }
+        }
+        "#,
+    )
+    .unwrap();
+    let mut visitor = SpanNameVisitor::default();
+    visitor.visit_file(&syntax);
+    assert_eq!(
+        visitor.names,
+        BTreeSet::from(["production.phase".to_owned()])
+    );
 }

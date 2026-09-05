@@ -21,6 +21,7 @@ use sqlx::Connection as _;
 use sqlx::pool::PoolConnection;
 use tokio::time::{Instant, timeout_at};
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument as _;
 use warden_core::result::{ResultBuilder, ResultSet, RowOutcome};
 use warden_policy::AuthorizedQuery;
 use warden_ports::error::ExecuteError;
@@ -163,43 +164,52 @@ impl PostgreSqlQueryExecutor {
         cancel: &CancellationToken,
     ) -> Result<ResultSet, ExecuteError> {
         let started = std::time::Instant::now();
+        let parent_span = tracing::Span::current();
 
         // Keep the pool connection so the named statement required for custom type
         // metadata can be removed before this exact connection returns to the pool.
         let connection = guarded(deadline, cancel, self.pools.agent().acquire()).await?;
         let mut connection = RetiringConnection::new(connection);
-        let mut transaction = guarded(
-            deadline,
-            cancel,
-            connection.begin_with(READ_ONLY_TRANSACTION),
-        )
-        .await?;
+        let (mut transaction, backend_pid) = async {
+            let mut transaction = guarded(
+                deadline,
+                cancel,
+                connection.begin_with(READ_ONLY_TRANSACTION),
+            )
+            .await?;
 
-        // `set_config(..., true)` is SET LOCAL in its parameterizable form. It can
-        // only tighten the per-connection server-side deadline.
-        let timeout = query
-            .limits()
-            .server_timeout()
-            .min(self.pools.statement_timeout());
-        guarded(
-            deadline,
-            cancel,
-            agent_query("SELECT set_config('statement_timeout', $1, true)")
-                .bind(options::millis(timeout))
-                .execute(&mut *transaction),
-        )
-        .await?;
+            // `set_config(..., true)` is SET LOCAL in its parameterizable form. It can
+            // only tighten the per-connection server-side deadline.
+            let timeout = query
+                .limits()
+                .server_timeout()
+                .min(self.pools.statement_timeout());
+            guarded(
+                deadline,
+                cancel,
+                agent_query("SELECT set_config('statement_timeout', $1, true)")
+                    .bind(options::millis(timeout))
+                    .execute(&mut *transaction),
+            )
+            .await?;
 
-        // A busy backend cannot identify itself during cancellation, so capture its
-        // id before the agent statement begins.
-        let row = guarded(
-            deadline,
-            cancel,
-            agent_query("SELECT pg_backend_pid()").fetch_one(&mut *transaction),
-        )
+            // A busy backend cannot identify itself during cancellation, so capture its
+            // id before the agent statement begins.
+            let row = guarded(
+                deadline,
+                cancel,
+                agent_query("SELECT pg_backend_pid()").fetch_one(&mut *transaction),
+            )
+            .await?;
+            let backend_pid: i32 =
+                sqlx::Row::try_get(&row, 0).map_err(|error| execute_error(&error))?;
+            Ok::<_, ExecuteError>((transaction, backend_pid))
+        }
+        .instrument(tracing::debug_span!(
+            parent: &parent_span,
+            "db.transaction.begin_read_only"
+        ))
         .await?;
-        let backend_pid: i32 =
-            sqlx::Row::try_get(&row, 0).map_err(|error| execute_error(&error))?;
 
         let outcome = collect(&mut transaction, query, deadline, cancel, started).await;
 
@@ -268,28 +278,38 @@ async fn collect(
     started: std::time::Instant,
 ) -> Result<ResultSet, ExecuteError> {
     let limits = query.limits();
+    let parent_span = tracing::Span::current();
+    let db_execute = tracing::debug_span!(parent: &parent_span, "db.execute");
     let mut rows = bind::statement(query.sql(), query.parameters()).fetch(&mut **transaction);
     let mut builder: Option<ResultBuilder> = None;
 
-    loop {
-        // Each fetch goes through the same guard as the statements before it, so an
-        // expired deadline stops the next row rather than being outrun by one the
-        // driver had already buffered.
-        let row = match guarded(deadline, cancel, rows.try_next()).await? {
-            Some(row) => row,
-            None => break,
-        };
+    async {
+        loop {
+            // Each fetch goes through the same guard as the statements before it, so an
+            // expired deadline stops the next row rather than being outrun by one the
+            // driver had already buffered.
+            let row = match guarded(deadline, cancel, rows.try_next())
+                .instrument(db_execute.clone())
+                .await?
+            {
+                Some(row) => row,
+                None => break,
+            };
 
-        let builder =
-            builder.get_or_insert_with(|| ResultBuilder::new(normalize::columns(&row), limits));
-        if builder.admit_row() == RowOutcome::Truncated {
-            break;
+            let builder =
+                builder.get_or_insert_with(|| ResultBuilder::new(normalize::columns(&row), limits));
+            if builder.admit_row() == RowOutcome::Truncated {
+                break;
+            }
+            let values = normalize::row(&row, builder.columns(), limits.max_value_bytes)?;
+            if builder.push_row(values)? == RowOutcome::Truncated {
+                break;
+            }
         }
-        let values = normalize::row(&row, builder.columns(), limits.max_value_bytes)?;
-        if builder.push_row(values)? == RowOutcome::Truncated {
-            break;
-        }
+        Ok::<(), ExecuteError>(())
     }
+    .instrument(tracing::debug_span!(parent: &parent_span, "result.normalize"))
+    .await?;
 
     let result = builder
         .unwrap_or_else(|| ResultBuilder::new(Vec::new(), limits))

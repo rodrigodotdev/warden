@@ -37,6 +37,9 @@ tokio-util = { workspace = true }
 # `TryStreamExt::try_next` is how a result is consumed one row at a time, which
 # docs/operations.md section 6.6 requires.
 futures-util = { workspace = true }
+# docs/operations.md section 10.1: adapters emit fieldless database phase spans;
+# they never attach SQL, bound values, row values, or driver messages.
+tracing = { workspace = true }
 sqlparser = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }

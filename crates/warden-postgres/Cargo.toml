@@ -45,6 +45,9 @@ tokio-util = { workspace = true }
 # `Query::fetch` returns a `BoxStream` and sqlx re-exports no way to advance one.
 # `TryStreamExt::try_next` consumes results one row at a time.
 futures-util = { workspace = true }
+# docs/operations.md section 10.1: adapters emit fieldless database phase spans;
+# they never attach SQL, bound values, row values, or driver messages.
+tracing = { workspace = true }
 sqlparser = { workspace = true }
 sha2 = { workspace = true }
 thiserror = { workspace = true }

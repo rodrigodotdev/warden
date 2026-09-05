@@ -16,6 +16,7 @@ use sqlx::AssertSqlSafe;
 use sqlx::mysql::MySqlDatabaseError;
 use tokio::time::{Instant, timeout_at};
 use tokio_util::sync::CancellationToken;
+use tracing::Instrument as _;
 use warden_core::result::{ResultBuilder, ResultSet, RowOutcome};
 use warden_policy::AuthorizedQuery;
 use warden_ports::error::ExecuteError;
@@ -95,22 +96,31 @@ impl MySqlQueryExecutor {
         cancel: &CancellationToken,
     ) -> Result<ResultSet, ExecuteError> {
         let started = std::time::Instant::now();
+        let parent_span = tracing::Span::current();
 
-        let mut transaction = guarded(
-            deadline,
-            cancel,
-            self.pools.agent().begin_with(READ_ONLY_TRANSACTION),
-        )
-        .await?;
+        let (mut transaction, connection_id) = async {
+            let mut transaction = guarded(
+                deadline,
+                cancel,
+                self.pools.agent().begin_with(READ_ONLY_TRANSACTION),
+            )
+            .await?;
 
-        // One extra round trip, accepted deliberately: a cancellation cannot ask a
-        // busy connection for its own id, so the id has to be known before the agent
-        // statement starts (`docs/operations.md` section 5.4).
-        let connection_id: u64 = guarded(
-            deadline,
-            cancel,
-            sqlx::query_scalar("SELECT CONNECTION_ID()").fetch_one(&mut *transaction),
-        )
+            // One extra round trip, accepted deliberately: a cancellation cannot ask a
+            // busy connection for its own id, so the id has to be known before the agent
+            // statement starts (`docs/operations.md` section 5.4).
+            let connection_id: u64 = guarded(
+                deadline,
+                cancel,
+                sqlx::query_scalar("SELECT CONNECTION_ID()").fetch_one(&mut *transaction),
+            )
+            .await?;
+            Ok::<_, ExecuteError>((transaction, connection_id))
+        }
+        .instrument(tracing::debug_span!(
+            parent: &parent_span,
+            "db.transaction.begin_read_only"
+        ))
         .await?;
 
         let outcome = collect(&mut transaction, query, deadline, cancel, started).await;
@@ -220,35 +230,45 @@ async fn collect(
     started: std::time::Instant,
 ) -> Result<ResultSet, ExecuteError> {
     let limits = query.limits();
+    let parent_span = tracing::Span::current();
+    let db_execute = tracing::debug_span!(parent: &parent_span, "db.execute");
     let mut rows = bind::statement(query.sql(), query.parameters()).fetch(&mut **transaction);
     let mut builder: Option<ResultBuilder> = None;
 
-    loop {
-        // Each fetch goes through the same guard as the statements before it, so an
-        // expired deadline stops the next row rather than being outrun by one the
-        // driver had already buffered.
-        let row = match guarded(deadline, cancel, rows.try_next()).await? {
-            Some(row) => row,
-            None => break,
-        };
+    async {
+        loop {
+            // Each fetch goes through the same guard as the statements before it, so an
+            // expired deadline stops the next row rather than being outrun by one the
+            // driver had already buffered.
+            let row = match guarded(deadline, cancel, rows.try_next())
+                .instrument(db_execute.clone())
+                .await?
+            {
+                Some(row) => row,
+                None => break,
+            };
 
-        // Column metadata comes from the first row: the driver exposes it nowhere
-        // else, and the alternative — preparing the statement separately — would
-        // prepare it twice on a pool whose statement cache is disabled and leak the
-        // first (`docs/operations.md` section 4).
-        let builder =
-            builder.get_or_insert_with(|| ResultBuilder::new(normalize::columns(&row), limits));
-        // The `max_rows + 1`-th row exists only to prove truncation. Refuse it
-        // before normalization so an oversized or otherwise invalid sentinel cannot
-        // replace an already valid bounded result with an error.
-        if builder.admit_row() == RowOutcome::Truncated {
-            break;
+            // Column metadata comes from the first row: the driver exposes it nowhere
+            // else, and the alternative — preparing the statement separately — would
+            // prepare it twice on a pool whose statement cache is disabled and leak the
+            // first (`docs/operations.md` section 4).
+            let builder =
+                builder.get_or_insert_with(|| ResultBuilder::new(normalize::columns(&row), limits));
+            // The `max_rows + 1`-th row exists only to prove truncation. Refuse it
+            // before normalization so an oversized or otherwise invalid sentinel cannot
+            // replace an already valid bounded result with an error.
+            if builder.admit_row() == RowOutcome::Truncated {
+                break;
+            }
+            let values = normalize::row(&row, builder.columns(), limits.max_value_bytes)?;
+            if builder.push_row(values)? == RowOutcome::Truncated {
+                break;
+            }
         }
-        let values = normalize::row(&row, builder.columns(), limits.max_value_bytes)?;
-        if builder.push_row(values)? == RowOutcome::Truncated {
-            break;
-        }
+        Ok::<(), ExecuteError>(())
     }
+    .instrument(tracing::debug_span!(parent: &parent_span, "result.normalize"))
+    .await?;
 
     // A result with no rows has no columns, because the driver never sent any.
     // Nothing is invented (`docs/architecture.md` section 11).
