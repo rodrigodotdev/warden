@@ -251,84 +251,72 @@ enum SourceReachability {
     TestOnly,
 }
 
-fn visit_reachable_items(
-    items: &[syn::Item],
-    directory: &Path,
-    reachability: SourceReachability,
-    sources: &BTreeMap<PathBuf, syn::File>,
-    visited: &mut BTreeSet<(PathBuf, PathBuf, SourceReachability)>,
-    active: &mut BTreeSet<(PathBuf, SourceReachability)>,
-    production_sources: &mut BTreeSet<PathBuf>,
-) {
-    for item in items {
-        let syn::Item::Mod(module) = item else {
-            continue;
-        };
-        let child_reachability =
-            if reachability == SourceReachability::TestOnly || is_cfg_test(&module.attrs) {
-                SourceReachability::TestOnly
-            } else {
-                SourceReachability::Production
+/// An edge on the current depth-first path. Repeating one would recurse forever;
+/// other edges from the re-entered source still need traversal.
+type ActiveModuleEdge = (PathBuf, String, PathBuf, SourceReachability);
+
+struct SourceTraversal<'a> {
+    sources: &'a BTreeMap<PathBuf, syn::File>,
+    visited: BTreeSet<(PathBuf, PathBuf, SourceReachability)>,
+    active_edges: BTreeSet<ActiveModuleEdge>,
+    production_sources: BTreeSet<PathBuf>,
+}
+
+impl SourceTraversal<'_> {
+    fn visit_items(
+        &mut self,
+        items: &[syn::Item],
+        current_source: &Path,
+        directory: &Path,
+        reachability: SourceReachability,
+    ) {
+        for item in items {
+            let syn::Item::Mod(module) = item else {
+                continue;
             };
-        if let Some((_brace, items)) = &module.content {
-            visit_reachable_items(
-                items,
-                &inline_module_directory(module, directory),
-                child_reachability,
-                sources,
-                visited,
-                active,
-                production_sources,
-            );
-        } else {
-            for source in module_sources(module, directory, sources) {
-                visit_reachable_source(
-                    &source,
-                    &directory.join(module.ident.to_string()),
+            let child_reachability =
+                if reachability == SourceReachability::TestOnly || is_cfg_test(&module.attrs) {
+                    SourceReachability::TestOnly
+                } else {
+                    SourceReachability::Production
+                };
+            if let Some((_brace, items)) = &module.content {
+                self.visit_items(
+                    items,
+                    current_source,
+                    &inline_module_directory(module, directory),
                     child_reachability,
-                    sources,
-                    visited,
-                    active,
-                    production_sources,
                 );
+            } else {
+                for source in module_sources(module, directory, self.sources) {
+                    let edge = (
+                        current_source.to_owned(),
+                        module.ident.to_string(),
+                        source.clone(),
+                        child_reachability,
+                    );
+                    if self.active_edges.insert(edge.clone()) {
+                        self.visit_source(&source, &module_directory(&source), child_reachability);
+                        self.active_edges.remove(&edge);
+                    }
+                }
             }
         }
     }
-}
 
-fn visit_reachable_source(
-    source: &Path,
-    directory: &Path,
-    reachability: SourceReachability,
-    sources: &BTreeMap<PathBuf, syn::File>,
-    visited: &mut BTreeSet<(PathBuf, PathBuf, SourceReachability)>,
-    active: &mut BTreeSet<(PathBuf, SourceReachability)>,
-    production_sources: &mut BTreeSet<PathBuf>,
-) {
-    let Some(syntax) = sources.get(source) else {
-        return;
-    };
-    let visit = (source.to_owned(), directory.to_owned(), reachability);
-    if !visited.insert(visit) {
-        return;
+    fn visit_source(&mut self, source: &Path, directory: &Path, reachability: SourceReachability) {
+        let Some(items) = self.sources.get(source).map(|syntax| syntax.items.clone()) else {
+            return;
+        };
+        let visit = (source.to_owned(), directory.to_owned(), reachability);
+        if !self.visited.insert(visit) {
+            return;
+        }
+        if reachability == SourceReachability::Production {
+            self.production_sources.insert(source.to_owned());
+        }
+        self.visit_items(&items, source, directory, reachability);
     }
-    if reachability == SourceReachability::Production {
-        production_sources.insert(source.to_owned());
-    }
-    let active_visit = (source.to_owned(), reachability);
-    if !active.insert(active_visit.clone()) {
-        return;
-    }
-    visit_reachable_items(
-        &syntax.items,
-        directory,
-        reachability,
-        sources,
-        visited,
-        active,
-        production_sources,
-    );
-    active.remove(&active_visit);
 }
 
 fn next_is_metadata(input: ParseStream<'_>, expected: &str) -> bool {
@@ -434,25 +422,24 @@ fn created_span_names(paths: &[PathBuf]) -> BTreeSet<String> {
         })
         .cloned()
         .collect();
-    let mut visited = BTreeSet::new();
-    let mut active = BTreeSet::new();
-    let mut production_sources = BTreeSet::new();
+    let mut traversal = SourceTraversal {
+        sources: &sources,
+        visited: BTreeSet::new(),
+        active_edges: BTreeSet::new(),
+        production_sources: BTreeSet::new(),
+    };
     for root in roots {
-        visit_reachable_source(
+        traversal.visit_source(
             &root,
             &module_directory(&root),
             SourceReachability::Production,
-            &sources,
-            &mut visited,
-            &mut active,
-            &mut production_sources,
         );
     }
 
     let mut visitor = SpanNameVisitor::default();
-    for (path, syntax) in sources {
-        if production_sources.contains(&path) {
-            visitor.visit_file(&syntax);
+    for (path, syntax) in &sources {
+        if traversal.production_sources.contains(path) {
+            visitor.visit_file(syntax);
         }
     }
     visitor.names
@@ -1215,6 +1202,55 @@ fn span_source_discovery_skips_test_only_path_aliases() {
     assert_eq!(
         created_span_names(&fixture.source_files()),
         BTreeSet::from(["production.root".to_owned()])
+    );
+}
+
+#[test]
+fn span_source_discovery_follows_out_of_line_path_module_children() {
+    let fixture = SourceFixture::new();
+    fixture.write(
+        "lib.rs",
+        r#"
+        #[path = "custom/parent.rs"]
+        mod parent;
+        "#,
+    );
+    fixture.write("custom/parent.rs", "mod child;");
+    fixture.write(
+        "custom/parent/child.rs",
+        r#"fn production() { tracing::info_span!("production.path.child"); }"#,
+    );
+
+    assert_eq!(
+        created_span_names(&fixture.source_files()),
+        BTreeSet::from(["production.path.child".to_owned()])
+    );
+}
+
+#[test]
+fn span_source_discovery_follows_nested_sources_beside_alias_cycles() {
+    let fixture = SourceFixture::new();
+    let source = fixture.root.join("shared.rs");
+    let source = source.to_string_lossy();
+    fixture.write("lib.rs", &format!(r#"#[path = "{source}"] mod first;"#));
+    fixture.write(
+        "shared.rs",
+        &format!(
+            r#"
+            #[path = "{source}"]
+            mod second;
+            mod child;
+            "#
+        ),
+    );
+    fixture.write(
+        "shared/child.rs",
+        r#"fn production() { tracing::debug_span!("production.cycle.child"); }"#,
+    );
+
+    assert_eq!(
+        created_span_names(&fixture.source_files()),
+        BTreeSet::from(["production.cycle.child".to_owned()])
     );
 }
 
