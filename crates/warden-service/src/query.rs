@@ -106,6 +106,7 @@ impl QueryService {
             request_id = %context.request_id(),
             connection = %request.connection(),
         );
+        let outcome_parent = span.clone();
         async move {
             let runtime = {
                 let _entered = tracing::debug_span!("connection.resolve").entered();
@@ -204,7 +205,8 @@ impl QueryService {
                 }
             };
 
-            let guard = audit::OutcomeGuard::arm(Arc::clone(&self.audit), attempt.id);
+            let guard =
+                audit::OutcomeGuard::arm(Arc::clone(&self.audit), attempt.id, outcome_parent);
             let queue_wait = gate.queue_wait();
             match gate.execute().await {
                 Ok(mut result) => {

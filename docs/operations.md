@@ -851,10 +851,13 @@ mcp.tool.list_connections
 ```
 
 Tool and service roots are `info`; phase children are `debug`. The shipped
-`warn,warden=info` filter therefore records one span per request by default, and an
-operator opts into the phase tree when diagnosing a request. The other service
-roots use the same phase names shown in the canonical query tree whenever they
-traverse the same phase.
+`warn,warden=info` filter therefore records one root per participating layer: two
+for each database-backed tool and one for `list_connections`. An operator opts into
+the phase tree when diagnosing a request. Phase children are operation-dependent
+subsets: the other service roots use the same names shown in the canonical query
+tree whenever they traverse that phase, and omit phases they do not perform. In
+particular, `search_schema` does not emit `result.redact`, because relation names
+are returned without a redaction pass.
 
 Span fields are restricted to the audit record's identity fields: `request_id`,
 `principal_id`, `client`, `connection`, `dialect`, `environment`, and `operation`.

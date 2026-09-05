@@ -21,7 +21,9 @@ use proc_macro2::{Ident, TokenStream, TokenTree};
 use syn::visit::Visit;
 use tokio_util::sync::CancellationToken;
 use tracing::field::{Field, Visit as FieldVisit};
+use tracing::instrument::WithSubscriber as _;
 use tracing::span::{self, Id};
+use tracing::subscriber::Interest;
 use tracing::{Event, Level, Metadata, Subscriber};
 use warden_core::analysis::{QueryAnalysis, QueryAnalysisParts, StatementKind};
 use warden_core::connection::Capabilities;
@@ -645,9 +647,9 @@ impl QueryExecutor for TestExecutor {
 }
 
 #[derive(Debug)]
-struct UnusedPorts;
+struct TestPorts;
 
-impl Explainer for UnusedPorts {
+impl Explainer for TestPorts {
     fn explain<'a>(
         &'a self,
         _query: &'a AuthorizedQuery,
@@ -663,7 +665,7 @@ impl Explainer for UnusedPorts {
     }
 }
 
-impl SchemaInspector for UnusedPorts {
+impl SchemaInspector for TestPorts {
     fn search_schema<'a>(
         &'a self,
         _request: &'a SchemaSearchRequest,
@@ -672,8 +674,9 @@ impl SchemaInspector for UnusedPorts {
         _cancel: CancellationToken,
     ) -> BoxFuture<'a, Result<SchemaSearchResult, SchemaError>> {
         Box::pin(async {
-            Err(SchemaError::Database {
-                detail: "unused test port".to_owned(),
+            Ok(SchemaSearchResult {
+                matches: Vec::new(),
+                truncated: false,
             })
         })
     }
@@ -690,6 +693,21 @@ impl SchemaInspector for UnusedPorts {
                 detail: "unused test port".to_owned(),
             })
         })
+    }
+}
+
+#[derive(Debug)]
+struct PendingExecutor;
+
+impl QueryExecutor for PendingExecutor {
+    fn execute_read_only<'a>(
+        &'a self,
+        _query: &'a AuthorizedQuery,
+        _permit: &'a QueryPermit,
+        _deadline: tokio::time::Instant,
+        _cancel: CancellationToken,
+    ) -> BoxFuture<'a, Result<ResultSet, ExecuteError>> {
+        Box::pin(std::future::pending())
     }
 }
 
@@ -716,6 +734,10 @@ struct CapturingSubscriber {
 }
 
 impl Subscriber for CapturingSubscriber {
+    fn register_callsite(&self, _metadata: &'static Metadata<'static>) -> Interest {
+        Interest::sometimes()
+    }
+
     fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
         true
     }
@@ -814,21 +836,24 @@ impl FieldVisit for SpanFieldVisitor {
 #[derive(Debug)]
 struct SpanCapture {
     state: Arc<Mutex<CaptureState>>,
-    _guard: tracing::subscriber::DefaultGuard,
+    dispatch: tracing::Dispatch,
 }
 
 impl SpanCapture {
-    fn install() -> Self {
+    fn new() -> Self {
         let state = Arc::new(Mutex::new(CaptureState::default()));
         let subscriber = CapturingSubscriber {
             state: Arc::clone(&state),
             next_id: Arc::new(AtomicU64::new(1)),
         };
-        let guard = tracing::subscriber::set_default(subscriber);
         Self {
             state,
-            _guard: guard,
+            dispatch: tracing::Dispatch::new(subscriber),
         }
+    }
+
+    fn dispatch(&self) -> tracing::Dispatch {
+        self.dispatch.clone()
     }
 
     fn span_tree(&self) -> Vec<(&'static str, Option<&'static str>, Level)> {
@@ -913,7 +938,11 @@ fn request(sql: &str) -> QueryRequest {
 }
 
 fn services_with_fakes() -> Services {
-    let unused = Arc::new(UnusedPorts);
+    services_with_executor(Arc::new(TestExecutor))
+}
+
+fn services_with_executor(executor: Arc<dyn QueryExecutor>) -> Services {
+    let ports = Arc::new(TestPorts);
     let runtime = Arc::new(
         ConnectionRuntime::new(ConnectionRuntimeParts {
             metadata: metadata("primary"),
@@ -925,9 +954,9 @@ fn services_with_fakes() -> Services {
             },
             limits: ExecutionLimits::default(),
             analyzer: Arc::new(TestAnalyzer),
-            executor: Arc::new(TestExecutor),
-            inspector: Arc::clone(&unused) as Arc<dyn SchemaInspector>,
-            explainer: unused,
+            executor,
+            inspector: Arc::clone(&ports) as Arc<dyn SchemaInspector>,
+            explainer: ports,
         })
         .unwrap(),
     );
@@ -943,7 +972,7 @@ fn services_with_fakes() -> Services {
 
 #[tokio::test]
 async fn one_query_creates_the_documented_span_tree_and_leaks_no_statement() {
-    let capture = SpanCapture::install();
+    let capture = SpanCapture::new();
     let services = services_with_fakes();
     services
         .query()
@@ -951,6 +980,7 @@ async fn one_query_creates_the_documented_span_tree_and_leaks_no_statement() {
             &context(),
             request("SELECT token FROM t WHERE k = 'hunter2'"),
         )
+        .with_subscriber(capture.dispatch())
         .await
         .unwrap();
 
@@ -974,6 +1004,57 @@ async fn one_query_creates_the_documented_span_tree_and_leaks_no_statement() {
     for field in capture.all_field_names() {
         assert!(!FORBIDDEN_SPAN_FIELDS.contains(&field.as_str()), "{field}");
     }
+}
+
+#[tokio::test]
+async fn schema_search_emits_only_phases_it_actually_performs() {
+    let capture = SpanCapture::new();
+    let services = services_with_fakes();
+    let search = SchemaSearchRequest::new("primary".parse().unwrap(), "orders", 10).unwrap();
+
+    services
+        .schema()
+        .search(&context(), search)
+        .with_subscriber(capture.dispatch())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        capture.span_tree(),
+        [
+            ("warden.search_schema", None, Level::INFO),
+            ("audit.attempt", Some("warden.search_schema"), Level::DEBUG,),
+            ("audit.outcome", Some("warden.search_schema"), Level::DEBUG,),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn a_dropped_query_parents_detached_audit_outcome_to_service_root() {
+    let capture = SpanCapture::new();
+    let services = services_with_executor(Arc::new(PendingExecutor));
+    let context = context();
+    let mut execution = Box::pin(
+        services
+            .query()
+            .execute(&context, request("SELECT token FROM t WHERE k = 'hunter2'"))
+            .with_subscriber(capture.dispatch()),
+    );
+    tokio::select! {
+        result = &mut execution => panic!("query completed early: {result:?}"),
+        () = tokio::task::yield_now() => {}
+    }
+    drop(execution);
+    tokio::task::yield_now().await;
+
+    let outcome = capture
+        .span_tree()
+        .into_iter()
+        .find(|(name, _, _)| *name == "audit.outcome");
+    assert_eq!(
+        outcome,
+        Some(("audit.outcome", Some("warden.query"), Level::DEBUG,))
+    );
 }
 
 #[test]

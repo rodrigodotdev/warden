@@ -139,11 +139,7 @@ impl SchemaService {
                 .search_schema(&request, filter, deadline, self.shutdown.child_token())
                 .await;
             self.complete(&attempt, started, &found).await;
-            let found = {
-                let _entered = tracing::debug_span!("result.redact").entered();
-                found?
-            };
-            Ok(found)
+            Ok(found?)
         }
         .instrument(span)
         .await

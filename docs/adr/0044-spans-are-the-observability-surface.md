@@ -13,8 +13,10 @@ not an open design question.
 
 The names in section 10.1's tree are the span names. Each MCP tool call and its
 service call have root spans at `info`; phase spans are at `debug`. The shipped
-`warn,warden=info` filter therefore records one span per request by default, while
-an operator can opt into the complete diagnostic tree.
+`warn,warden=info` filter therefore records one root per participating layer: two
+for a database-backed tool and one for `list_connections`. An operator can opt into
+the operation-dependent phase tree. Shared phases reuse the canonical names, and a
+tool emits only the subset it actually performs.
 
 Span fields are restricted to the audit record's identity fields: `request_id`,
 `principal_id`, `client`, `connection`, `dialect`, `environment`, and `operation`.

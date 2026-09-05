@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use tokio::time::timeout;
 use tracing::Instrument as _;
+use tracing::instrument::WithSubscriber as _;
 use warden_core::analysis::StatementKind;
 use warden_core::connection::ConnectionMetadata;
 use warden_core::context::RequestContext;
@@ -133,6 +134,10 @@ pub(crate) async fn record_outcome(sink: &dyn AuditSink, event: AuditOutcomeEven
 pub(crate) struct OutcomeGuard {
     sink: Arc<dyn AuditSink>,
     pending: Option<AuditEventId>,
+    /// The service root that owns this attempt, retained for a detached outcome.
+    parent: tracing::Span,
+    /// The dispatcher that created `parent`, because spawned tasks do not inherit it.
+    dispatch: tracing::Dispatch,
 }
 
 /// Prints only the pending attempt id.
@@ -148,11 +153,17 @@ impl fmt::Debug for OutcomeGuard {
 }
 
 impl OutcomeGuard {
-    /// Arms the guard for an attempt that is already on record.
-    pub(crate) fn arm(sink: Arc<dyn AuditSink>, attempt_id: AuditEventId) -> Self {
+    /// Arms the guard for an attempt that is already on record under `parent`.
+    pub(crate) fn arm(
+        sink: Arc<dyn AuditSink>,
+        attempt_id: AuditEventId,
+        parent: tracing::Span,
+    ) -> Self {
         Self {
             sink,
             pending: Some(attempt_id),
+            parent,
+            dispatch: tracing::dispatcher::get_default(Clone::clone),
         }
     }
 
@@ -186,14 +197,21 @@ impl Drop for OutcomeGuard {
             result_bytes: None,
             error_code: Some(PublicErrorCode::InternalError),
         };
-        // `Drop` cannot await, so the durable write is detached. It is bounded by
-        // `AUDIT_WRITE_TIMEOUT` like every other write, and there is no runtime to
-        // spawn on when a request is dropped during shutdown — the alarm above is
-        // what covers that case.
+        // `Drop` cannot await, so the durable write is detached. The future carries
+        // both the owning service span and its dispatcher because Tokio tasks inherit
+        // neither. It is bounded by `AUDIT_WRITE_TIMEOUT` like every other write, and
+        // there is no runtime to spawn on when a request is dropped during shutdown —
+        // the alarm above is what covers that case.
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 let sink = Arc::clone(&self.sink);
-                handle.spawn(async move { record_outcome(sink.as_ref(), event).await });
+                let parent = self.parent.clone();
+                let dispatch = self.dispatch.clone();
+                handle.spawn(
+                    async move { record_outcome(sink.as_ref(), event).await }
+                        .instrument(parent)
+                        .with_subscriber(dispatch),
+                );
             }
             Err(_no_runtime) => {}
         }

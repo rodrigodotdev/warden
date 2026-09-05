@@ -284,15 +284,15 @@ impl WardenServer {
 
     /// Answers `query`: validate the arguments, then run one statement in its own task.
     async fn run_query(&self, identity: RequestContext, input: QueryInput) -> CallToolResult {
-        let request = match input.into_request() {
-            Ok(request) => request,
-            Err(code) => return failure(code),
-        };
-        let services = Arc::clone(&self.services);
         let span = tracing::info_span!(
             "mcp.tool.query",
             request_id = %identity.request_id(),
         );
+        let request = match span.in_scope(|| input.into_request()) {
+            Ok(request) => request,
+            Err(code) => return failure(code),
+        };
+        let services = Arc::clone(&self.services);
         let outcome = Self::run_in_task(
             async move { services.query().execute(&identity, request).await }.instrument(span),
         )
@@ -306,15 +306,15 @@ impl WardenServer {
 
     /// Answers `explain`: the same validation and containment, without execution.
     async fn run_explain(&self, identity: RequestContext, input: ExplainInput) -> CallToolResult {
-        let request = match input.into_request() {
-            Ok(request) => request,
-            Err(code) => return failure(code),
-        };
-        let services = Arc::clone(&self.services);
         let span = tracing::info_span!(
             "mcp.tool.explain",
             request_id = %identity.request_id(),
         );
+        let request = match span.in_scope(|| input.into_request()) {
+            Ok(request) => request,
+            Err(code) => return failure(code),
+        };
+        let services = Arc::clone(&self.services);
         let outcome = Self::run_in_task(
             async move { services.explain().explain(&identity, request).await }.instrument(span),
         )
@@ -332,15 +332,15 @@ impl WardenServer {
         identity: RequestContext,
         input: SearchInput,
     ) -> CallToolResult {
-        let request = match input.into_request() {
-            Ok(request) => request,
-            Err(code) => return failure(code),
-        };
-        let services = Arc::clone(&self.services);
         let span = tracing::info_span!(
             "mcp.tool.search_schema",
             request_id = %identity.request_id(),
         );
+        let request = match span.in_scope(|| input.into_request()) {
+            Ok(request) => request,
+            Err(code) => return failure(code),
+        };
+        let services = Arc::clone(&self.services);
         let outcome = Self::run_in_task(
             async move { services.schema().search(&identity, request).await }.instrument(span),
         )
@@ -358,15 +358,15 @@ impl WardenServer {
         identity: RequestContext,
         input: DescribeInput,
     ) -> CallToolResult {
-        let request = match input.into_request() {
-            Ok(request) => request,
-            Err(code) => return failure(code),
-        };
-        let services = Arc::clone(&self.services);
         let span = tracing::info_span!(
             "mcp.tool.describe_schema",
             request_id = %identity.request_id(),
         );
+        let request = match span.in_scope(|| input.into_request()) {
+            Ok(request) => request,
+            Err(code) => return failure(code),
+        };
+        let services = Arc::clone(&self.services);
         let outcome = Self::run_in_task(
             async move { services.schema().describe(&identity, request).await }.instrument(span),
         )
@@ -452,8 +452,122 @@ impl ServerHandler for WardenServer {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    use std::collections::BTreeMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use tracing::field::{Field, Visit};
+    use tracing::instrument::WithSubscriber as _;
+    use tracing::span::{self, Id};
+    use tracing::subscriber::Interest;
+    use tracing::{Event, Metadata, Subscriber};
+
     use super::*;
     use crate::testing;
+
+    const FORBIDDEN_SPAN_FIELDS: &[&str] = &[
+        "sql",
+        "raw_sql",
+        "statement",
+        "parameters",
+        "raw_parameters",
+        "password",
+        "dsn",
+    ];
+
+    #[derive(Debug)]
+    struct CapturedSpan {
+        name: &'static str,
+        field_names: Vec<String>,
+        field_values: BTreeMap<String, String>,
+    }
+
+    #[derive(Debug, Clone)]
+    struct CapturingSubscriber {
+        spans: Arc<Mutex<Vec<CapturedSpan>>>,
+        next_id: Arc<AtomicU64>,
+    }
+
+    impl Subscriber for CapturingSubscriber {
+        fn register_callsite(&self, _metadata: &'static Metadata<'static>) -> Interest {
+            Interest::sometimes()
+        }
+
+        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+            true
+        }
+
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            Some(tracing::level_filters::LevelFilter::TRACE)
+        }
+
+        fn new_span(&self, attributes: &span::Attributes<'_>) -> Id {
+            let mut visitor = FieldVisitor::default();
+            attributes.record(&mut visitor);
+            let metadata = attributes.metadata();
+            self.spans.lock().unwrap().push(CapturedSpan {
+                name: metadata.name(),
+                field_names: metadata
+                    .fields()
+                    .iter()
+                    .map(|field| field.name().to_owned())
+                    .collect(),
+                field_values: visitor.values,
+            });
+            Id::from_u64(self.next_id.fetch_add(1, Ordering::Relaxed))
+        }
+
+        fn record(&self, _span: &Id, _values: &span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+        fn event(&self, _event: &Event<'_>) {}
+
+        fn enter(&self, _span: &Id) {}
+
+        fn exit(&self, _span: &Id) {}
+    }
+
+    #[derive(Debug, Default)]
+    struct FieldVisitor {
+        values: BTreeMap<String, String>,
+    }
+
+    impl Visit for FieldVisitor {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.values
+                .insert(field.name().to_owned(), format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.values
+                .insert(field.name().to_owned(), value.to_owned());
+        }
+    }
+
+    #[derive(Debug)]
+    struct SpanCapture {
+        spans: Arc<Mutex<Vec<CapturedSpan>>>,
+        dispatch: tracing::Dispatch,
+    }
+
+    impl SpanCapture {
+        fn new() -> Self {
+            let spans = Arc::new(Mutex::new(Vec::new()));
+            let subscriber = CapturingSubscriber {
+                spans: Arc::clone(&spans),
+                next_id: Arc::new(AtomicU64::new(1)),
+            };
+            Self {
+                spans,
+                dispatch: tracing::Dispatch::new(subscriber),
+            }
+        }
+
+        fn dispatch(&self) -> tracing::Dispatch {
+            self.dispatch.clone()
+        }
+    }
 
     fn identity() -> warden_core::context::RequestContext {
         warden_core::context::RequestContext::new(
@@ -491,6 +605,72 @@ mod tests {
         DescribeInput {
             connection: testing::CONNECTION.to_owned(),
             tables: tables.iter().map(|table| (*table).to_owned()).collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_inputs_still_create_their_mcp_root_spans() {
+        let capture = SpanCapture::new();
+        let server = WardenServer::new(testing::services());
+        let results = async {
+            // Some runners' callsites may have first been reached on another test
+            // thread before this scoped subscriber was active. Re-evaluate them
+            // against the capture dispatch rather than relying on process-wide
+            // cached interest from that thread.
+            tracing::callsite::rebuild_interest_cache();
+            [
+                server
+                    .run_query(identity(), query_input("bad connection", "SELECT hunter2"))
+                    .await,
+                server
+                    .run_explain(
+                        identity(),
+                        explain_input("bad connection", "SELECT hunter2"),
+                    )
+                    .await,
+                server
+                    .run_search_schema(
+                        identity(),
+                        SearchInput {
+                            connection: "bad connection".to_owned(),
+                            query: "hunter2".to_owned(),
+                            limit: None,
+                        },
+                    )
+                    .await,
+                server
+                    .run_describe_schema(
+                        identity(),
+                        DescribeInput {
+                            connection: "bad connection".to_owned(),
+                            tables: vec!["SELECT hunter2".to_owned()],
+                        },
+                    )
+                    .await,
+            ]
+        }
+        .with_subscriber(capture.dispatch())
+        .await;
+        assert!(results.iter().all(|result| result.is_error == Some(true)));
+
+        let spans = capture.spans.lock().unwrap();
+        assert_eq!(
+            spans.iter().map(|span| span.name).collect::<Vec<_>>(),
+            [
+                "mcp.tool.query",
+                "mcp.tool.explain",
+                "mcp.tool.search_schema",
+                "mcp.tool.describe_schema",
+            ]
+        );
+        for span in spans.iter() {
+            for name in &span.field_names {
+                assert!(!FORBIDDEN_SPAN_FIELDS.contains(&name.as_str()), "{name}");
+            }
+            for value in span.field_values.values() {
+                assert!(!value.contains("hunter2"), "{value}");
+                assert!(!value.contains("SELECT"), "{value}");
+            }
         }
     }
 

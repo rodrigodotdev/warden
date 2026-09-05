@@ -104,6 +104,7 @@ impl ExplainService {
             request_id = %context.request_id(),
             connection = %request.query().connection(),
         );
+        let outcome_parent = span.clone();
         async move {
             let query = request.query().clone();
             let runtime = {
@@ -195,7 +196,8 @@ impl ExplainService {
                 }
             };
 
-            let guard = audit::OutcomeGuard::arm(Arc::clone(&self.audit), attempt.id);
+            let guard =
+                audit::OutcomeGuard::arm(Arc::clone(&self.audit), attempt.id, outcome_parent);
             // A service-side clock around the gated call: planning plus the adapter's own
             // overhead, started after the permit was acquired so the queue wait is
             // excluded. `QueryPlan` carries no adapter-measured duration the way
