@@ -251,14 +251,11 @@ enum SourceReachability {
     TestOnly,
 }
 
-/// An edge on the current depth-first path. Repeating one would recurse forever;
-/// other edges from the re-entered source still need traversal.
-type ActiveModuleEdge = (PathBuf, String, PathBuf, SourceReachability);
-
 struct SourceTraversal<'a> {
     sources: &'a BTreeMap<PathBuf, syn::File>,
-    visited: BTreeSet<(PathBuf, PathBuf, SourceReachability)>,
-    active_edges: BTreeSet<ActiveModuleEdge>,
+    // Each source has one physical module directory and two reachability states.
+    // Marking a state before descending bounds cycles to at most two visits per file.
+    visited: BTreeSet<(PathBuf, SourceReachability)>,
     production_sources: BTreeSet<PathBuf>,
 }
 
@@ -266,7 +263,6 @@ impl SourceTraversal<'_> {
     fn visit_items(
         &mut self,
         items: &[syn::Item],
-        current_source: &Path,
         directory: &Path,
         reachability: SourceReachability,
     ) {
@@ -283,39 +279,29 @@ impl SourceTraversal<'_> {
             if let Some((_brace, items)) = &module.content {
                 self.visit_items(
                     items,
-                    current_source,
                     &inline_module_directory(module, directory),
                     child_reachability,
                 );
             } else {
                 for source in module_sources(module, directory, self.sources) {
-                    let edge = (
-                        current_source.to_owned(),
-                        module.ident.to_string(),
-                        source.clone(),
-                        child_reachability,
-                    );
-                    if self.active_edges.insert(edge.clone()) {
-                        self.visit_source(&source, &module_directory(&source), child_reachability);
-                        self.active_edges.remove(&edge);
-                    }
+                    self.visit_source(&source, child_reachability);
                 }
             }
         }
     }
 
-    fn visit_source(&mut self, source: &Path, directory: &Path, reachability: SourceReachability) {
+    fn visit_source(&mut self, source: &Path, reachability: SourceReachability) {
         let Some(items) = self.sources.get(source).map(|syntax| syntax.items.clone()) else {
             return;
         };
-        let visit = (source.to_owned(), directory.to_owned(), reachability);
+        let visit = (source.to_owned(), reachability);
         if !self.visited.insert(visit) {
             return;
         }
         if reachability == SourceReachability::Production {
             self.production_sources.insert(source.to_owned());
         }
-        self.visit_items(&items, source, directory, reachability);
+        self.visit_items(&items, &module_directory(source), reachability);
     }
 }
 
@@ -425,15 +411,10 @@ fn created_span_names(paths: &[PathBuf]) -> BTreeSet<String> {
     let mut traversal = SourceTraversal {
         sources: &sources,
         visited: BTreeSet::new(),
-        active_edges: BTreeSet::new(),
         production_sources: BTreeSet::new(),
     };
     for root in roots {
-        traversal.visit_source(
-            &root,
-            &module_directory(&root),
-            SourceReachability::Production,
-        );
+        traversal.visit_source(&root, SourceReachability::Production);
     }
 
     let mut visitor = SpanNameVisitor::default();
@@ -1228,30 +1209,37 @@ fn span_source_discovery_follows_out_of_line_path_module_children() {
 }
 
 #[test]
-fn span_source_discovery_follows_nested_sources_beside_alias_cycles() {
+fn span_source_discovery_resolves_children_independently_of_alias_directory() {
     let fixture = SourceFixture::new();
     let source = fixture.root.join("shared.rs");
     let source = source.to_string_lossy();
-    fixture.write("lib.rs", &format!(r#"#[path = "{source}"] mod first;"#));
-    fixture.write(
-        "shared.rs",
-        &format!(
-            r#"
-            #[path = "{source}"]
-            mod second;
-            mod child;
-            "#
-        ),
-    );
+    let first = format!(r#"mod early {{ #[path = "{source}"] mod first; }}"#);
+    let later = format!(r#"mod later {{ mod nested {{ #[path = "{source}"] mod second; }} }}"#);
+    fixture.write("shared.rs", "mod child;");
     fixture.write(
         "shared/child.rs",
-        r#"fn production() { tracing::debug_span!("production.cycle.child"); }"#,
+        r#"fn production() { tracing::debug_span!("production.alias.child"); }"#,
     );
 
-    assert_eq!(
-        created_span_names(&fixture.source_files()),
-        BTreeSet::from(["production.cycle.child".to_owned()])
+    // Every alias must resolve children relative to shared.rs, irrespective of
+    // its identifier or enclosing inline directories. Removing the first alias
+    // ensures the later alias cannot borrow its successful traversal.
+    for declarations in [first.clone(), format!("{first}\n{later}"), later] {
+        fixture.write("lib.rs", &declarations);
+        assert_eq!(
+            created_span_names(&fixture.source_files()),
+            BTreeSet::from(["production.alias.child".to_owned()]),
+            "module declarations: {declarations}",
+        );
+    }
+
+    // shared.rs is referenced only from this test module, and child.rs remains
+    // referenced by shared.rs. Neither can masquerade as an unreferenced root.
+    fixture.write(
+        "lib.rs",
+        &format!(r#"#[cfg(test)] #[path = "{source}"] mod test_support;"#),
     );
+    assert_eq!(created_span_names(&fixture.source_files()), BTreeSet::new());
 }
 
 #[test]
