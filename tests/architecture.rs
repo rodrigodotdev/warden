@@ -5,7 +5,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -170,30 +170,165 @@ fn path_override(attributes: &[syn::Attribute]) -> Option<PathBuf> {
     })
 }
 
-fn cfg_test_module_roots(items: &[syn::Item], directory: &Path, roots: &mut Vec<PathBuf>) {
+fn normalized_path(path: PathBuf) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if normalized.file_name().is_some_and(|name| name != "..") {
+                    normalized.pop();
+                } else if !normalized.has_root() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    normalized
+}
+
+fn resolved_module_path(directory: &Path, path: PathBuf) -> PathBuf {
+    normalized_path(directory.join(path))
+}
+
+fn module_sources(
+    module: &syn::ItemMod,
+    directory: &Path,
+    sources: &BTreeMap<PathBuf, syn::File>,
+) -> Vec<PathBuf> {
+    if let Some(path) = path_override(&module.attrs) {
+        let source = resolved_module_path(directory, path);
+        return sources
+            .contains_key(&source)
+            .then_some(source)
+            .into_iter()
+            .collect();
+    }
+
+    let module_path = directory.join(module.ident.to_string());
+    [module_path.with_extension("rs"), module_path.join("mod.rs")]
+        .into_iter()
+        .filter(|source| sources.contains_key(source))
+        .collect()
+}
+
+fn inline_module_directory(module: &syn::ItemMod, directory: &Path) -> PathBuf {
+    path_override(&module.attrs).map_or_else(
+        || directory.join(module.ident.to_string()),
+        |path| resolved_module_path(directory, path),
+    )
+}
+
+fn referenced_module_sources(
+    items: &[syn::Item],
+    directory: &Path,
+    sources: &BTreeMap<PathBuf, syn::File>,
+    referenced: &mut BTreeSet<PathBuf>,
+) {
     for item in items {
         let syn::Item::Mod(module) = item else {
             continue;
         };
-        let module_path = directory.join(module.ident.to_string());
-        if is_cfg_test(&module.attrs) {
-            if module.content.is_some() {
-                roots.push(module_path);
-            } else if let Some(path) = path_override(&module.attrs) {
-                let source = directory.join(path);
-                roots.push(module_directory(&source));
-                roots.push(source);
-                roots.push(module_path);
-            } else {
-                roots.push(module_path.with_extension("rs"));
-                roots.push(module_path);
-            }
-            continue;
-        }
         if let Some((_brace, items)) = &module.content {
-            cfg_test_module_roots(items, &module_path, roots);
+            referenced_module_sources(
+                items,
+                &inline_module_directory(module, directory),
+                sources,
+                referenced,
+            );
+        } else {
+            referenced.extend(module_sources(module, directory, sources));
         }
     }
+}
+
+#[derive(Clone, Copy, Eq, Ord, PartialEq, PartialOrd)]
+enum SourceReachability {
+    Production,
+    TestOnly,
+}
+
+fn visit_reachable_items(
+    items: &[syn::Item],
+    directory: &Path,
+    reachability: SourceReachability,
+    sources: &BTreeMap<PathBuf, syn::File>,
+    visited: &mut BTreeSet<(PathBuf, PathBuf, SourceReachability)>,
+    active: &mut BTreeSet<(PathBuf, SourceReachability)>,
+    production_sources: &mut BTreeSet<PathBuf>,
+) {
+    for item in items {
+        let syn::Item::Mod(module) = item else {
+            continue;
+        };
+        let child_reachability =
+            if reachability == SourceReachability::TestOnly || is_cfg_test(&module.attrs) {
+                SourceReachability::TestOnly
+            } else {
+                SourceReachability::Production
+            };
+        if let Some((_brace, items)) = &module.content {
+            visit_reachable_items(
+                items,
+                &inline_module_directory(module, directory),
+                child_reachability,
+                sources,
+                visited,
+                active,
+                production_sources,
+            );
+        } else {
+            for source in module_sources(module, directory, sources) {
+                visit_reachable_source(
+                    &source,
+                    &directory.join(module.ident.to_string()),
+                    child_reachability,
+                    sources,
+                    visited,
+                    active,
+                    production_sources,
+                );
+            }
+        }
+    }
+}
+
+fn visit_reachable_source(
+    source: &Path,
+    directory: &Path,
+    reachability: SourceReachability,
+    sources: &BTreeMap<PathBuf, syn::File>,
+    visited: &mut BTreeSet<(PathBuf, PathBuf, SourceReachability)>,
+    active: &mut BTreeSet<(PathBuf, SourceReachability)>,
+    production_sources: &mut BTreeSet<PathBuf>,
+) {
+    let Some(syntax) = sources.get(source) else {
+        return;
+    };
+    let visit = (source.to_owned(), directory.to_owned(), reachability);
+    if !visited.insert(visit) {
+        return;
+    }
+    if reachability == SourceReachability::Production {
+        production_sources.insert(source.to_owned());
+    }
+    let active_visit = (source.to_owned(), reachability);
+    if !active.insert(active_visit.clone()) {
+        return;
+    }
+    visit_reachable_items(
+        &syntax.items,
+        directory,
+        reachability,
+        sources,
+        visited,
+        active,
+        production_sources,
+    );
+    active.remove(&active_visit);
 }
 
 fn next_is_metadata(input: ParseStream<'_>, expected: &str) -> bool {
@@ -269,31 +404,54 @@ impl<'ast> Visit<'ast> for SpanNameVisitor {
 }
 
 fn created_span_names(paths: &[PathBuf]) -> BTreeSet<String> {
-    let sources: Vec<_> = paths
+    let sources: BTreeMap<_, _> = paths
         .iter()
         .map(|path| {
             let source = fs::read_to_string(path)
                 .unwrap_or_else(|error| panic!("could not read {}: {error}", path.display()));
             let syntax = syn::parse_file(&source)
                 .unwrap_or_else(|error| panic!("could not parse {}: {error}", path.display()));
-            (path, syntax)
+            (path.to_owned(), syntax)
         })
         .collect();
-    let mut test_module_roots = Vec::new();
+    let mut referenced = BTreeSet::new();
     for (path, syntax) in &sources {
-        cfg_test_module_roots(
+        referenced_module_sources(
             &syntax.items,
             &module_directory(path),
-            &mut test_module_roots,
+            &sources,
+            &mut referenced,
+        );
+    }
+
+    let roots: Vec<_> = sources
+        .keys()
+        .filter(|path| {
+            matches!(
+                path.file_name().and_then(|name| name.to_str()),
+                Some("lib.rs" | "main.rs")
+            ) || !referenced.contains(*path)
+        })
+        .cloned()
+        .collect();
+    let mut visited = BTreeSet::new();
+    let mut active = BTreeSet::new();
+    let mut production_sources = BTreeSet::new();
+    for root in roots {
+        visit_reachable_source(
+            &root,
+            &module_directory(&root),
+            SourceReachability::Production,
+            &sources,
+            &mut visited,
+            &mut active,
+            &mut production_sources,
         );
     }
 
     let mut visitor = SpanNameVisitor::default();
     for (path, syntax) in sources {
-        let is_test_module = test_module_roots
-            .iter()
-            .any(|root| path == root || path.starts_with(root));
-        if !is_test_module {
+        if production_sources.contains(&path) {
             visitor.visit_file(&syntax);
         }
     }
@@ -968,6 +1126,9 @@ fn span_source_discovery_skips_direct_nested_and_path_test_modules() {
         mod direct;
 
         #[cfg(test)]
+        mod directory_form;
+
+        #[cfg(test)]
         mod tests {
             mod support;
         }
@@ -982,6 +1143,10 @@ fn span_source_discovery_skips_direct_nested_and_path_test_modules() {
         r#"fn helper() { tracing::debug_span!("test.direct"); }"#,
     );
     fixture.write(
+        "directory_form/mod.rs",
+        r#"fn helper() { tracing::debug_span!("test.directory.form"); }"#,
+    );
+    fixture.write(
         "tests/support.rs",
         r#"fn helper() { tracing::trace_span!("test.nested.support"); }"#,
     );
@@ -993,6 +1158,113 @@ fn span_source_discovery_skips_direct_nested_and_path_test_modules() {
     assert_eq!(
         created_span_names(&fixture.source_files()),
         BTreeSet::from(["production.root".to_owned()])
+    );
+}
+
+#[test]
+fn span_source_discovery_skips_path_directory_below_an_inline_test_module() {
+    let fixture = SourceFixture::new();
+    fixture.write(
+        "lib.rs",
+        r#"
+        fn production() {
+            tracing::info_span!("production.root");
+        }
+
+        #[cfg(test)]
+        #[path = "thread_files"]
+        mod thread {
+            #[path = "tls.rs"]
+            mod local_data;
+        }
+        "#,
+    );
+    fixture.write(
+        "thread_files/tls.rs",
+        r#"fn helper() { tracing::debug_span!("test.path.directory"); }"#,
+    );
+
+    assert_eq!(
+        created_span_names(&fixture.source_files()),
+        BTreeSet::from(["production.root".to_owned()])
+    );
+}
+
+#[test]
+fn span_source_discovery_skips_test_only_path_aliases() {
+    let fixture = SourceFixture::new();
+    fixture.write(
+        "lib.rs",
+        r#"
+        fn production() {
+            tracing::info_span!("production.root");
+        }
+
+        #[cfg(test)]
+        mod tests {
+            #[path = "../test_support.rs"]
+            mod support;
+        }
+        "#,
+    );
+    fixture.write(
+        "test_support.rs",
+        r#"fn helper() { tracing::debug_span!("test.path.alias"); }"#,
+    );
+
+    assert_eq!(
+        created_span_names(&fixture.source_files()),
+        BTreeSet::from(["production.root".to_owned()])
+    );
+}
+
+#[test]
+fn span_source_discovery_terminates_on_absolute_path_alias_cycles() {
+    let fixture = SourceFixture::new();
+    let source = fixture.root.join("shared.rs");
+    let source = source.to_string_lossy();
+    fixture.write("lib.rs", &format!(r#"#[path = "{source}"] mod first;"#));
+    fixture.write(
+        "shared.rs",
+        &format!(
+            r#"
+            #[path = "{source}"]
+            mod second;
+
+            fn production() {{
+                tracing::info_span!("production.cycle");
+            }}
+            "#
+        ),
+    );
+
+    assert_eq!(
+        created_span_names(&fixture.source_files()),
+        BTreeSet::from(["production.cycle".to_owned()])
+    );
+}
+
+#[test]
+fn span_source_discovery_keeps_a_file_with_production_and_test_reachability() {
+    let fixture = SourceFixture::new();
+    fixture.write(
+        "lib.rs",
+        r#"
+        mod production;
+
+        #[cfg(test)]
+        #[path = "production.rs"]
+        mod test_support;
+        "#,
+    );
+    fixture.write(
+        "production.rs",
+        r#"fn production() { tracing::error_span!("production.shared"); }"#,
+    );
+
+    assert_eq!(
+        created_span_names(&fixture.source_files()),
+        BTreeSet::from(["production.shared".to_owned()])
     );
 }
 
