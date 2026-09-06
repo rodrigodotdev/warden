@@ -1102,3 +1102,65 @@ pub(crate) async fn saturated_explain_service() -> (ExplainService, Arc<FakeAudi
     );
     (service, sink, held)
 }
+
+/// Keeps every callsite's cached interest dynamic for the rest of this process.
+///
+/// `tracing-core` caches one `Interest` per callsite for the whole program and computes
+/// it the first time *any* thread reaches that callsite. While exactly one dispatcher is
+/// registered it takes a fast path that asks whichever subscriber is default on that
+/// thread — so a span callsite first reached by a sibling test thread, which has none, is
+/// cached as `never` for every thread, including the one that scopes a capturing
+/// subscriber over the same code a moment later. That is a lost span here and nowhere in
+/// production, where the process installs a subscriber before it serves anything.
+///
+/// Registering two dispatchers that are never dropped keeps that fast path off for the
+/// rest of the process: interest is then always the union over the live dispatchers, so
+/// it stays `sometimes` and `enabled` decides per call, on the thread doing the emitting.
+pub(crate) fn keep_callsite_interest_dynamic() {
+    /// Registers interest in every callsite and enables none of them: this subscriber
+    /// exists to be counted, not to record.
+    #[derive(Debug)]
+    struct AlwaysAsk;
+
+    impl tracing::Subscriber for AlwaysAsk {
+        fn register_callsite(
+            &self,
+            _metadata: &'static tracing::Metadata<'static>,
+        ) -> tracing::subscriber::Interest {
+            tracing::subscriber::Interest::sometimes()
+        }
+
+        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+            false
+        }
+
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            Some(tracing::level_filters::LevelFilter::TRACE)
+        }
+
+        fn new_span(&self, _attributes: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+
+        fn event(&self, _event: &tracing::Event<'_>) {}
+
+        fn enter(&self, _span: &tracing::span::Id) {}
+
+        fn exit(&self, _span: &tracing::span::Id) {}
+    }
+
+    static REGISTERED: std::sync::OnceLock<[tracing::Dispatch; 2]> = std::sync::OnceLock::new();
+    REGISTERED.get_or_init(|| {
+        [
+            tracing::Dispatch::new(AlwaysAsk),
+            tracing::Dispatch::new(AlwaysAsk),
+        ]
+    });
+    // Callsites reached before those two were registered still hold the interest they
+    // were given then. Re-evaluating covers them.
+    tracing::callsite::rebuild_interest_cache();
+}

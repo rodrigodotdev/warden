@@ -797,7 +797,13 @@ async fn the_shipped_formatter_exposes_roots_and_debug_phases_with_either_audit_
                     "query",
                     json!({
                         "connection": NAME,
-                        "sql": "SELECT id FROM orders WHERE status = $1 /* private-statement-token */",
+                        // The statement selects the seeded `password` column and matches
+                        // every row, so `SECRET` really does travel the pipeline on this
+                        // call. A projection of `id` alone would make the
+                        // `!contains(SECRET)` assertion below unfalsifiable. The bound
+                        // parameter stays a token no row holds, which is what keeps the
+                        // parameter assertion meaningful too.
+                        "sql": "SELECT id, password FROM orders WHERE status <> $1 /* private-statement-token */",
                         "parameters": ["private-parameter-token"],
                     }),
                 ),
@@ -822,6 +828,14 @@ async fn the_shipped_formatter_exposes_roots_and_debug_phases_with_either_audit_
                 assert!(response["error"].is_null(), "{response}");
                 assert_ne!(response["result"]["isError"], true, "{response}");
             }
+            // Proof that the query above really carried the seeded secret: only a row
+            // holding `password` can come back redacted. Without it the `SECRET` check
+            // further down would pass against a projection that never read the column.
+            let returned = serde_json::to_string(&responses).unwrap();
+            assert!(
+                returned.contains("[REDACTED]"),
+                "no response carried a redacted cell, so the secret never travelled: {returned}"
+            );
             for root in [
                 "mcp.tool.list_connections",
                 "mcp.tool.query",

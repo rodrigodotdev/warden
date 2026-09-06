@@ -453,8 +453,8 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use std::collections::BTreeMap;
-    use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, OnceLock};
 
     use tracing::field::{Field, Visit};
     use tracing::instrument::WithSubscriber as _;
@@ -545,6 +545,67 @@ mod tests {
         }
     }
 
+    /// Keeps every callsite's cached interest dynamic for the rest of this process.
+    ///
+    /// `tracing-core` caches one `Interest` per callsite for the whole program and
+    /// computes it the first time *any* thread reaches that callsite. While exactly one
+    /// dispatcher is registered it takes a fast path that asks whichever subscriber is
+    /// default on that thread — so a `mcp.tool.*` callsite first reached by a sibling
+    /// test thread, which has none, is cached as `never` for every thread, including
+    /// the one that scopes a capturing subscriber over the same code a moment later.
+    /// That is a lost span here and nowhere in production, where the process installs a
+    /// subscriber before it serves anything.
+    ///
+    /// Registering two dispatchers that are never dropped keeps that fast path off for
+    /// the rest of the process: interest is then always the union over the live
+    /// dispatchers, so it stays `sometimes` and `enabled` decides per call, on the
+    /// thread doing the emitting.
+    fn keep_callsite_interest_dynamic() {
+        /// Registers interest in every callsite and enables none of them: this
+        /// subscriber exists to be counted, not to record.
+        #[derive(Debug)]
+        struct AlwaysAsk;
+
+        impl Subscriber for AlwaysAsk {
+            fn register_callsite(&self, _metadata: &'static Metadata<'static>) -> Interest {
+                Interest::sometimes()
+            }
+
+            fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+                false
+            }
+
+            fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+                Some(tracing::level_filters::LevelFilter::TRACE)
+            }
+
+            fn new_span(&self, _attributes: &span::Attributes<'_>) -> Id {
+                Id::from_u64(1)
+            }
+
+            fn record(&self, _span: &Id, _values: &span::Record<'_>) {}
+
+            fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
+
+            fn event(&self, _event: &Event<'_>) {}
+
+            fn enter(&self, _span: &Id) {}
+
+            fn exit(&self, _span: &Id) {}
+        }
+
+        static REGISTERED: OnceLock<[tracing::Dispatch; 2]> = OnceLock::new();
+        REGISTERED.get_or_init(|| {
+            [
+                tracing::Dispatch::new(AlwaysAsk),
+                tracing::Dispatch::new(AlwaysAsk),
+            ]
+        });
+        // Callsites reached before those two were registered still hold the interest
+        // they were given then. Re-evaluating covers them.
+        tracing::callsite::rebuild_interest_cache();
+    }
+
     #[derive(Debug)]
     struct SpanCapture {
         spans: Arc<Mutex<Vec<CapturedSpan>>>,
@@ -553,6 +614,7 @@ mod tests {
 
     impl SpanCapture {
         fn new() -> Self {
+            keep_callsite_interest_dynamic();
             let spans = Arc::new(Mutex::new(Vec::new()));
             let subscriber = CapturingSubscriber {
                 spans: Arc::clone(&spans),
@@ -613,11 +675,6 @@ mod tests {
         let capture = SpanCapture::new();
         let server = WardenServer::new(testing::services());
         let results = async {
-            // Some runners' callsites may have first been reached on another test
-            // thread before this scoped subscriber was active. Re-evaluate them
-            // against the capture dispatch rather than relying on process-wide
-            // cached interest from that thread.
-            tracing::callsite::rebuild_interest_cache();
             [
                 server
                     .run_query(identity(), query_input("bad connection", "SELECT hunter2"))

@@ -387,6 +387,7 @@ mod tests {
     async fn a_describe_redaction_panic_records_abandoned_instead_of_success() {
         use tracing::instrument::WithSubscriber as _;
 
+        testing::keep_callsite_interest_dynamic();
         let sink = Arc::new(testing::FakeAuditSink::new());
         let service = testing::schema_service(testing::ServiceFakes {
             audit: sink.clone(),
