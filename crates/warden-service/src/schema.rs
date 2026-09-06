@@ -111,6 +111,7 @@ impl SchemaService {
             request_id = %context.request_id(),
             connection = %request.connection(),
         );
+        let outcome_parent = span.clone();
         async move {
             let runtime = self.registry.get(request.connection())?;
             if !runtime.capabilities().schema_search {
@@ -127,6 +128,8 @@ impl SchemaService {
                 Vec::new(),
             );
             audit::record_attempt(self.audit.as_ref(), &attempt).await?;
+            let guard =
+                audit::OutcomeGuard::arm(Arc::clone(&self.audit), attempt.id, outcome_parent);
 
             let started = Instant::now();
             let filter = ObjectFilter::new(
@@ -138,7 +141,7 @@ impl SchemaService {
                 .inspector()
                 .search_schema(&request, filter, deadline, self.shutdown.child_token())
                 .await;
-            self.complete(&attempt, started, &found).await;
+            Self::complete(guard, &attempt, started, &found).await;
             Ok(found?)
         }
         .instrument(span)
@@ -169,6 +172,7 @@ impl SchemaService {
             request_id = %context.request_id(),
             connection = %request.connection(),
         );
+        let outcome_parent = span.clone();
         async move {
             let runtime = self.registry.get(request.connection())?;
             let attempt = audit::attempt(
@@ -182,6 +186,8 @@ impl SchemaService {
                 Vec::new(),
             );
             audit::record_attempt(self.audit.as_ref(), &attempt).await?;
+            let guard =
+                audit::OutcomeGuard::arm(Arc::clone(&self.audit), attempt.id, outcome_parent);
 
             let started = Instant::now();
             let filter = ObjectFilter::new(
@@ -189,17 +195,16 @@ impl SchemaService {
                 PolicyContext::new(context, runtime.metadata()),
             );
             let deadline = RequestBudget::new(runtime.limits()).deadline(started);
-            let found = runtime
+            let mut found = runtime
                 .inspector()
                 .describe_schema(&request, filter, deadline, self.shutdown.child_token())
                 .await;
-            self.complete(&attempt, started, &found).await;
-            let mut described = found?;
-            {
+            if let Ok(described) = &mut found {
                 let _entered = tracing::debug_span!("result.redact").entered();
-                self.redactor.redact_description(&mut described);
+                self.redactor.redact_description(described);
             }
-            Ok(described)
+            Self::complete(guard, &attempt, started, &found).await;
+            Ok(found?)
         }
         .instrument(span)
         .await
@@ -211,7 +216,7 @@ impl SchemaService {
     /// row, and reporting a catalog count under a result set's field name would
     /// make the record say something it does not mean.
     async fn complete<T>(
-        &self,
+        guard: audit::OutcomeGuard,
         attempt: &AuditAttempt,
         started: Instant,
         result: &Result<T, SchemaError>,
@@ -228,9 +233,8 @@ impl SchemaService {
                 Some(error.public_code()),
             ),
         };
-        audit::record_outcome(
-            self.audit.as_ref(),
-            AuditOutcomeEvent {
+        guard
+            .complete(AuditOutcomeEvent {
                 attempt_id: attempt.id,
                 outcome,
                 duration: Some(started.elapsed()),
@@ -238,9 +242,8 @@ impl SchemaService {
                 rows_returned: None,
                 result_bytes: None,
                 error_code,
-            },
-        )
-        .await;
+            })
+            .await;
     }
 }
 
@@ -272,6 +275,137 @@ mod tests {
     use crate::error::SchemaServiceError;
     use crate::redaction::REDACTED;
     use crate::testing;
+
+    async fn assert_catalog_panic_records_abandoned(describe: bool) {
+        let sink = Arc::new(testing::FakeAuditSink::new());
+        let service = testing::schema_service(testing::ServiceFakes {
+            inspector: Arc::new(testing::FakeInspector::panicking()),
+            audit: sink.clone(),
+            ..testing::ServiceFakes::default()
+        });
+        let task = tokio::spawn(async move {
+            let context = testing::request_context();
+            if describe {
+                service
+                    .describe(&context, testing::describe_request())
+                    .await
+                    .map(|_| ())
+            } else {
+                service
+                    .search(&context, testing::search_request())
+                    .await
+                    .map(|_| ())
+            }
+        });
+        assert!(task.await.unwrap_err().is_panic());
+        let outcome = testing::await_outcome(&sink).await;
+        assert_eq!(outcome.attempt_id, sink.attempts()[0].id);
+        assert_eq!(outcome.outcome, AuditOutcome::Abandoned);
+        assert_eq!(outcome.error_code, Some(PublicErrorCode::InternalError));
+    }
+
+    #[tokio::test]
+    async fn a_panicking_search_records_abandoned() {
+        assert_catalog_panic_records_abandoned(false).await;
+    }
+
+    #[tokio::test]
+    async fn a_panicking_describe_records_abandoned() {
+        assert_catalog_panic_records_abandoned(true).await;
+    }
+
+    async fn assert_catalog_drop_records_abandoned(describe: bool) {
+        let sink = Arc::new(testing::FakeAuditSink::new());
+        let inspector = Arc::new(testing::FakeInspector::taking(Duration::from_secs(600)));
+        let service = testing::schema_service(testing::ServiceFakes {
+            inspector: inspector.clone(),
+            audit: sink.clone(),
+            ..testing::ServiceFakes::default()
+        });
+        let context = testing::request_context();
+        let mut read = Box::pin(async {
+            if describe {
+                service
+                    .describe(&context, testing::describe_request())
+                    .await
+                    .map(|_| ())
+            } else {
+                service
+                    .search(&context, testing::search_request())
+                    .await
+                    .map(|_| ())
+            }
+        });
+        tokio::select! {
+            result = &mut read => panic!("catalog read completed: {result:?}"),
+            () = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+        assert_eq!(sink.attempts().len(), 1);
+        assert_eq!(inspector.search_calls() + inspector.describe_calls(), 1);
+        drop(read);
+        let outcome = testing::await_outcome(&sink).await;
+        assert_eq!(outcome.attempt_id, sink.attempts()[0].id);
+        assert_eq!(outcome.outcome, AuditOutcome::Abandoned);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_search_records_abandoned() {
+        assert_catalog_drop_records_abandoned(false).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_dropped_describe_records_abandoned() {
+        assert_catalog_drop_records_abandoned(true).await;
+    }
+
+    /// Injects a panic at the real redaction boundary, after the inspector returns.
+    struct PanicOnRedaction;
+
+    impl tracing::Subscriber for PanicOnRedaction {
+        fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            Some(tracing::level_filters::LevelFilter::TRACE)
+        }
+        fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            assert_ne!(
+                span.metadata().name(),
+                "result.redact",
+                "injected redaction panic"
+            );
+            tracing::span::Id::from_u64(1)
+        }
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+        fn event(&self, _: &tracing::Event<'_>) {}
+        fn enter(&self, _: &tracing::span::Id) {}
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    #[tokio::test]
+    async fn a_describe_redaction_panic_records_abandoned_instead_of_success() {
+        use tracing::instrument::WithSubscriber as _;
+
+        let sink = Arc::new(testing::FakeAuditSink::new());
+        let service = testing::schema_service(testing::ServiceFakes {
+            audit: sink.clone(),
+            ..testing::ServiceFakes::default()
+        });
+        let task = tokio::spawn(
+            async move {
+                service
+                    .describe(&testing::request_context(), testing::describe_request())
+                    .await
+            }
+            .with_subscriber(PanicOnRedaction),
+        );
+        assert!(task.await.unwrap_err().is_panic());
+        let outcome = testing::await_outcome(&sink).await;
+        assert_eq!(outcome.attempt_id, sink.attempts()[0].id);
+        assert_eq!(outcome.outcome, AuditOutcome::Abandoned);
+        assert_eq!(sink.outcomes().len(), 1);
+    }
 
     fn denying_engine() -> Arc<PolicyEngine> {
         Arc::new(

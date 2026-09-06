@@ -11,19 +11,6 @@
 //! the object or function that tripped a rule, and it stays on the auditor's side
 //! of `docs/security.md` section 6 — a decision Milestone 13 makes deliberately by
 //! keeping the field out of the format rather than by omitting a value.
-//!
-//! Nothing in this module is called from production code yet: `tracing_sink` reads
-//! only the field-name constants, and the structs themselves wait for Task 5's file
-//! sink to construct them. Until then this is the declaration and its own tests are
-//! the only caller.
-#![cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the record format's declaration; only its own tests construct one \
-                  until Task 5's file sink does too"
-    )
-)]
 
 use serde::Serialize;
 use time::OffsetDateTime;
@@ -40,6 +27,7 @@ use warden_ports::{AuditAttempt, AuditOutcomeEvent};
 pub(crate) const RECORD_SCHEMA: &str = "warden.audit.v1";
 
 /// Every key an attempt record has, in serialization order.
+#[cfg(test)]
 pub(crate) const ATTEMPT_FIELDS: &[&str] = &[
     "schema",
     "event",
@@ -58,6 +46,7 @@ pub(crate) const ATTEMPT_FIELDS: &[&str] = &[
 ];
 
 /// Every key an outcome record has, in serialization order.
+#[cfg(test)]
 pub(crate) const OUTCOME_FIELDS: &[&str] = &[
     "schema",
     "event",
@@ -72,6 +61,7 @@ pub(crate) const OUTCOME_FIELDS: &[&str] = &[
 ];
 
 /// Names no record may ever carry (`docs/operations.md` section 10.2).
+#[cfg(test)]
 pub(crate) const FORBIDDEN_FIELDS: &[&str] = &[
     "sql",
     "raw_sql",
@@ -86,7 +76,22 @@ pub(crate) const FORBIDDEN_FIELDS: &[&str] = &[
 ///
 /// The subscriber stamps its own time, and the `warden.audit` target already names
 /// the stream a `schema` key would identify.
+#[cfg(test)]
 pub(crate) const TRACING_OMITS: &[&str] = &["schema", "timestamp"];
+
+/// The shared mode-dependent projection used by both audit destinations.
+pub(super) fn statement_fields(
+    event: &AuditAttempt,
+    mode: AuditMode,
+) -> (Option<&'static str>, Option<&str>) {
+    match mode {
+        AuditMode::Fingerprint => (
+            event.statement_kind.map(StatementKind::as_str),
+            event.fingerprint.as_ref().map(QueryFingerprint::as_str),
+        ),
+        AuditMode::None_ => (None, None),
+    }
+}
 
 /// One attempt, as it is written.
 #[derive(Debug, Serialize)]
@@ -111,7 +116,7 @@ pub(crate) struct AttemptRecord<'a> {
 impl<'a> AttemptRecord<'a> {
     /// Projects an attempt into the record `mode` allows.
     pub(crate) fn new(event: &'a AuditAttempt, mode: AuditMode) -> Self {
-        let describes_statement = matches!(mode, AuditMode::Fingerprint);
+        let (statement_kind, fingerprint) = statement_fields(event, mode);
         Self {
             schema: RECORD_SCHEMA,
             event: "attempt",
@@ -127,12 +132,8 @@ impl<'a> AttemptRecord<'a> {
             // new accessor (docs/operations.md section 10.2's field, unchanged).
             environment: event.environment.as_ref(),
             operation: event.operation.as_str(),
-            statement_kind: describes_statement
-                .then(|| event.statement_kind.map(StatementKind::as_str))
-                .flatten(),
-            fingerprint: describes_statement
-                .then(|| event.fingerprint.as_ref().map(QueryFingerprint::as_str))
-                .flatten(),
+            statement_kind,
+            fingerprint,
             deny_codes: event
                 .deny_reasons
                 .iter()

@@ -231,6 +231,7 @@ fn install_tracing() {
     );
     if let Err(error) = tracing_subscriber::fmt()
         .with_env_filter(filter)
+        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
         .with_writer(io::stderr)
         .try_init()
     {

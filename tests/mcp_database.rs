@@ -415,8 +415,25 @@ impl Fixture {
     /// line, because `/proc/<pid>/cmdline` is world-readable and this test is also the
     /// documentation of how to pass one.
     async fn run_to_completion(&self, requests: &[Value]) -> (String, String, ExitStatus) {
-        let mut child = self
-            .command(["serve", "--transport", "stdio"])
+        self.run_with_filter(requests, Some(LOG_FILTER)).await
+    }
+
+    /// Runs the actual formatter, including its default when RUST_LOG is absent.
+    async fn run_with_filter(
+        &self,
+        requests: &[Value],
+        filter: Option<&str>,
+    ) -> (String, String, ExitStatus) {
+        let mut command = self.command(["serve", "--transport", "stdio"]);
+        match filter {
+            Some(filter) => {
+                command.env("RUST_LOG", filter);
+            }
+            None => {
+                command.env_remove("RUST_LOG");
+            }
+        }
+        let mut child = command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -754,6 +771,122 @@ fn sqlstate(error: &sqlx::Error) -> Option<String> {
 // ---------------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[tokio::test]
+async fn the_shipped_formatter_exposes_roots_and_debug_phases_with_either_audit_sink() {
+    let mut fixture = Fixture::start(Engine::PostgreSql).await;
+    let base_config = std::fs::read_to_string(&fixture.config.path).unwrap();
+    for file_audit in [false, true] {
+        // This helper owns and removes a temporary file; JSONL needs no extension.
+        let audit_file = TemporaryConfig::write("");
+        fixture.config = TemporaryConfig::write(&if file_audit {
+            format!(
+                "{base_config}\n[audit]\ndestination = \"file\"\nmode = \"fingerprint\"\npath = \"{}\"\n",
+                audit_file.path.display()
+            )
+        } else {
+            base_config.clone()
+        });
+        for filter in [None, Some(LOG_FILTER)] {
+            let requests = with_ids(&[
+                initialize(),
+                initialized(),
+                call("list_connections", json!({})),
+                call(
+                    "query",
+                    json!({
+                        "connection": NAME,
+                        "sql": "SELECT id FROM orders WHERE status = $1 /* private-statement-token */",
+                        "parameters": ["private-parameter-token"],
+                    }),
+                ),
+                call(
+                    "explain",
+                    json!({ "connection": NAME, "sql": fixture.select() }),
+                ),
+                call(
+                    "search_schema",
+                    json!({ "connection": NAME, "query": "orders" }),
+                ),
+                call(
+                    "describe_schema",
+                    json!({ "connection": NAME, "tables": [fixture.table()] }),
+                ),
+            ]);
+            let (stdout, stderr, status) = fixture.run_with_filter(&requests, filter).await;
+            assert!(status.success(), "{stderr}");
+            let responses = parse_protocol(&stdout);
+            assert_eq!(responses.len(), 6, "every request must complete: {stdout}");
+            for response in &responses {
+                assert!(response["error"].is_null(), "{response}");
+                assert_ne!(response["result"]["isError"], true, "{response}");
+            }
+            for root in [
+                "mcp.tool.list_connections",
+                "mcp.tool.query",
+                "warden.query",
+                "mcp.tool.explain",
+                "warden.explain",
+                "mcp.tool.search_schema",
+                "warden.search_schema",
+                "mcp.tool.describe_schema",
+                "warden.describe_schema",
+            ] {
+                assert!(
+                    stderr
+                        .lines()
+                        .any(|line| line.contains(root) && line.contains("close")),
+                    "missing formatted close for {root}, file_audit={file_audit}, filter={filter:?}: {stderr}"
+                );
+            }
+            for phase in [
+                "connection.resolve",
+                "sql.analyze",
+                "policy.evaluate",
+                "audit.attempt",
+                "concurrency.acquire",
+                "result.redact",
+                "audit.outcome",
+            ] {
+                let emitted = stderr
+                    .lines()
+                    .any(|line| line.contains(phase) && line.contains("close"));
+                assert_eq!(
+                    emitted,
+                    filter.is_some(),
+                    "phase {phase}, filter={filter:?}: {stderr}"
+                );
+            }
+            assert_eq!(stderr.contains("audit attempt"), !file_audit, "{stderr}");
+            assert_eq!(stderr.contains("audit outcome"), !file_audit, "{stderr}");
+            for secret in [
+                SECRET,
+                ROLE_PASSWORD,
+                "private-statement-token",
+                "private-parameter-token",
+                "SELECT id",
+                &fixture.dsn,
+            ] {
+                assert!(
+                    !stderr.contains(secret),
+                    "formatter disclosed {secret}: {stderr}"
+                );
+            }
+            if file_audit {
+                let trail = std::fs::read_to_string(&audit_file.path).unwrap();
+                let records: Vec<Value> = trail
+                    .lines()
+                    .map(|line| serde_json::from_str(line).unwrap())
+                    .collect();
+                assert_eq!(
+                    records.iter().filter(|r| r["event"] == "attempt").count(),
+                    if filter.is_some() { 8 } else { 4 }
+                );
+            }
+        }
+    }
+}
 
 #[tokio::test]
 async fn an_agent_can_find_a_table_describe_it_query_it_and_plan_it() {

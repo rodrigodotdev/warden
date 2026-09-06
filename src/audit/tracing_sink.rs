@@ -26,13 +26,7 @@ use warden_ports::{AuditAttempt, AuditError, AuditOutcomeEvent, AuditSink, BoxFu
 /// Every field [`TracingAuditSink::record_attempt`] emits, in the order it emits
 /// them: `record::ATTEMPT_FIELDS` minus `record::TRACING_OMITS`, which the module's
 /// own test proves.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the declaration of what this module emits; only its test reads it back"
-    )
-)]
+#[cfg(test)]
 const ATTEMPT_FIELDS: &[&str] = &[
     "event",
     "attempt_id",
@@ -50,13 +44,7 @@ const ATTEMPT_FIELDS: &[&str] = &[
 
 /// Every field [`TracingAuditSink::record_outcome`] emits, in the order it emits
 /// them: `record::OUTCOME_FIELDS` minus `record::TRACING_OMITS`.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the declaration of what this module emits; only its test reads it back"
-    )
-)]
+#[cfg(test)]
 const OUTCOME_FIELDS: &[&str] = &[
     "event",
     "attempt_id",
@@ -106,7 +94,7 @@ impl AuditSink for TracingAuditSink {
                 .join(",");
             // The same gate `record::AttemptRecord::new` applies: `none` records that
             // a request happened and nothing about the statement it carried.
-            let describes_statement = matches!(self.mode, AuditMode::Fingerprint);
+            let (statement_kind, fingerprint) = super::record::statement_fields(event, self.mode);
             tracing::info!(
                 target: AUDIT_TARGET,
                 event = "attempt",
@@ -118,16 +106,8 @@ impl AuditSink for TracingAuditSink {
                 dialect = %event.dialect,
                 environment = %event.environment,
                 operation = event.operation.as_str(),
-                statement_kind = describes_statement
-                    .then(|| {
-                        event
-                            .statement_kind
-                            .map(warden_core::analysis::StatementKind::as_str)
-                    })
-                    .flatten(),
-                fingerprint = describes_statement
-                    .then(|| event.fingerprint.as_ref().map(|value| value.as_str()))
-                    .flatten(),
+                statement_kind,
+                fingerprint,
                 deny_codes = %deny_codes,
                 "audit attempt"
             );
@@ -282,6 +262,24 @@ mod tests {
 
         assert_eq!(recorded[0].values.get("statement_kind"), None);
         assert_eq!(recorded[0].values.get("fingerprint"), None);
+
+        let fingerprint_id = AuditEventId::generate();
+        TracingAuditSink::new(AuditMode::Fingerprint)
+            .record_attempt(&attempt(fingerprint_id))
+            .await
+            .unwrap();
+        let fingerprint_records = events_for(fingerprint_id);
+        assert_eq!(
+            fingerprint_records[0]
+                .values
+                .get("statement_kind")
+                .map(String::as_str),
+            Some("select")
+        );
+        assert_eq!(
+            fingerprint_records[0].values.get("fingerprint"),
+            Some(&format!("v1:{}", "a".repeat(64)))
+        );
     }
 
     /// The two events carrying `id`, in the order they were emitted.
@@ -405,7 +403,9 @@ mod tests {
             dialect: warden_core::dialect::Dialect::MySql,
             environment: warden_core::connection::Environment::Production,
             operation: warden_ports::AuditOperation::Query,
-            fingerprint: None,
+            fingerprint: Some(
+                warden_core::fingerprint::QueryFingerprint::v1(&"a".repeat(64)).unwrap(),
+            ),
             statement_kind: Some(warden_core::analysis::StatementKind::Select),
             deny_reasons: vec![warden_policy::DenyReason::with_detail(
                 warden_policy::DenyCode::ObjectNotAllowed,

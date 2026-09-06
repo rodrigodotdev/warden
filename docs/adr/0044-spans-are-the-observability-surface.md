@@ -18,12 +18,19 @@ for a database-backed tool and one for `list_connections`. An operator can opt i
 the operation-dependent phase tree. Shared phases reuse the canonical names, and a
 tool emits only the subset it actually performs.
 
+The process formatter enables `FmtSpan::CLOSE`, so each enabled span produces
+output even if it contains no ordinary event. The default filter shows the roots;
+`warden=debug` also shows phases. This remains true with file auditing, where the
+audit sink itself emits no successful tracing event. Lifecycle busy/idle timing
+is not the same measurement as database execution duration.
+
 Span fields are restricted to the audit record's identity fields: `request_id`,
 `principal_id`, `client`, `connection`, `dialect`, `environment`, and `operation`.
 No span may carry a statement, a parameter, or a `DenyReason` detail.
 
 `tests/architecture.rs` parses section 10.1 and fails when code and documentation
-disagree; that mechanical guard is introduced in Task 8.
+disagree. The Docker MCP regression also checks the actual shipped formatter,
+both filters and audit destinations, all five tools, and protocol-only stdout.
 
 ## Consequences
 

@@ -31,13 +31,13 @@ Milestone 11 adds these no-database unit rows:
 | Auditing | bounded writes, fail-closed attempts, fail-open outcomes, and the `NotStarted` distinction |
 | Execution gate | attempt-before-permit ordering, same-runtime dispatch, by-value permit release, and the exclusive AST/token-aware call-site guard |
 
-Milestone 13 adds these no-database observability rows through Task 8:
+Milestone 13 adds these no-database observability rows:
 
 | Area | Evidence |
 |---|---|
 | Audit record | the versioned JSON Lines shape, exact attempt/outcome key order, and the field allowlist that leaves no place for statements or secrets |
-| File audit sink | append behavior, the durable attempt-write path, startup refusal, and surfaced write failures so callers can fail closed |
-| Abandoned outcome | a panicking adapter and a dropped request each complete their recorded attempt as `abandoned`, while an ordinary request still records exactly one outcome |
+| File audit sink | append behavior, real file/directory synchronization and injected directory failure, refusal of an interrupted tail, and permanent poisoning after partial write, flush, sync, or cancellation uncertainty |
+| Abandoned outcome | queued query/explain drops, catalog panic/drop, and describe redaction panic produce `abandoned`; ordinary requests retain exactly one outcome; interrupted completion alarms without a duplicate write |
 | Span tree | a capturing subscriber proves phase order, parentage, levels, the field allowlist, and absence of the statement literal |
 | Span-tree guard | `tests/architecture.rs` parses every fenced `text` tree in `docs/operations.md` section 10.1 and production `*_span!` macros with `syn`, rather than comparing either side with a hard-coded name list |
 
@@ -47,6 +47,15 @@ read-only regular-file fixture proves that a real attempt write becomes
 `AuditError::Unavailable`; independently, the execution-gate fixture's failing sink
 proves that the error takes no permit and reaches no executor. `/dev/full` is instead a
 special-file destination refused at open time.
+
+The Docker MCP suite also runs the shipped `tracing-subscriber` formatter at the
+default and debug filters, with both stderr and file auditing. It verifies close
+events for all tool/service roots, debug phase visibility, `list_connections`,
+secret suppression, JSONL records, and protocol-only stdout. File-destination
+tests run on Unix; non-Unix file auditing has an explicit startup limitation
+(ADR-0043). Directory-sync tests prove the OS boundary, not a simulated power loss.
+Rotation is operational: stop submissions, drain, stop Warden, rotate, and restart.
+The tests make no losslessness claim for live `copytruncate`.
 
 ## 2. Policy
 

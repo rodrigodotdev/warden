@@ -1040,20 +1040,42 @@ async fn a_dropped_query_parents_detached_audit_outcome_to_service_root() {
             .execute(&context, request("SELECT token FROM t WHERE k = 'hunter2'"))
             .with_subscriber(capture.dispatch()),
     );
-    tokio::select! {
-        result = &mut execution => panic!("query completed early: {result:?}"),
-        () = tokio::task::yield_now() => {}
-    }
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            tokio::select! {
+                result = &mut execution => panic!("query completed early: {result:?}"),
+                () = tokio::time::sleep(Duration::from_millis(1)) => {}
+            }
+            if capture
+                .span_tree()
+                .iter()
+                .any(|(name, _, _)| *name == "concurrency.acquire")
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the request must reach permit acquisition");
     drop(execution);
-    tokio::task::yield_now().await;
 
-    let outcome = capture
-        .span_tree()
-        .into_iter()
-        .find(|(name, _, _)| *name == "audit.outcome");
+    let outcome = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if let Some(outcome) = capture
+                .span_tree()
+                .into_iter()
+                .find(|(name, _, _)| *name == "audit.outcome")
+            {
+                break outcome;
+            }
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the detached writer must create audit.outcome");
     assert_eq!(
         outcome,
-        Some(("audit.outcome", Some("warden.query"), Level::DEBUG,))
+        ("audit.outcome", Some("warden.query"), Level::DEBUG,)
     );
 }
 

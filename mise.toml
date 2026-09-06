@@ -43,6 +43,8 @@ run = "cargo test --workspace"
 
 [tasks."test:docker"]
 description = "Run integration tests against real containers"
+# Match docs/testing.md and CI's database capacity contract for local runs too.
+env = { RUST_TEST_THREADS = "4" }
 run = [
   "cargo test -p warden-mysql --features docker -- --nocapture",
   "cargo test -p warden-postgres --features docker -- --nocapture",

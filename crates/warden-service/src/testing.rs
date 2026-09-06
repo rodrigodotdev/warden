@@ -576,6 +576,7 @@ pub(crate) struct InspectorObservation<T> {
 #[derive(Debug)]
 pub(crate) struct FakeInspector {
     duration: Duration,
+    panics: bool,
     failure: Option<SchemaError>,
     search_result: SchemaSearchResult,
     description: SchemaDescription,
@@ -594,6 +595,7 @@ impl FakeInspector {
     pub(crate) fn new() -> Self {
         Self {
             duration: Duration::ZERO,
+            panics: false,
             failure: None,
             search_result: schema_search_result(),
             description: schema_description(),
@@ -605,6 +607,13 @@ impl FakeInspector {
     pub(crate) fn rejecting() -> Self {
         Self {
             failure: Some(SchemaError::Rejected(rejection())),
+            ..Self::new()
+        }
+    }
+    /// Panics after reaching the catalog boundary.
+    pub(crate) fn panicking() -> Self {
+        Self {
+            panics: true,
             ..Self::new()
         }
     }
@@ -683,6 +692,7 @@ impl SchemaInspector for FakeInspector {
                 .lock()
                 .unwrap()
                 .push(Self::observe(request, filter, deadline, &cancel));
+            assert!(!self.panics, "private catalog panic payload");
             tokio::select! {
                 () = sleep(self.duration) => {},
                 () = cancel.cancelled() => return Err(SchemaError::Cancelled),
@@ -706,6 +716,7 @@ impl SchemaInspector for FakeInspector {
                 .lock()
                 .unwrap()
                 .push(Self::observe(request, filter, deadline, &cancel));
+            assert!(!self.panics, "private catalog panic payload");
             tokio::select! {
                 () = sleep(self.duration) => {},
                 () = cancel.cancelled() => return Err(SchemaError::Cancelled),

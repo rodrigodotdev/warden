@@ -251,8 +251,26 @@ pool, and writes one JSON object per line. The target must be a regular file dis
 stdout; devices, FIFOs, stdout aliases, and every other special file are startup failures.
 A path is refused for the `stderr` destination. With a file destination, an unwritable
 audit volume denies queries whose attempt cannot be recorded (ADR-0022, ADR-0043).
-Rotation must append or use `copytruncate`, rather than move the open file: Warden
-continues writing the inode it already has open.
+File startup requires read access to validate the final record boundary, write access,
+and permission to open and synchronize the existing parent directory. It synchronizes
+the file and its containing directory before opening database pools. A nonempty file
+without a terminating newline is refused without truncation. Any uncertain record
+write, flush, sync, or cancellation permanently disables that live writer; later
+attempts fail closed until the operator inspects the trail and restarts Warden.
+
+The file destination currently requires Unix and a filesystem that supports directory
+synchronization. Other platforms, including Windows, compile but refuse file auditing
+at startup with `Unsupported`; use `stderr` there until an equivalent safe persistence
+protocol is implemented. Warden does not fall back to weaker file durability.
+Protect the file and parent directory from other writers, truncation, or replacement;
+one Warden process owns each trail.
+
+For rotation, stop submitting requests, let outstanding requests and audit outcomes
+drain, stop Warden, rotate the closed file, then restart. Preserve and synchronize the
+archive and its directory before removing any backup. Do not use live `copytruncate`:
+an attempt synchronized between the copy and truncate can be erased. Renaming a live
+file also leaves Warden writing its old open handle. Coordinated reopening is not
+implemented (ADR-0043).
 
 ### 3.1 Structural rules
 
@@ -865,34 +883,39 @@ A span never carries a statement, a parameter, or a `DenyReason` detail. The
 capturing subscriber in `crates/warden-service/tests/service_rules.rs` runs a real
 statement carrying a literal and verifies the ordering, parentage, field names, and
 field values. The architecture guard in `tests/architecture.rs` parses this section
-and keeps its names synchronized with code (Task 8).
+and keeps its names synchronized with code. The shipped formatter emits a `close`
+event when each enabled span closes, including eventless phases. Its busy/idle times
+describe span lifecycle, not database execution time. The actual binary is tested
+over MCP in `tests/mcp_database.rs` with the default and debug filters, with stderr
+and file auditing, including the memory-only `list_connections` tool. All formatted
+output stays on stderr; stdout carries only MCP messages.
 
 ### 10.2 Fields
 
-Reconciled with `src/audit.rs` in Milestone 12: the list below is what the code emits,
-not a wish. The added names were reviewed and carry nothing sensitive.
+`src/audit/record.rs` defines the JSON Lines format, with schema
+`warden.audit.v1`. Each attempt contains, in wire order: `schema`, `event`,
+`attempt_id`, `timestamp`, `request_id`, `principal_id`, `client`, `connection`,
+`dialect`, `environment`, `operation`, `statement_kind`, `fingerprint`, and
+`deny_codes`. Each outcome contains: `schema`, `event`, `attempt_id`, `timestamp`,
+`outcome`, `duration_ms`, `queue_wait_ms`, `rows`, `result_bytes`, and `error_code`.
+`event` is `attempt` or `outcome`; timestamps are RFC 3339, with the attempt's
+creation time and the outcome's serialization time respectively. Missing optional
+values are JSON `null`. `deny_codes` is a JSON array of fixed code strings.
 
-The Milestone 12 audit sink emits, per attempt: `attempt_id`, `request_id`,
-`principal_id`, `client`, `connection`, `dialect`, `environment`, `operation`,
-`statement_kind`, `fingerprint`, and `deny_codes`. Per outcome: `attempt_id`, `outcome`,
-`duration_ms`, `queue_wait_ms`, `rows`, `result_bytes`, and `error_code`. `src/audit.rs`
-declares both lists as constants and its own test asserts the emitted field names
-against them, so a renamed field fails the build rather than silently drifting from
-this section.
+`src/audit/tracing_sink.rs` emits the same logical fields except `schema` and
+`timestamp`: the formatter supplies time, level, and the `warden.audit` target,
+plus the fixed message `audit attempt` or `audit outcome`. Tracing omits unset
+optional values and renders `deny_codes` as a comma-joined string. Tests cover
+both sinks' field sets and JSON wire order.
 
-Four of those are new since the list this section first carried, and each is safe by
-construction: `attempt_id` is a generated identifier and the only thing that makes the two
-lines readable as one record; `client` is a validated `ClientName` of printable ASCII;
-`fingerprint` is `v1:<sha256>` and not reversible; and `deny_codes` is a comma-joined list
-of `&'static str` codes — never `DenyReason::internal_detail`, which names the object or
-function that tripped a rule and stays off every surface but a durable audit record
-(`docs/security.md` section 6). `error_code` is a `PublicErrorCode`, the same closed set
-section 10 of `docs/security.md` fixes. `outcome` is this section's former
-`policy_outcome` under the name `warden_ports::AuditOutcome` actually uses.
-
-`operation` and `queue_wait_ms` are now emitted: `operation` is a fixed `&'static str`
-drawn from `AuditOperation`'s closed set, and `queue_wait_ms` is a duration Warden
-measured itself, around permit acquisition inside the execution gate.
+`attempt_id` correlates the phases; `client` is validated printable ASCII;
+`fingerprint` is a versioned digest of the normalized statement, never raw SQL.
+`audit.mode = "none"` suppresses both fingerprint and statement kind while retaining
+the record. `operation` and `outcome` come from closed enums; `abandoned` means a
+guarded request ended before initiating its own terminal write. `queue_wait_ms`
+measures permit acquisition. `error_code` is a `PublicErrorCode`.
+Internal denial details are omitted from both JSONL and tracing, as are driver
+errors, parameters, credentials, and panic payloads.
 
 Forbidden by default: `raw_sql`, `raw_parameters`, `password`, and `dsn`. `AuditAttempt`
 has no field any of them could occupy, which is the structural half of the guarantee; the

@@ -12,20 +12,24 @@
 //! attempt from a structural claim into a tested behaviour.
 use std::fmt;
 use std::io;
+#[cfg(unix)]
+use std::io::{Read as _, Seek as _};
 use std::path::{Path, PathBuf};
 
-use tokio::io::AsyncWriteExt;
 use warden_config::AuditMode;
 use warden_ports::{AuditAttempt, AuditError, AuditOutcomeEvent, AuditSink, BoxFuture};
 
 use super::record::{AttemptRecord, OutcomeRecord};
+
+mod writer;
+use writer::Writer;
 
 /// Appends the shared audit record shape to a JSON Lines file.
 pub(crate) struct FileAuditSink {
     mode: AuditMode,
     /// The open file, held across write and flush so two concurrent records cannot
     /// interleave halves of a line.
-    file: tokio::sync::Mutex<tokio::fs::File>,
+    file: tokio::sync::Mutex<Writer<tokio::fs::File>>,
     path: PathBuf,
 }
 
@@ -34,16 +38,17 @@ impl FileAuditSink {
     ///
     /// # Errors
     ///
-    /// Returns the underlying [`std::io::Error`] if the file could not be created or
-    /// opened for appending — a missing parent directory, or a permission a
-    /// misconfigured deployment did not grant. Also returns
+    /// Returns the underlying [`std::io::Error`] if the file could not be read,
+    /// opened for appending, or persisted together with its parent directory. Returns
+    /// [`std::io::ErrorKind::Unsupported`] outside Unix (ADR-0043), and
+    /// [`std::io::ErrorKind::InvalidData`] for an unterminated existing tail. Also returns
     /// [`std::io::ErrorKind::InvalidInput`] when the target is not a regular file or
     /// resolves to the same file target as stdout.
     pub(crate) async fn open(path: PathBuf, mode: AuditMode) -> Result<Self, std::io::Error> {
         let file = open_regular_file(&path).await?;
         Ok(Self {
             mode,
-            file: tokio::sync::Mutex::new(file),
+            file: tokio::sync::Mutex::new(Writer::new(file)),
             path,
         })
     }
@@ -58,25 +63,7 @@ impl FileAuditSink {
     /// fails. The io error's detail goes in the structured field; `Display` never
     /// repeats a path or an errno.
     async fn write(&self, line: String, durable: bool) -> Result<(), AuditError> {
-        let mut file = self.file.lock().await;
-        file.write_all(line.as_bytes())
-            .await
-            .map_err(|error| AuditError::Unavailable {
-                detail: error.to_string(),
-            })?;
-        file.flush()
-            .await
-            .map_err(|error| AuditError::Unavailable {
-                detail: error.to_string(),
-            })?;
-        if durable {
-            file.sync_data()
-                .await
-                .map_err(|error| AuditError::Unavailable {
-                    detail: error.to_string(),
-                })?;
-        }
-        Ok(())
+        self.file.lock().await.write(&line, durable).await
     }
 }
 
@@ -95,50 +82,99 @@ async fn open_regular_file(path: &Path) -> io::Result<tokio::fs::File> {
 /// this function allows through.
 #[cfg(unix)]
 fn open_regular_file_sync(path: &Path) -> io::Result<std::fs::File> {
+    open_regular_file_sync_with(path, std::fs::File::sync_all)
+}
+
+#[cfg(unix)]
+fn open_regular_file_sync_with(
+    path: &Path,
+    persist_directory: impl FnOnce(&std::fs::File) -> io::Result<()>,
+) -> io::Result<std::fs::File> {
     use rustix::fs::{Mode, OFlags};
 
     reject_existing_non_regular_file(path)?;
 
-    let descriptor = rustix::fs::open(
-        path,
-        OFlags::WRONLY | OFlags::APPEND | OFlags::CREATE | OFlags::CLOEXEC | OFlags::NONBLOCK,
+    // Resolve an existing final symlink before retaining its containing directory.
+    // NOFOLLOW on openat below refuses a replacement rather than syncing the wrong
+    // directory. For a new file only its existing parent needs resolution.
+    let resolved = match path.canonicalize() {
+        Ok(resolved) => resolved,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let parent = path
+                .parent()
+                .filter(|p| !p.as_os_str().is_empty())
+                .unwrap_or(Path::new("."));
+            parent
+                .canonicalize()?
+                .join(path.file_name().ok_or_else(invalid_audit_destination)?)
+        }
+        Err(error) => return Err(error),
+    };
+    let directory: std::fs::File = rustix::fs::open(
+        resolved.parent().ok_or_else(invalid_audit_destination)?,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?
+    .into();
+    let descriptor = rustix::fs::openat(
+        &directory,
+        resolved.file_name().ok_or_else(invalid_audit_destination)?,
+        OFlags::RDWR
+            | OFlags::APPEND
+            | OFlags::CREATE
+            | OFlags::CLOEXEC
+            | OFlags::NONBLOCK
+            | OFlags::NOFOLLOW,
         Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
     )?;
-    validate_opened_file(descriptor.into())
+    let file = validate_opened_file(descriptor.into())?;
+    file.sync_all()?;
+    persist_directory(&directory)?;
+    Ok(file)
 }
 
-/// Other platforms still validate both before and after opening. The preflight keeps
-/// a named special file out of a potentially blocking open, while the second check
-/// closes replacement races for targets whose native open does return.
+/// Do not silently claim directory-entry persistence where no equivalent safe
+/// protocol is implemented. Tracing remains available on these platforms (ADR-0043).
 #[cfg(not(unix))]
-fn open_regular_file_sync(path: &Path) -> io::Result<std::fs::File> {
-    reject_existing_non_regular_file(path)?;
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
-    validate_opened_file(file)
+fn open_regular_file_sync(_path: &Path) -> io::Result<std::fs::File> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "durable audit file creation is not supported on this platform; use stderr tracing",
+    ))
 }
 
 /// Validates the object the open actually reached, then compares that object with the
 /// process's stdout target. `same-file` performs the safe platform-specific descriptor
 /// comparison on both Unix and Windows; comparing paths would miss descriptor aliases,
 /// symlinks, and hardlinks.
+#[cfg(unix)]
 fn validate_opened_file(file: std::fs::File) -> io::Result<std::fs::File> {
     if !file.metadata()?.is_file() {
         return Err(invalid_audit_destination());
     }
 
-    let retained = file.try_clone()?;
+    let mut retained = file.try_clone()?;
     let opened = same_file::Handle::from_file(file)?;
     if opened == same_file::Handle::stdout()? {
         return Err(invalid_audit_destination());
+    }
+    if retained.metadata()?.len() != 0 {
+        retained.seek(io::SeekFrom::End(-1))?;
+        let mut tail = [0];
+        retained.read_exact(&mut tail)?;
+        if tail != *b"\n" {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "the audit destination has an unterminated record",
+            ));
+        }
     }
     Ok(retained)
 }
 
 /// Refuses a known special target before opening it. A missing target is valid: the
 /// sink creates a new regular file there.
+#[cfg(unix)]
 fn reject_existing_non_regular_file(path: &Path) -> io::Result<()> {
     match std::fs::metadata(path) {
         Ok(metadata) if !metadata.is_file() => Err(invalid_audit_destination()),
@@ -148,6 +184,7 @@ fn reject_existing_non_regular_file(path: &Path) -> io::Result<()> {
     }
 }
 
+#[cfg(unix)]
 fn invalid_audit_destination() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
@@ -202,16 +239,32 @@ mod tests {
 
     use std::path::Path;
     use std::sync::atomic::{AtomicU64, Ordering};
+    #[cfg(unix)]
     use std::time::Duration;
 
     use warden_core::analysis::StatementKind;
     use warden_core::connection::Environment;
     use warden_core::dialect::Dialect;
-    use warden_ports::{AuditEventId, AuditOperation, AuditOutcome};
+    #[cfg(unix)]
+    use warden_ports::AuditOutcome;
+    use warden_ports::{AuditEventId, AuditOperation};
 
+    #[cfg(unix)]
     use super::super::record::RECORD_SCHEMA;
     use super::*;
 
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn unsupported_directory_persistence_fails_before_creation() {
+        let file = TempPath::new("unsupported-persistence");
+        let error = FileAuditSink::open(file.path().to_owned(), AuditMode::Fingerprint)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        assert!(!file.path().exists());
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn both_phases_land_as_one_json_line_each() {
         let file = TempPath::new("records");
@@ -233,6 +286,7 @@ mod tests {
         assert_eq!(lines[1]["attempt_id"], lines[0]["attempt_id"]);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn a_sink_appends_rather_than_truncating_what_is_already_recorded() {
         let file = TempPath::new("append");
@@ -263,6 +317,54 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn an_interrupted_tail_is_rejected_before_appending() {
+        let file = TempPath::new("interrupted-tail");
+        let prefix = b"{\"schema\":\"warden.audit.v1\"";
+        std::fs::write(file.path(), prefix).unwrap();
+        let error = FileAuditSink::open(file.path().to_owned(), AuditMode::Fingerprint)
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(std::fs::read(file.path()).unwrap(), prefix);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn directory_persistence_failure_refuses_startup() {
+        let file = TempPath::new("directory-sync-failure");
+        let error = open_regular_file_sync_with(file.path(), |directory| {
+            assert!(directory.metadata()?.is_dir());
+            Err(io::Error::other("injected directory persistence failure"))
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "injected directory persistence failure");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn creation_persists_the_directory_that_contains_the_opened_file() {
+        let file = TempPath::new("directory-sync-success");
+        let mut persisted = false;
+        open_regular_file_sync_with(file.path(), |directory| {
+            assert!(directory.metadata()?.is_dir());
+            assert_eq!(
+                same_file::Handle::from_file(directory.try_clone()?)?,
+                same_file::Handle::from_path(file.path().parent().unwrap())?,
+            );
+            assert!(
+                file.path().is_file(),
+                "create must precede directory persistence"
+            );
+            directory.sync_all()?;
+            persisted = true;
+            Ok(())
+        })
+        .unwrap();
+        assert!(persisted, "startup must persist the directory entry");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn a_non_regular_special_file_is_rejected_before_use() {
         let error = FileAuditSink::open(PathBuf::from("/dev/full"), AuditMode::Fingerprint)
             .await
@@ -277,7 +379,7 @@ mod tests {
         let read_only = std::fs::File::open(file.path()).unwrap();
         let sink = FileAuditSink {
             mode: AuditMode::Fingerprint,
-            file: tokio::sync::Mutex::new(tokio::fs::File::from_std(read_only)),
+            file: tokio::sync::Mutex::new(Writer::new(tokio::fs::File::from_std(read_only))),
             path: file.path().to_owned(),
         };
 
@@ -335,6 +437,7 @@ mod tests {
     }
 
     /// One outcome correlated with `attempt_id`.
+    #[cfg(unix)]
     fn outcome(attempt_id: AuditEventId) -> AuditOutcomeEvent {
         AuditOutcomeEvent {
             attempt_id,

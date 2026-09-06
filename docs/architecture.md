@@ -392,15 +392,16 @@ request. Step 8 is adapter-owned: the service passes `runtime.limits()` into
 
 The attempt is recorded **before** permit acquisition and execution. If the sink
 fails, deny the query. If the process dies during execution, the attempt is already
-recorded. A recorded attempt receives its terminal outcome only if the request future
-is polled to completion — dropping it mid-flight releases the permit but writes no
-outcome — so the audit trail's completeness depends on each request running in its own
-task, as `AGENTS.md` requires. Milestone 12 shipped that:
+recorded. Each request runs in its own task, as `AGENTS.md` requires:
 `WardenServer::run_in_task` in `crates/warden-mcp/src/server.rs` spawns every tool call
 that reaches an adapter, awaits the handle, and maps a `JoinError` to `internal_error`.
-It contains the panic; `warden-service`'s drop guard writes an `abandoned` outcome for
-an attempt whose request was dropped or panicked, and the write is detached because
-`Drop` cannot await.
+The service arms an outcome guard immediately after a successful authorized-statement
+or catalog attempt, before permit queueing or database dispatch, and keeps it through
+redaction. A dropped or panicking pending request emits an alarm and detaches a bounded
+best-effort `abandoned` outcome because `Drop` cannot await. Once terminal completion
+is in progress, cancellation emits only a sanitized alarm: the first record may have
+persisted, so retrying could produce a duplicate. Runtime shutdown can prevent a
+detached outcome from running; the synchronous alarm covers that observability gap.
 
 ## 9. Why adapters remain separate crates
 

@@ -117,37 +117,38 @@ pub(crate) async fn record_outcome(sink: &dyn AuditSink, event: AuditOutcomeEven
     }
 }
 
-/// Guarantees that a recorded attempt receives a terminal outcome.
+/// Tracks a recorded attempt through queueing, database access, and redaction.
 ///
-/// `docs/architecture.md` section 8 states the gap this closes: an attempt is
-/// completed only if the request future is polled to completion, so a dropped or
-/// panicking request left the audit trail's most interesting record half-written.
-/// The guard is armed after the attempt is on record and disarmed by
-/// [`OutcomeGuard::complete`]; the only way to reach its `Drop` is a request that
-/// ended without saying how.
-///
-/// **Scope, stated honestly:** the guard is armed by the caller after
-/// `ExecutionGate::enter` returns, so a panic *inside* permit acquisition — a
-/// semaphore acquire under a timeout, with no user code in it — is still
-/// unguarded. Closing that would mean the gate constructing the guard and handing
-/// it back through both result arms, which buys nothing this path can exercise.
+/// An abandoned pending request raises an alarm and detaches a best-effort outcome.
+/// Cancellation during completion raises only an alarm: the sink may already have
+/// persisted that terminal record, so writing another would risk a contradiction.
 pub(crate) struct OutcomeGuard {
     sink: Arc<dyn AuditSink>,
-    pending: Option<AuditEventId>,
+    state: OutcomeState,
     /// The service root that owns this attempt, retained for a detached outcome.
     parent: tracing::Span,
     /// The dispatcher that created `parent`, because spawned tasks do not inherit it.
     dispatch: tracing::Dispatch,
 }
 
-/// Prints only the pending attempt id.
+#[derive(Debug)]
+enum OutcomeState {
+    Pending(AuditEventId),
+    Completing {
+        attempt_id: AuditEventId,
+        outcome: AuditOutcome,
+    },
+    Finished,
+}
+
+/// Prints only the attempt's terminal-state tracking, omitting the sink and dispatcher.
 ///
 /// `AuditSink` is not `Debug` — the same reason `QueryService`, `ExplainService`, and
 /// `SchemaService` all hand-write this impl and omit the port (`query.rs`).
 impl fmt::Debug for OutcomeGuard {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("OutcomeGuard")
-            .field("pending", &self.pending)
+            .field("state", &self.state)
             .finish_non_exhaustive()
     }
 }
@@ -161,7 +162,7 @@ impl OutcomeGuard {
     ) -> Self {
         Self {
             sink,
-            pending: Some(attempt_id),
+            state: OutcomeState::Pending(attempt_id),
             parent,
             dispatch: tracing::dispatcher::get_default(Clone::clone),
         }
@@ -169,15 +170,34 @@ impl OutcomeGuard {
 
     /// Records the outcome the request actually had and disarms.
     pub(crate) async fn complete(mut self, event: AuditOutcomeEvent) {
-        self.pending = None;
+        self.state = OutcomeState::Completing {
+            attempt_id: event.attempt_id,
+            outcome: event.outcome,
+        };
         record_outcome(self.sink.as_ref(), event).await;
+        self.state = OutcomeState::Finished;
     }
 }
 
 impl Drop for OutcomeGuard {
     fn drop(&mut self) {
-        let Some(attempt_id) = self.pending.take() else {
-            return;
+        // Drop can run outside the dispatch that originally polled the request.
+        let _dispatch = tracing::dispatcher::set_default(&self.dispatch);
+        let attempt_id = match std::mem::replace(&mut self.state, OutcomeState::Finished) {
+            OutcomeState::Finished => return,
+            OutcomeState::Pending(attempt_id) => attempt_id,
+            OutcomeState::Completing {
+                attempt_id,
+                outcome,
+            } => {
+                tracing::error!(
+                    target: "warden.audit",
+                    attempt_id = %attempt_id,
+                    outcome = %outcome,
+                    "audit outcome completion was interrupted; persistence is unknown"
+                );
+                return;
+            }
         };
         // Always on stderr, whether or not the durable write below survives: a
         // runtime that is shutting down accepts a spawn and never polls it, and an
@@ -332,6 +352,71 @@ mod tests {
         }
     }
 
+    /// A sink that may have persisted before its completion future is cancelled.
+    struct PendingOutcomeSink(Mutex<Vec<AuditOutcomeEvent>>);
+
+    impl AuditSink for PendingOutcomeSink {
+        fn record_attempt<'a>(
+            &'a self,
+            _event: &'a AuditAttempt,
+        ) -> warden_ports::BoxFuture<'a, Result<(), AuditError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn record_outcome<'a>(
+            &'a self,
+            event: &'a AuditOutcomeEvent,
+        ) -> warden_ports::BoxFuture<'a, Result<(), AuditError>> {
+            self.0.lock().unwrap().push(*event);
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_completion_alarms_without_writing_a_duplicate_outcome() {
+        use std::future::Future as _;
+        use std::task::{Context, Waker};
+
+        let _lock = alarm_test_lock();
+        let events = alarm_events();
+        events.lock().unwrap().clear();
+        let sink = Arc::new(PendingOutcomeSink(Mutex::new(Vec::new())));
+        let recorded = outcome();
+        let guard = OutcomeGuard::arm(sink.clone(), recorded.attempt_id, tracing::Span::none());
+        let mut completion = Box::pin(guard.complete(recorded));
+        assert!(
+            completion
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        assert_eq!(*sink.0.lock().unwrap(), vec![recorded]);
+        drop(completion);
+
+        let events = events.lock().unwrap();
+        let alarms: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event.fields.get("attempt_id") == Some(&recorded.attempt_id.to_string())
+            })
+            .collect();
+        assert_eq!(
+            alarms.len(),
+            1,
+            "cancellation must leave a synchronous alarm"
+        );
+        let alarm = alarms[0];
+        assert_eq!(alarm.target, "warden.audit");
+        assert_eq!(alarm.fields.get("outcome"), Some(&"succeeded".to_owned()));
+        assert_eq!(
+            alarm.fields.keys().map(String::as_str).collect::<Vec<_>>(),
+            vec!["attempt_id", "message", "outcome"]
+        );
+        // A blindly detached retry would own another Arc even before being polled.
+        assert_eq!(Arc::strong_count(&sink), 1);
+        assert_eq!(*sink.0.lock().unwrap(), vec![recorded]);
+    }
+
     #[test]
     fn an_attempt_carries_every_denial_and_no_statement() {
         let reasons = vec![DenyReason::new(warden_policy::DenyCode::WriteStatement)];
@@ -407,8 +492,14 @@ mod tests {
         record_outcome(&sink, recorded).await;
 
         let events = events.lock().unwrap();
-        assert_eq!(events.len(), 1);
-        let alarm = &events[0];
+        let alarms: Vec<_> = events
+            .iter()
+            .filter(|event| {
+                event.fields.get("attempt_id") == Some(&recorded.attempt_id.to_string())
+            })
+            .collect();
+        assert_eq!(alarms.len(), 1);
+        let alarm = alarms[0];
         assert_eq!(alarm.target, "warden.audit");
         assert_eq!(
             alarm.fields.get("attempt_id"),

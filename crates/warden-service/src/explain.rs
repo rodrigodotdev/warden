@@ -171,33 +171,22 @@ impl ExplainService {
                 },
                 Vec::new(),
             );
-            let gate = match ExecutionGate::enter(
+            let (gate, guard) = match ExecutionGate::enter(
                 &runtime,
-                self.audit.as_ref(),
+                Arc::clone(&self.audit),
                 &attempt,
                 authorized,
                 self.shutdown.child_token(),
+                outcome_parent,
             )
             .await
             {
                 Ok(gate) => gate,
                 Err(GateError::Audit(error)) => return Err(error.into()),
-                Err(GateError::Connection { error, queue_wait }) => {
-                    let code = error.public_code();
-                    self.complete(
-                        &attempt,
-                        AuditOutcome::NotStarted,
-                        None,
-                        Some(queue_wait),
-                        code,
-                    )
-                    .await;
-                    return Err(error.into());
-                }
+                // The gate completed the recorded attempt as not_started.
+                Err(GateError::Connection { error, .. }) => return Err(error.into()),
             };
 
-            let guard =
-                audit::OutcomeGuard::arm(Arc::clone(&self.audit), attempt.id, outcome_parent);
             // A service-side clock around the gated call: planning plus the adapter's own
             // overhead, started after the permit was acquired so the queue wait is
             // excluded. `QueryPlan` carries no adapter-measured duration the way
@@ -313,6 +302,24 @@ pub(crate) fn redactor_arc(service: &ExplainService) -> &Arc<Redactor> {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    #[tokio::test(start_paused = true)]
+    async fn dropping_a_queued_explain_records_abandoned() {
+        let (service, sink, _held) = testing::saturated_explain_service().await;
+        let context = testing::request_context();
+        let mut explanation =
+            Box::pin(service.explain(&context, ExplainRequest::new(testing::request())));
+        tokio::select! {
+            result = &mut explanation => panic!("queued explain completed: {result:?}"),
+            () = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+        assert_eq!(sink.attempts().len(), 1);
+        assert!(sink.outcomes().is_empty());
+        drop(explanation);
+        let outcome = testing::await_outcome(&sink).await;
+        assert_eq!(outcome.attempt_id, sink.attempts()[0].id);
+        assert_eq!(outcome.outcome, AuditOutcome::Abandoned);
+    }
+
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -355,6 +362,11 @@ mod tests {
         assert_eq!(outcomes[0].result_bytes, Some(plan.plan_bytes()));
         assert_eq!(outcomes[0].error_code, None);
         assert_eq!(attempts[0].operation, AuditOperation::Explain);
+        assert_eq!(
+            Arc::strong_count(&sink),
+            2,
+            "no detached duplicate writer may remain"
+        );
     }
 
     #[tokio::test]

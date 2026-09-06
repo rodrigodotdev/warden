@@ -566,7 +566,7 @@ pub struct AuditOutcomeEvent {
 }
 
 pub enum AuditOutcome {
-    Denied, Succeeded, Failed, TimedOut, Cancelled, NotStarted,
+    Denied, Succeeded, Failed, TimedOut, Cancelled, NotStarted, Abandoned,
 }
 
 pub enum AuditOperation {
@@ -576,6 +576,11 @@ pub enum AuditOperation {
 
 `NotStarted` means an authorized statement had an attempt on record but never reached
 the database, such as when permit acquisition ended at `server_busy`.
+`Abandoned` means a guarded request was dropped or panicked before beginning its
+terminal outcome write. It reports `internal_error`, without a panic payload. A
+request dropped while its terminal write is already in progress raises only a
+sanitized alarm: that record may already exist, so Warden does not append a
+potentially duplicate or contradictory outcome.
 
 `statement_kind` is `None` for `search_schema` and `describe_schema`: a catalog read
 submits no statement, so recording one would be false.
@@ -587,8 +592,10 @@ string, so an outcome cannot record a code outside the closed set of section 10.
 Both types live in `warden-ports`, not `warden-core`: `AuditAttempt` carries
 `DenyReason`, which belongs to `warden-policy`, downstream of the core. Neither
 derives `Serialize` — a record carrying internal denial detail must not be attachable
-to a tool response by accident, and Milestone 13's sink decides its own format for the
-fields it may write.
+to a tool response by accident. `src/audit/record.rs` projects the permitted fields
+into `warden.audit.v1` JSON Lines; `src/audit/tracing_sink.rs` emits its tracing form.
+Internal denial details are absent from both. Operations section 10.2 enumerates
+the envelope and payload fields, including their different denial-code encoding.
 
 ### 11.3 SQL in audits
 
@@ -661,15 +668,20 @@ Two complementary controls are mandatory:
 `JoinError` to `internal_error` while logging no payload. `list_connections` is the one
 exception, and deliberately so: it reads an in-memory map and awaits nothing, so a task
 would add a hop and a failure mode without containing anything.
-`docs/architecture.md` section 8 and ADR-0038 both assign this to Milestone 12 by name,
-because a recorded audit attempt receives its terminal outcome only if the request future
-is polled to completion. Containment is all it buys: a task that panics still leaves its
-attempt half-written, which ADR-0038 states — `warden-service`'s drop guard writes an
-`abandoned` outcome for an attempt whose request was dropped or panicked, and the write
-is detached because `Drop` cannot await. Milestone 13 installs the process panic hook
-after tracing, so it emits source location, thread name, payload shape, and only a
-runtime-captured backtrace. It neither reads nor emits the payload; ADR-0045 records the
-deliberate trade-off of message convenience for data safety.
+Milestone 13 adds audit coverage when a request cannot complete normally. The service
+arms `OutcomeGuard` immediately after each successful attempt for an authorized
+query/explain or catalog operation. It remains armed during permit queueing,
+execution, and redaction, including describe-schema redaction. Dropping or panicking
+before completion emits a synchronous sanitized alarm and schedules a bounded,
+best-effort `abandoned` outcome. `Drop` cannot await, and runtime shutdown can prevent
+the detached write from running; the alarm does not depend on that write. Once
+terminal completion starts, cancellation emits only an alarm because persistence is
+unknown. File-sink uncertainty also poisons the live writer so subsequent attempts
+fail closed (ADR-0043).
+
+The process panic hook is installed after tracing and emits source location, thread
+name, payload shape, and only a runtime-captured backtrace. It neither reads nor emits
+the payload; ADR-0045 records the trade-off of message convenience for data safety.
 
 Do not globally catch every panic and continue as if nothing happened. Add parser
 panic containment only if fuzzing demonstrates a dependency panic that can be safely

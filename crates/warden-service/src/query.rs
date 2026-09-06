@@ -179,34 +179,23 @@ impl QueryService {
                 },
                 Vec::new(),
             );
-            let gate = match ExecutionGate::enter(
+            let (gate, guard) = match ExecutionGate::enter(
                 &runtime,
-                self.audit.as_ref(),
+                Arc::clone(&self.audit),
                 &attempt,
                 authorized,
                 self.shutdown.child_token(),
+                outcome_parent,
             )
             .await
             {
                 Ok(gate) => gate,
                 // No attempt was recorded, so there is no outcome to complete.
                 Err(GateError::Audit(error)) => return Err(error.into()),
-                Err(GateError::Connection { error, queue_wait }) => {
-                    let code = error.public_code();
-                    self.complete(
-                        &attempt,
-                        AuditOutcome::NotStarted,
-                        None,
-                        Some(queue_wait),
-                        code,
-                    )
-                    .await;
-                    return Err(error.into());
-                }
+                // The gate completed the recorded attempt as not_started.
+                Err(GateError::Connection { error, .. }) => return Err(error.into()),
             };
 
-            let guard =
-                audit::OutcomeGuard::arm(Arc::clone(&self.audit), attempt.id, outcome_parent);
             let queue_wait = gate.queue_wait();
             match gate.execute().await {
                 Ok(mut result) => {
@@ -776,6 +765,23 @@ mod tests {
         assert_eq!(outcome.outcome, AuditOutcome::Abandoned);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn dropping_a_queued_query_records_abandoned() {
+        let (service, sink, _held) = testing::saturated_query_service().await;
+        let context = testing::request_context();
+        let mut execution = Box::pin(service.execute(&context, testing::request()));
+        tokio::select! {
+            result = &mut execution => panic!("queued query completed: {result:?}"),
+            () = tokio::time::sleep(Duration::from_millis(10)) => {}
+        }
+        assert_eq!(sink.attempts().len(), 1);
+        assert!(sink.outcomes().is_empty());
+        drop(execution);
+        let outcome = testing::await_outcome(&sink).await;
+        assert_eq!(outcome.attempt_id, sink.attempts()[0].id);
+        assert_eq!(outcome.outcome, AuditOutcome::Abandoned);
+    }
+
     #[tokio::test]
     async fn an_ordinary_request_records_exactly_one_outcome() {
         // The guard must disarm on the normal path, or every successful query would
@@ -789,9 +795,13 @@ mod tests {
             .execute(&testing::request_context(), testing::request())
             .await
             .unwrap();
-        tokio::task::yield_now().await;
         assert_eq!(sink.outcomes().len(), 1);
         assert_eq!(sink.outcomes()[0].outcome, AuditOutcome::Succeeded);
+        assert_eq!(
+            Arc::strong_count(&sink),
+            2,
+            "no detached duplicate writer may remain"
+        );
     }
 
     #[test]
