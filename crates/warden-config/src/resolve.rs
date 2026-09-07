@@ -365,24 +365,47 @@ mod tests {
 
     use super::*;
 
-    /// A uniquely named directory under the OS temp directory. Built from the process
-    /// id and an atomic counter rather than a new dependency.
-    fn tempdir() -> PathBuf {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let directory = std::env::temp_dir().join(format!(
-            "warden-config-resolve-{}-{unique}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
-        directory
+    /// A uniquely named directory under the OS temp directory, removed on drop.
+    ///
+    /// Built from the process id and an atomic counter rather than a new dependency, so
+    /// parallel test binaries and repeated test functions in this one never collide.
+    /// The `Drop` is the point: without it every `cargo test -p warden-config` left
+    /// directories behind, which the two helpers this replaces both did.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let directory = std::env::temp_dir().join(format!(
+                "warden-config-{label}-{}-{unique}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&directory).unwrap();
+            Self(directory)
+        }
+
+        fn join(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ignored = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     /// Parses a TOML literal after substituting `{MYSQL_DSN}` and `{POSTGRES_DSN}` for
     /// the paths of two files this helper writes, so no test needs an environment
     /// variable.
-    fn config_with(template: &str) -> Config {
-        let directory = tempdir();
+    /// A parsed configuration and the directory holding the DSN files it points at.
+    ///
+    /// The directory is returned rather than dropped here: `Config::resolve` reads
+    /// those files, so they have to outlive this call. They used to survive only
+    /// because the helper leaked its directory into `/tmp` on every run.
+    fn config_with(template: &str) -> (Config, TempDir) {
+        let directory = TempDir::new("resolve");
         let mysql_path = directory.join("mysql-dsn");
         let postgres_path = directory.join("postgres-dsn");
         std::fs::write(&mysql_path, "mysql://warden_ro:pw@db.internal:3306/app").unwrap();
@@ -394,7 +417,7 @@ mod tests {
         let text = template
             .replace("{MYSQL_DSN}", &mysql_path.display().to_string())
             .replace("{POSTGRES_DSN}", &postgres_path.display().to_string());
-        Config::from_toml_str(&text).unwrap()
+        (Config::from_toml_str(&text).unwrap(), directory)
     }
 
     /// Resolves an audit-focused literal with one otherwise valid connection.
@@ -410,7 +433,7 @@ mod tests {
              policy = \"p\"\n\
              [policies.p]\n"
         );
-        config_with(&complete).resolve()
+        config_with(&complete).0.resolve()
     }
 
     const PROFILES_AGREE: &str = r#"
@@ -656,7 +679,7 @@ policy = "p"
 
     #[test]
     fn a_valid_deployment_resolves_into_what_the_composition_root_needs() {
-        let resolved = config_with(PROFILES_AGREE).resolve().unwrap();
+        let resolved = config_with(PROFILES_AGREE).0.resolve().unwrap();
         assert_eq!(resolved.connections.len(), 2);
         assert_eq!(resolved.connections[0].metadata.database, "app");
         assert_eq!(resolved.connections[0].limits.max_rows, 200);
@@ -701,7 +724,7 @@ policy = "p"
     fn two_profiles_that_disagree_about_policy_refuse_to_start() {
         // ADR-0039: one PolicyEngine cannot honour two policies, and quietly applying one
         // of them to a connection that asked for the other is the worst option available.
-        let error = config_with(PROFILES_DISAGREE).resolve().unwrap_err();
+        let error = config_with(PROFILES_DISAGREE).0.resolve().unwrap_err();
         assert_eq!(
             error,
             ConfigError::ConflictingPolicy {
@@ -714,7 +737,10 @@ policy = "p"
 
     #[test]
     fn two_profiles_may_differ_in_capacity() {
-        let resolved = config_with(PROFILES_DIFFER_IN_CAPACITY).resolve().unwrap();
+        let resolved = config_with(PROFILES_DIFFER_IN_CAPACITY)
+            .0
+            .resolve()
+            .unwrap();
         assert_ne!(
             resolved.connections[0].limits.max_rows,
             resolved.connections[1].limits.max_rows
@@ -734,7 +760,7 @@ policy = "p"
             (POOL_BELOW_CONCURRENCY, "max_connections"),
             (CLEARTEXT_IN_PRODUCTION, "tls"),
         ] {
-            let error = config_with(toml).resolve().unwrap_err().to_string();
+            let error = config_with(toml).0.resolve().unwrap_err().to_string();
             assert!(error.contains(expected), "{toml}\n-> {error}");
         }
     }
@@ -742,6 +768,7 @@ policy = "p"
     #[test]
     fn a_dsn_whose_scheme_contradicts_the_declared_dialect_is_refused() {
         let error = config_with(POSTGRES_DSN_ON_MYSQL_ENTRY)
+            .0
             .resolve()
             .unwrap_err();
         assert!(

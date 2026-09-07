@@ -23,11 +23,40 @@ use sqlx::{AssertSqlSafe, Row};
 use testcontainers_modules::mysql::Mysql;
 use testcontainers_modules::testcontainers::{ContainerAsync, ImageExt, runners::AsyncRunner};
 use tokio::time::Instant;
-use warden_core::connection::Environment;
+use warden_core::connection::{ConnectionMetadata, Environment};
+use warden_core::context::RequestContext;
+use warden_core::dialect::Dialect;
 use warden_core::limits::ExecutionLimits;
 use warden_core::pool::PoolSettings;
 use warden_core::secret::{Dsn, DsnError};
 use warden_core::tls::{TlsMode, TlsSettings};
+
+/// Fixtures every `container_tests` submodule shares.
+///
+/// One copy in the module every submodule already imports from, rather than the
+/// four identical copies these replace. Each submodule reads them through
+/// `use super::{context, metadata}`.
+/// A fixed request identity.
+fn context() -> RequestContext {
+    RequestContext::new(
+        "req-1".parse().unwrap(),
+        "alice@example.com".parse().unwrap(),
+        "Claude Code".parse().unwrap(),
+    )
+}
+
+/// The connection every fixture targets.
+///
+/// The name matches the `QueryRequest` `authorized` builds, because
+/// `PolicyEngine::authorize` compares the two and denies a mismatch.
+fn metadata() -> ConnectionMetadata {
+    ConnectionMetadata {
+        name: "production-db".parse().unwrap(),
+        dialect: Dialect::MySql,
+        environment: Environment::Development,
+        database: "test".to_owned(),
+    }
+}
 
 use crate::connection::{MySqlConnectionConfig, MySqlConnectionPools};
 use crate::error::ConnectError;

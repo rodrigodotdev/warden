@@ -22,8 +22,7 @@ use sqlx::{AssertSqlSafe, Connection};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use warden_core::analysis::{QueryAnalysis, QueryAnalysisParts, StatementKind};
-use warden_core::connection::{Capabilities, ConnectionMetadata, Environment};
-use warden_core::context::RequestContext;
+use warden_core::connection::Capabilities;
 use warden_core::dialect::Dialect;
 use warden_core::error::{PublicError, PublicErrorCode};
 use warden_core::limits::ExecutionLimits;
@@ -37,7 +36,7 @@ use warden_ports::{
     ConnectionRuntime, ConnectionRuntimeParts, QueryAnalyzer, QueryExecutor, QueryPermit,
 };
 
-use super::{config, dsn, setting, start_postgres};
+use super::{config, context, dsn, metadata, setting, start_postgres};
 use crate::analyzer::PostgreSqlAnalyzer;
 use crate::connection::PostgreSqlConnectionPools;
 use crate::execute::PostgreSqlQueryExecutor;
@@ -114,28 +113,6 @@ fn runtime(executor: Arc<PostgreSqlQueryExecutor>, limits: ExecutionLimits) -> C
 /// The default engine every deployment uses.
 fn engine() -> PolicyEngine {
     PolicyEngine::with_defaults(&PolicySettings::default()).unwrap()
-}
-
-/// A fixed request identity.
-fn context() -> RequestContext {
-    RequestContext::new(
-        "req-1".parse().unwrap(),
-        "alice@example.com".parse().unwrap(),
-        "Claude Code".parse().unwrap(),
-    )
-}
-
-/// The connection every fixture targets.
-///
-/// The name matches the `QueryRequest` `authorized` builds, because
-/// `PolicyEngine::authorize` compares the two and denies a mismatch.
-fn metadata() -> ConnectionMetadata {
-    ConnectionMetadata {
-        name: "production-db".parse().unwrap(),
-        dialect: Dialect::PostgreSql,
-        environment: Environment::Development,
-        database: "postgres".to_owned(),
-    }
 }
 
 /// A generous client deadline, for the tests that are not about deadlines.

@@ -14,9 +14,8 @@ use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::ContainerAsync;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use warden_core::connection::{ConnectionMetadata, ConnectionName, Environment};
+use warden_core::connection::{ConnectionMetadata, ConnectionName};
 use warden_core::context::RequestContext;
-use warden_core::dialect::Dialect;
 use warden_core::pool::AGENT_POOL_MAX_CONNECTIONS;
 use warden_core::schema::cache::{SCHEMA_CACHE_CAPACITY, SchemaCache};
 use warden_core::schema::{
@@ -30,7 +29,7 @@ use warden_policy::{
 use warden_ports::SchemaInspector;
 use warden_ports::error::SchemaError;
 
-use super::{config, dsn, start_postgres};
+use super::{config, context, dsn, metadata, start_postgres};
 use crate::connection::{PostgreSqlConnectionConfig, PostgreSqlConnectionPools, SearchPath};
 use crate::inspector::PostgreSqlSchemaInspector;
 
@@ -39,23 +38,6 @@ const ROLE_PASSWORD: &str = "warden-inspector-password";
 
 fn name() -> ConnectionName {
     "production-db".parse().unwrap()
-}
-
-fn context() -> RequestContext {
-    RequestContext::new(
-        "req-1".parse().unwrap(),
-        "alice@example.com".parse().unwrap(),
-        "Claude Code".parse().unwrap(),
-    )
-}
-
-fn metadata() -> ConnectionMetadata {
-    ConnectionMetadata {
-        name: name(),
-        dialect: Dialect::PostgreSql,
-        environment: Environment::Development,
-        database: "postgres".to_owned(),
-    }
 }
 
 fn engine(settings: &PolicySettings) -> PolicyEngine {

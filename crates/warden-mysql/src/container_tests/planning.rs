@@ -17,8 +17,7 @@ use sqlx::{AssertSqlSafe, Row};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use warden_core::analysis::{QueryAnalysis, QueryAnalysisParts, StatementKind};
-use warden_core::connection::{Capabilities, ConnectionMetadata, Environment};
-use warden_core::context::RequestContext;
+use warden_core::connection::Capabilities;
 use warden_core::dialect::Dialect;
 use warden_core::error::{PublicError, PublicErrorCode};
 use warden_core::limits::ExecutionLimits;
@@ -28,7 +27,7 @@ use warden_policy::{AnalyzedQuery, AuthorizedQuery, PolicyEngine, PolicySettings
 use warden_ports::error::ExplainError;
 use warden_ports::{ConnectionRuntime, ConnectionRuntimeParts, QueryPermit};
 
-use super::{config, dsn, start_mysql, tls};
+use super::{config, context, dsn, metadata, start_mysql, tls};
 use crate::analyzer::MySqlAnalyzer;
 use crate::connection::MySqlConnectionPools;
 use crate::execute::MySqlQueryExecutor;
@@ -85,23 +84,6 @@ fn authorized(sql: &str, parameters: Vec<ParameterValue>) -> AuthorizedQuery {
             ExecutionLimits::default(),
         )
         .unwrap()
-}
-
-fn context() -> RequestContext {
-    RequestContext::new(
-        "req-1".parse().unwrap(),
-        "alice@example.com".parse().unwrap(),
-        "Claude Code".parse().unwrap(),
-    )
-}
-
-fn metadata() -> ConnectionMetadata {
-    ConnectionMetadata {
-        name: "production-db".parse().unwrap(),
-        dialect: Dialect::MySql,
-        environment: Environment::Development,
-        database: "test".to_owned(),
-    }
 }
 
 /// A runtime over the real four ports, so a test can hold a real permit.

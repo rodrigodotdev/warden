@@ -21,16 +21,13 @@ use sqlx::{AssertSqlSafe, Connection, Row};
 use testcontainers_modules::postgres::Postgres;
 use testcontainers_modules::testcontainers::ContainerAsync;
 use warden_core::analysis::{FunctionClassification, RiskFlag, StatementKind};
-use warden_core::connection::{ConnectionMetadata, Environment};
-use warden_core::context::RequestContext;
-use warden_core::dialect::Dialect;
 use warden_core::limits::ExecutionLimits;
 use warden_core::query::{InputLimits, QueryRequest};
 use warden_core::secret::Dsn;
 use warden_policy::{DenyCode, PolicyEngine, PolicySettings};
 use warden_ports::QueryAnalyzer;
 
-use super::{config, dsn, start_postgres};
+use super::{config, context, dsn, metadata, start_postgres};
 use crate::analyzer::PostgreSqlAnalyzer;
 use crate::connection::PostgreSqlConnectionPools;
 use crate::query::agent_query;
@@ -243,25 +240,6 @@ async fn role_dsn(container: &ContainerAsync<Postgres>) -> Dsn {
     format!("postgres://{ROLE}:{ROLE_PASSWORD}@{host}:{port}/postgres")
         .parse()
         .unwrap()
-}
-
-/// A fixed request identity, matching `execution.rs`'s own fixture.
-fn context() -> RequestContext {
-    RequestContext::new(
-        "req-1".parse().unwrap(),
-        "alice@example.com".parse().unwrap(),
-        "Claude Code".parse().unwrap(),
-    )
-}
-
-/// The connection every fixture targets, matching the `QueryRequest` below.
-fn metadata() -> ConnectionMetadata {
-    ConnectionMetadata {
-        name: "production-db".parse().unwrap(),
-        dialect: Dialect::PostgreSql,
-        environment: Environment::Development,
-        database: "postgres".to_owned(),
-    }
 }
 
 /// The default engine every deployment uses.

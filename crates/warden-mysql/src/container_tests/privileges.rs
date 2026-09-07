@@ -12,16 +12,13 @@ use sqlx::AssertSqlSafe;
 use sqlx::mysql::MySqlDatabaseError;
 use testcontainers_modules::mysql::Mysql;
 use testcontainers_modules::testcontainers::ContainerAsync;
-use warden_core::connection::{ConnectionMetadata, Environment};
-use warden_core::context::RequestContext;
-use warden_core::dialect::Dialect;
 use warden_core::limits::ExecutionLimits;
 use warden_core::query::{InputLimits, QueryRequest};
 use warden_core::secret::Dsn;
 use warden_policy::{PolicyEngine, PolicySettings};
 use warden_ports::QueryAnalyzer;
 
-use super::{config, dsn, start_mysql, tls};
+use super::{config, context, dsn, metadata, start_mysql, tls};
 use crate::analyzer::MySqlAnalyzer;
 use crate::connection::MySqlConnectionPools;
 
@@ -95,25 +92,6 @@ const DENIED_WRITES: [&str; 5] = [
     "CREATE TABLE scratch (id INT)",
     "DROP TABLE orders",
 ];
-
-/// A fixed request identity, matching `execution.rs`'s own fixture.
-fn context() -> RequestContext {
-    RequestContext::new(
-        "req-1".parse().unwrap(),
-        "alice@example.com".parse().unwrap(),
-        "Claude Code".parse().unwrap(),
-    )
-}
-
-/// The connection every fixture targets, matching the `QueryRequest` below.
-fn metadata() -> ConnectionMetadata {
-    ConnectionMetadata {
-        name: "production-db".parse().unwrap(),
-        dialect: Dialect::MySql,
-        environment: Environment::Development,
-        database: "test".to_owned(),
-    }
-}
 
 /// The default engine every deployment uses.
 fn engine() -> PolicyEngine {

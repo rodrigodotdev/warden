@@ -15,7 +15,6 @@ use testcontainers_modules::testcontainers::ContainerAsync;
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use warden_core::connection::{ConnectionMetadata, ConnectionName, Environment};
-use warden_core::context::RequestContext;
 use warden_core::dialect::Dialect;
 use warden_core::pool::AGENT_POOL_MAX_CONNECTIONS;
 use warden_core::schema::cache::{SCHEMA_CACHE_CAPACITY, SchemaCache};
@@ -29,20 +28,12 @@ use warden_policy::{
 use warden_ports::SchemaInspector;
 use warden_ports::error::SchemaError;
 
-use super::{config, connection_string, dsn, start_mysql, tls};
+use super::{config, connection_string, context, dsn, start_mysql, tls};
 use crate::connection::MySqlConnectionPools;
 use crate::inspector::MySqlSchemaInspector;
 
 fn name() -> ConnectionName {
     "production-db".parse().unwrap()
-}
-
-fn context() -> RequestContext {
-    RequestContext::new(
-        "req-1".parse().unwrap(),
-        "alice@example.com".parse().unwrap(),
-        "Claude Code".parse().unwrap(),
-    )
 }
 
 fn metadata(database: &str) -> ConnectionMetadata {

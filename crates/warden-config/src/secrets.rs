@@ -89,25 +89,42 @@ mod tests {
         "production-mysql".parse().unwrap()
     }
 
-    /// A uniquely named directory under the OS temp directory. Built from the process
-    /// id and an atomic counter rather than a new dependency, so parallel test binaries
-    /// and repeated test functions in this one never collide.
-    fn tempdir() -> PathBuf {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let directory = std::env::temp_dir().join(format!(
-            "warden-config-secrets-{}-{unique}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&directory).unwrap();
-        directory
+    /// A uniquely named directory under the OS temp directory, removed on drop.
+    ///
+    /// Built from the process id and an atomic counter rather than a new dependency, so
+    /// parallel test binaries and repeated test functions in this one never collide.
+    /// The `Drop` is the point: without it every `cargo test -p warden-config` left
+    /// directories behind, which the two helpers this replaces both did.
+    struct TempDir(PathBuf);
+
+    impl TempDir {
+        fn new(label: &str) -> Self {
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let directory = std::env::temp_dir().join(format!(
+                "warden-config-{label}-{}-{unique}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&directory).unwrap();
+            Self(directory)
+        }
+
+        fn join(&self, name: &str) -> PathBuf {
+            self.0.join(name)
+        }
+    }
+
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ignored = std::fs::remove_dir_all(&self.0);
+        }
     }
 
     #[test]
     fn a_dsn_file_is_read_and_trimmed() {
         // A file written by `echo` ends in a newline; a DSN with a trailing newline is not
         // a different DSN, and refusing it would be a support ticket, not a control.
-        let directory = tempdir();
+        let directory = TempDir::new("secrets");
         let path = directory.join("dsn");
         std::fs::write(&path, format!("{DSN}\n")).unwrap();
         let dsn = resolve(&name(), &SecretSource::File(path)).unwrap();
@@ -125,7 +142,7 @@ mod tests {
 
     #[test]
     fn an_invalid_dsn_is_refused_without_echoing_itself() {
-        let directory = tempdir();
+        let directory = TempDir::new("secrets");
         let path = directory.join("dsn");
         // ADR-0031: a DSN names only the target. A query string is a second, unreviewed
         // source of a decision Warden makes from its own configuration.

@@ -471,6 +471,46 @@ impl<'a> ExecutionGate<'a> {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+    /// A gate entered on `runtime` with the default fakes.
+    ///
+    /// Almost every test in this module is about what the gate does once it is open,
+    /// and the nine lines that open one were repeated before each of them. The two
+    /// tests that vary a token or a sink still call `ExecutionGate::enter` directly:
+    /// there, the argument being varied is the subject, and spelling it out is the
+    /// point.
+    /// A gate entered on `runtime` under a caller-supplied cancellation token.
+    ///
+    /// The token is the subject of every test that uses this, so it stays at the call
+    /// site; the rest is the same default wiring [`entered`] supplies.
+    async fn entered_with_token(
+        runtime: &ConnectionRuntime,
+        cancel: CancellationToken,
+    ) -> (ExecutionGate<'_>, audit::OutcomeGuard) {
+        ExecutionGate::enter(
+            runtime,
+            Arc::new(testing::FakeAuditSink::new()),
+            &testing::attempt(),
+            testing::authorized(runtime),
+            cancel,
+            tracing::Span::none(),
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn entered(runtime: &ConnectionRuntime) -> (ExecutionGate<'_>, audit::OutcomeGuard) {
+        ExecutionGate::enter(
+            runtime,
+            Arc::new(testing::FakeAuditSink::new()),
+            &testing::attempt(),
+            testing::authorized(runtime),
+            CancellationToken::new(),
+            tracing::Span::none(),
+        )
+        .await
+        .unwrap()
+    }
+
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -597,16 +637,7 @@ mod tests {
         let runtime = testing::runtime(Dialect::MySql);
         let cancel = CancellationToken::new();
         cancel.cancel();
-        let (gate, _guard) = ExecutionGate::enter(
-            &runtime,
-            Arc::new(testing::FakeAuditSink::new()),
-            &testing::attempt(),
-            testing::authorized(&runtime),
-            cancel,
-            tracing::Span::none(),
-        )
-        .await
-        .unwrap();
+        let (gate, _guard) = entered_with_token(&runtime, cancel).await;
         assert_eq!(gate.execute().await.unwrap_err(), ExecuteError::Cancelled);
         assert_eq!(
             runtime.available_permits(),
@@ -620,16 +651,7 @@ mod tests {
             Dialect::MySql,
             Arc::new(testing::FakeExecutor::taking(Duration::from_secs(600))),
         );
-        let (gate, _guard) = ExecutionGate::enter(
-            &runtime,
-            Arc::new(testing::FakeAuditSink::new()),
-            &testing::attempt(),
-            testing::authorized(&runtime),
-            CancellationToken::new(),
-            tracing::Span::none(),
-        )
-        .await
-        .unwrap();
+        let (gate, _guard) = entered(&runtime).await;
         assert_eq!(gate.execute().await.unwrap_err(), ExecuteError::Timeout);
         assert_eq!(
             runtime.available_permits(),
@@ -640,16 +662,7 @@ mod tests {
     #[tokio::test]
     async fn a_successful_execution_releases_its_permit() {
         let runtime = testing::runtime(Dialect::MySql);
-        let (gate, _guard) = ExecutionGate::enter(
-            &runtime,
-            Arc::new(testing::FakeAuditSink::new()),
-            &testing::attempt(),
-            testing::authorized(&runtime),
-            CancellationToken::new(),
-            tracing::Span::none(),
-        )
-        .await
-        .unwrap();
+        let (gate, _guard) = entered(&runtime).await;
 
         gate.execute().await.unwrap();
 
@@ -667,16 +680,7 @@ mod tests {
                 detail: "fixture failure".to_owned(),
             })),
         );
-        let (gate, _guard) = ExecutionGate::enter(
-            &runtime,
-            Arc::new(testing::FakeAuditSink::new()),
-            &testing::attempt(),
-            testing::authorized(&runtime),
-            CancellationToken::new(),
-            tracing::Span::none(),
-        )
-        .await
-        .unwrap();
+        let (gate, _guard) = entered(&runtime).await;
 
         assert!(matches!(
             gate.execute().await,
@@ -691,16 +695,7 @@ mod tests {
     #[tokio::test]
     async fn a_successful_explain_releases_its_permit() {
         let runtime = testing::runtime(Dialect::MySql);
-        let (gate, _guard) = ExecutionGate::enter(
-            &runtime,
-            Arc::new(testing::FakeAuditSink::new()),
-            &testing::attempt(),
-            testing::authorized(&runtime),
-            CancellationToken::new(),
-            tracing::Span::none(),
-        )
-        .await
-        .unwrap();
+        let (gate, _guard) = entered(&runtime).await;
 
         gate.explain().await.unwrap();
 
@@ -718,16 +713,7 @@ mod tests {
                 detail: "fixture failure".to_owned(),
             })),
         );
-        let (gate, _guard) = ExecutionGate::enter(
-            &runtime,
-            Arc::new(testing::FakeAuditSink::new()),
-            &testing::attempt(),
-            testing::authorized(&runtime),
-            CancellationToken::new(),
-            tracing::Span::none(),
-        )
-        .await
-        .unwrap();
+        let (gate, _guard) = entered(&runtime).await;
 
         assert!(matches!(
             gate.explain().await,
@@ -747,16 +733,7 @@ mod tests {
             Dialect::MySql,
             Arc::new(testing::FakeExplainer::taking(Duration::from_secs(600))),
         );
-        let (gate, _guard) = ExecutionGate::enter(
-            &runtime,
-            Arc::new(testing::FakeAuditSink::new()),
-            &testing::attempt(),
-            testing::authorized(&runtime),
-            cancel,
-            tracing::Span::none(),
-        )
-        .await
-        .unwrap();
+        let (gate, _guard) = entered_with_token(&runtime, cancel).await;
 
         assert_eq!(gate.explain().await.unwrap_err(), ExplainError::Cancelled);
         assert_eq!(
@@ -776,16 +753,7 @@ mod tests {
         parts.limits = limits;
         parts.executor = executor;
         let runtime = testing::runtime_from(parts);
-        let (gate, _guard) = ExecutionGate::enter(
-            &runtime,
-            Arc::new(testing::FakeAuditSink::new()),
-            &testing::attempt(),
-            testing::authorized(&runtime),
-            CancellationToken::new(),
-            tracing::Span::none(),
-        )
-        .await
-        .unwrap();
+        let (gate, _guard) = entered(&runtime).await;
         let mut execution = Box::pin(gate.execute());
         tokio::select! {
             result = &mut execution => panic!("execution unexpectedly finished: {result:?}"),
@@ -809,16 +777,7 @@ mod tests {
         parts.limits = limits;
         parts.explainer = explainer;
         let runtime = testing::runtime_from(parts);
-        let (gate, _guard) = ExecutionGate::enter(
-            &runtime,
-            Arc::new(testing::FakeAuditSink::new()),
-            &testing::attempt(),
-            testing::authorized(&runtime),
-            CancellationToken::new(),
-            tracing::Span::none(),
-        )
-        .await
-        .unwrap();
+        let (gate, _guard) = entered(&runtime).await;
         let mut explanation = Box::pin(gate.explain());
         tokio::select! {
             result = &mut explanation => panic!("explain unexpectedly finished: {result:?}"),
@@ -836,16 +795,7 @@ mod tests {
         let executor = Arc::new(testing::FakeExecutor::new());
         let runtime = testing::runtime_with_executor(Dialect::MySql, Arc::clone(&executor));
         let cancel = CancellationToken::new();
-        let (gate, _guard) = ExecutionGate::enter(
-            &runtime,
-            Arc::new(testing::FakeAuditSink::new()),
-            &testing::attempt(),
-            testing::authorized(&runtime),
-            cancel.clone(),
-            tracing::Span::none(),
-        )
-        .await
-        .unwrap();
+        let (gate, _guard) = entered_with_token(&runtime, cancel.clone()).await;
 
         gate.execute().await.unwrap();
 
@@ -859,16 +809,7 @@ mod tests {
         let explainer = Arc::new(testing::FakeExplainer::new());
         let runtime = testing::runtime_with_explainer(Dialect::MySql, Arc::clone(&explainer));
         let cancel = CancellationToken::new();
-        let (gate, _guard) = ExecutionGate::enter(
-            &runtime,
-            Arc::new(testing::FakeAuditSink::new()),
-            &testing::attempt(),
-            testing::authorized(&runtime),
-            cancel.clone(),
-            tracing::Span::none(),
-        )
-        .await
-        .unwrap();
+        let (gate, _guard) = entered_with_token(&runtime, cancel.clone()).await;
 
         gate.explain().await.unwrap();
 
@@ -889,16 +830,7 @@ mod tests {
         parts.limits = limits;
         parts.executor = Arc::clone(&executor) as Arc<dyn warden_ports::QueryExecutor>;
         let runtime = testing::runtime_from(parts);
-        let (held, _held_guard) = ExecutionGate::enter(
-            &runtime,
-            Arc::new(testing::FakeAuditSink::new()),
-            &testing::attempt(),
-            testing::authorized(&runtime),
-            CancellationToken::new(),
-            tracing::Span::none(),
-        )
-        .await
-        .unwrap();
+        let (held, _held_guard) = entered(&runtime).await;
         let cancel = CancellationToken::new();
         let waiting_sink = Arc::new(testing::FakeAuditSink::new());
         let waiting_attempt = testing::attempt();
@@ -940,16 +872,7 @@ mod tests {
         parts.limits = limits;
         parts.explainer = Arc::clone(&explainer) as Arc<dyn warden_ports::Explainer>;
         let runtime = testing::runtime_from(parts);
-        let (held, _held_guard) = ExecutionGate::enter(
-            &runtime,
-            Arc::new(testing::FakeAuditSink::new()),
-            &testing::attempt(),
-            testing::authorized(&runtime),
-            CancellationToken::new(),
-            tracing::Span::none(),
-        )
-        .await
-        .unwrap();
+        let (held, _held_guard) = entered(&runtime).await;
         let cancel = CancellationToken::new();
         let waiting_sink = Arc::new(testing::FakeAuditSink::new());
         let waiting_attempt = testing::attempt();
