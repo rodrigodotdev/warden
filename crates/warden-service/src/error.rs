@@ -17,6 +17,7 @@ use warden_ports::{
     AnalyzeError, AuditError, ConnectionError, ExecuteError, ExplainError, SchemaError,
 };
 
+use crate::pipeline::PreflightError;
 use crate::redaction::RedactionRuleError;
 
 /// Why a query produced no result.
@@ -41,6 +42,22 @@ pub enum QueryServiceError {
     /// The database rejected, failed, or could not finish the statement.
     #[error(transparent)]
     Execute(#[from] ExecuteError),
+}
+
+/// Every preflight refusal is already audited when it arrives here.
+///
+/// [`crate::pipeline::ServiceCore::preflight`] records the attempt and completes it
+/// before returning, so this conversion adds the service's own vocabulary and nothing
+/// else. The variants stay spelled out rather than collapsed behind a generic: this map
+/// is what `docs/security.md` section 10 asks a reader to check.
+impl From<PreflightError> for QueryServiceError {
+    fn from(error: PreflightError) -> Self {
+        match error {
+            PreflightError::Connection(error) => Self::Connection(error),
+            PreflightError::Analyze(error) => Self::Analyze(error),
+            PreflightError::Rejected(rejection) => Self::Rejected(rejection),
+        }
+    }
 }
 
 impl PublicError for QueryServiceError {
@@ -77,6 +94,22 @@ pub enum ExplainServiceError {
     /// The database rejected, failed, or could not finish planning the statement.
     #[error(transparent)]
     Explain(#[from] ExplainError),
+}
+
+/// Every preflight refusal is already audited when it arrives here.
+///
+/// [`crate::pipeline::ServiceCore::preflight`] records the attempt and completes it
+/// before returning, so this conversion adds the service's own vocabulary and nothing
+/// else. The variants stay spelled out rather than collapsed behind a generic: this map
+/// is what `docs/security.md` section 10 asks a reader to check.
+impl From<PreflightError> for ExplainServiceError {
+    fn from(error: PreflightError) -> Self {
+        match error {
+            PreflightError::Connection(error) => Self::Connection(error),
+            PreflightError::Analyze(error) => Self::Analyze(error),
+            PreflightError::Rejected(rejection) => Self::Rejected(rejection),
+        }
+    }
 }
 
 impl PublicError for ExplainServiceError {

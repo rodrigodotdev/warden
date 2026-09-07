@@ -21,7 +21,6 @@
 //! (ADR-0036), and redact the description before it returns, because column defaults
 //! and comments can carry secrets (`docs/security.md` section 8).
 
-use std::fmt;
 use std::sync::Arc;
 
 use tokio::time::Instant;
@@ -41,28 +40,13 @@ use warden_ports::{
 use crate::audit::{self, StatementFacts};
 use crate::error::SchemaServiceError;
 use crate::limits::RequestBudget;
+use crate::pipeline::ServiceCore;
 use crate::redaction::Redactor;
 
 /// Resolves one connection and dispatches bounded catalog reads to its inspector.
+#[derive(Debug)]
 pub struct SchemaService {
-    registry: Arc<dyn ConnectionRegistry>,
-    engine: Arc<PolicyEngine>,
-    audit: Arc<dyn AuditSink>,
-    redactor: Arc<Redactor>,
-    shutdown: CancellationToken,
-}
-
-/// Prints only non-secret configuration state.
-///
-/// Port implementations and the cancellation token are deliberately omitted: an
-/// adapter may hold a driver pool whose debug output contains connection options,
-/// while token state is runtime coordination rather than useful configuration.
-impl fmt::Debug for SchemaService {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("SchemaService")
-            .field("redactor_is_empty", &self.redactor.is_empty())
-            .finish_non_exhaustive()
-    }
+    core: ServiceCore,
 }
 
 impl SchemaService {
@@ -76,11 +60,7 @@ impl SchemaService {
         shutdown: CancellationToken,
     ) -> Self {
         Self {
-            registry,
-            engine,
-            audit,
-            redactor,
-            shutdown,
+            core: ServiceCore::new(registry, engine, audit, redactor, shutdown),
         }
     }
 
@@ -113,7 +93,7 @@ impl SchemaService {
         );
         let outcome_parent = span.clone();
         async move {
-            let runtime = self.registry.get(request.connection())?;
+            let runtime = self.core.registry().get(request.connection())?;
             if !runtime.capabilities().schema_search {
                 return Err(SchemaServiceError::SearchUnsupported);
             }
@@ -127,19 +107,19 @@ impl SchemaService {
                 StatementFacts::default(),
                 Vec::new(),
             );
-            audit::record_attempt(self.audit.as_ref(), &attempt).await?;
+            audit::record_attempt(self.core.audit().as_ref(), &attempt).await?;
             let guard =
-                audit::OutcomeGuard::arm(Arc::clone(&self.audit), attempt.id, outcome_parent);
+                audit::OutcomeGuard::arm(Arc::clone(self.core.audit()), attempt.id, outcome_parent);
 
             let started = Instant::now();
             let filter = ObjectFilter::new(
-                self.engine.as_ref(),
+                self.core.engine(),
                 PolicyContext::new(context, runtime.metadata()),
             );
             let deadline = RequestBudget::new(runtime.limits()).deadline(started);
             let found = runtime
                 .inspector()
-                .search_schema(&request, filter, deadline, self.shutdown.child_token())
+                .search_schema(&request, filter, deadline, self.core.child_token())
                 .await;
             Self::complete(guard, &attempt, started, &found).await;
             Ok(found?)
@@ -174,7 +154,7 @@ impl SchemaService {
         );
         let outcome_parent = span.clone();
         async move {
-            let runtime = self.registry.get(request.connection())?;
+            let runtime = self.core.registry().get(request.connection())?;
             let attempt = audit::attempt(
                 context,
                 runtime.metadata(),
@@ -185,23 +165,23 @@ impl SchemaService {
                 StatementFacts::default(),
                 Vec::new(),
             );
-            audit::record_attempt(self.audit.as_ref(), &attempt).await?;
+            audit::record_attempt(self.core.audit().as_ref(), &attempt).await?;
             let guard =
-                audit::OutcomeGuard::arm(Arc::clone(&self.audit), attempt.id, outcome_parent);
+                audit::OutcomeGuard::arm(Arc::clone(self.core.audit()), attempt.id, outcome_parent);
 
             let started = Instant::now();
             let filter = ObjectFilter::new(
-                self.engine.as_ref(),
+                self.core.engine(),
                 PolicyContext::new(context, runtime.metadata()),
             );
             let deadline = RequestBudget::new(runtime.limits()).deadline(started);
             let mut found = runtime
                 .inspector()
-                .describe_schema(&request, filter, deadline, self.shutdown.child_token())
+                .describe_schema(&request, filter, deadline, self.core.child_token())
                 .await;
             if let Ok(described) = &mut found {
                 let _entered = tracing::debug_span!("result.redact").entered();
-                self.redactor.redact_description(described);
+                self.core.redactor().redact_description(described);
             }
             Self::complete(guard, &attempt, started, &found).await;
             Ok(found?)
@@ -248,8 +228,8 @@ impl SchemaService {
 }
 
 #[cfg(test)]
-pub(crate) fn redactor_arc(service: &SchemaService) -> &Arc<Redactor> {
-    &service.redactor
+pub(crate) fn redactor_arc(service: &SchemaService) -> &Redactor {
+    service.core.redactor()
 }
 
 #[cfg(test)]

@@ -18,47 +18,32 @@
 //! planning must not begin. Analysis and policy refusals retain their refusal even if
 //! either audit write fails.
 
-use std::fmt;
 use std::sync::Arc;
-use std::time::Duration;
 
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
-use warden_core::analysis::StatementKind;
 use warden_core::context::RequestContext;
 use warden_core::error::PublicError;
 use warden_core::explain::{ExplainRequest, QueryPlan};
 use warden_policy::PolicyEngine;
 use warden_ports::{
-    AuditAttempt, AuditOperation, AuditOutcome, AuditOutcomeEvent, AuditSink, ConnectionRegistry,
-    ExplainError,
+    AuditOperation, AuditOutcome, AuditOutcomeEvent, AuditSink, ConnectionRegistry, ExplainError,
 };
 
-use crate::audit::{self, StatementFacts};
 use crate::error::ExplainServiceError;
-use crate::pipeline::{ExecutionGate, GateError};
+use crate::pipeline::{GateError, ServiceCore};
 use crate::redaction::Redactor;
 
 /// Plans one agent statement through the same safety boundaries as execution.
-pub struct ExplainService {
-    registry: Arc<dyn ConnectionRegistry>,
-    engine: Arc<PolicyEngine>,
-    audit: Arc<dyn AuditSink>,
-    redactor: Arc<Redactor>,
-    shutdown: CancellationToken,
-}
-
-/// Prints only non-secret configuration state.
 ///
-/// Port implementations are deliberately omitted: an adapter may hold a driver
-/// pool whose debug output includes connection options.
-impl fmt::Debug for ExplainService {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("ExplainService")
-            .field("redactor_is_empty", &self.redactor.is_empty())
-            .finish_non_exhaustive()
-    }
+/// A thin wrapper over [`ServiceCore`], which holds the collaborators and runs the
+/// preflight this service shares with [`crate::QueryService`]. What is left here is
+/// what genuinely differs: the operation constant, the root span, the gated call, the
+/// error-to-outcome map, and the redaction step.
+#[derive(Debug)]
+pub struct ExplainService {
+    core: ServiceCore,
 }
 
 impl ExplainService {
@@ -72,11 +57,7 @@ impl ExplainService {
         shutdown: CancellationToken,
     ) -> Self {
         Self {
-            registry,
-            engine,
-            audit,
-            redactor,
-            shutdown,
+            core: ServiceCore::new(registry, engine, audit, redactor, shutdown),
         }
     }
 
@@ -106,93 +87,27 @@ impl ExplainService {
         );
         let outcome_parent = span.clone();
         async move {
-            let query = request.query().clone();
-            let runtime = {
-                let _entered = tracing::debug_span!("connection.resolve").entered();
-                self.registry.get(query.connection())
-            }?;
+            // `ExplainRequest` is a `QueryRequest` in a wrapper: the same statement
+            // goes through the same analysis and the same policy, which is the point of
+            // ADR-0017 — planning is real work on the server, not a dry run.
+            let preflight = self
+                .core
+                .preflight(context, request.query().clone(), AuditOperation::Explain)
+                .await?;
+            let (runtime, attempt, authorized) = preflight.into_parts();
 
-            let analysis_result = {
-                let _entered = tracing::debug_span!("sql.analyze").entered();
-                runtime.analyzer().analyze(query)
-            };
-            let analyzed = match analysis_result {
-                Ok(analyzed) => analyzed,
-                Err(error) => {
-                    let attempt = audit::attempt(
-                        context,
-                        runtime.metadata(),
-                        AuditOperation::Explain,
-                        StatementFacts {
-                            kind: Some(StatementKind::Unknown),
-                            fingerprint: None,
-                        },
-                        vec![error.deny_reason()],
-                    );
-                    self.refuse(&attempt, AuditOutcome::Denied, error.public_code())
-                        .await;
-                    return Err(error.into());
-                }
-            };
-
-            let statement_kind = analyzed.analysis().root_kind();
-            let fingerprint = analyzed.analysis().fingerprint().cloned();
-            let authorization = {
-                let _entered = tracing::debug_span!("policy.evaluate").entered();
-                self.engine
-                    .authorize(context, runtime.metadata(), analyzed, runtime.limits())
-            };
-            let authorized = match authorization {
-                Ok(authorized) => authorized,
-                Err(rejection) => {
-                    let attempt = audit::attempt(
-                        context,
-                        runtime.metadata(),
-                        AuditOperation::Explain,
-                        StatementFacts {
-                            kind: Some(statement_kind),
-                            fingerprint,
-                        },
-                        rejection.reasons().to_vec(),
-                    );
-                    self.refuse(&attempt, AuditOutcome::Denied, rejection.public_code())
-                        .await;
-                    return Err(rejection.into());
-                }
-            };
-
-            let attempt = audit::attempt(
-                context,
-                runtime.metadata(),
-                AuditOperation::Explain,
-                StatementFacts {
-                    kind: Some(statement_kind),
-                    fingerprint,
-                },
-                Vec::new(),
-            );
-            let (gate, guard) = match ExecutionGate::enter(
-                &runtime,
-                Arc::clone(&self.audit),
-                &attempt,
-                authorized,
-                self.shutdown.child_token(),
-                outcome_parent,
-            )
-            .await
+            let (gate, guard) = match self
+                .core
+                .gate(&runtime, &attempt, authorized, outcome_parent)
+                .await
             {
                 Ok(gate) => gate,
+                // No attempt was recorded, so there is no outcome to complete.
                 Err(GateError::Audit(error)) => return Err(error.into()),
                 // The gate completed the recorded attempt as not_started.
                 Err(GateError::Connection { error, .. }) => return Err(error.into()),
             };
 
-            // A service-side clock around the gated call: planning plus the adapter's own
-            // overhead, started after the permit was acquired so the queue wait is
-            // excluded. `QueryPlan` carries no adapter-measured duration the way
-            // `ResultSet::stats` does, so this is the only figure available here — it is
-            // wider than `query.rs`'s adapter-reported statement duration, and an auditor
-            // comparing `AuditOutcomeEvent.duration` across the two tools is comparing two
             // different quantities.
             let queue_wait = gate.queue_wait();
             let started = Instant::now();
@@ -202,7 +117,7 @@ impl ExplainService {
                 Ok(mut plan) => {
                     {
                         let _entered = tracing::debug_span!("result.redact").entered();
-                        self.redactor.redact_plan(&mut plan);
+                        self.core.redactor().redact_plan(&mut plan);
                     }
                     let plan_bytes = plan.plan_bytes();
                     guard
@@ -246,61 +161,18 @@ impl ExplainService {
         .instrument(span)
         .await
     }
-
-    /// Records a refused attempt and its terminal outcome together.
-    async fn refuse(
-        &self,
-        attempt: &AuditAttempt,
-        outcome: AuditOutcome,
-        error_code: warden_core::error::PublicErrorCode,
-    ) {
-        if let Err(error) = audit::record_attempt(self.audit.as_ref(), attempt).await {
-            tracing::error!(
-                target: "warden.audit",
-                attempt_id = %attempt.id,
-                %error,
-                "the audit attempt could not be recorded for a refused explain request"
-            );
-        }
-        // No gate was ever entered for a refused statement, so there is no permit
-        // acquisition to time.
-        self.complete(attempt, outcome, None, None, error_code)
-            .await;
-    }
-
-    /// Records the terminal state of an attempt without writing the attempt again.
-    async fn complete(
-        &self,
-        attempt: &AuditAttempt,
-        outcome: AuditOutcome,
-        duration: Option<Duration>,
-        queue_wait: Option<Duration>,
-        error_code: warden_core::error::PublicErrorCode,
-    ) {
-        audit::record_outcome(
-            self.audit.as_ref(),
-            AuditOutcomeEvent {
-                attempt_id: attempt.id,
-                outcome,
-                duration,
-                queue_wait,
-                rows_returned: None,
-                result_bytes: None,
-                error_code: Some(error_code),
-            },
-        )
-        .await;
-    }
 }
 
 #[cfg(test)]
-pub(crate) fn redactor_arc(service: &ExplainService) -> &Arc<Redactor> {
-    &service.redactor
+pub(crate) fn redactor_arc(service: &ExplainService) -> &Redactor {
+    service.core.redactor()
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::time::Duration;
 
     #[tokio::test(start_paused = true)]
     async fn dropping_a_queued_explain_records_abandoned() {
@@ -321,7 +193,6 @@ mod tests {
     }
 
     use std::sync::Arc;
-    use std::time::Duration;
 
     use warden_core::dialect::Dialect;
     use warden_core::error::{PublicError, PublicErrorCode};

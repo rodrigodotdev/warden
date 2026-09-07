@@ -18,47 +18,32 @@
 //! may run. A statement already refused by analysis or policy keeps that refusal even
 //! if either audit write fails.
 
-use std::fmt;
 use std::sync::Arc;
-use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
-use warden_core::analysis::StatementKind;
 use warden_core::context::RequestContext;
 use warden_core::error::PublicError;
 use warden_core::query::QueryRequest;
 use warden_core::result::ResultSet;
 use warden_policy::PolicyEngine;
 use warden_ports::{
-    AuditAttempt, AuditOperation, AuditOutcome, AuditOutcomeEvent, AuditSink, ConnectionRegistry,
-    ExecuteError,
+    AuditOperation, AuditOutcome, AuditOutcomeEvent, AuditSink, ConnectionRegistry, ExecuteError,
 };
 
-use crate::audit::{self, StatementFacts};
 use crate::error::QueryServiceError;
-use crate::pipeline::{ExecutionGate, GateError};
+use crate::pipeline::{GateError, ServiceCore};
 use crate::redaction::Redactor;
 
 /// Runs one agent statement, end to end.
-pub struct QueryService {
-    registry: Arc<dyn ConnectionRegistry>,
-    engine: Arc<PolicyEngine>,
-    audit: Arc<dyn AuditSink>,
-    redactor: Arc<Redactor>,
-    shutdown: CancellationToken,
-}
-
-/// Prints only non-secret configuration state.
 ///
-/// Port implementations are deliberately omitted: an adapter may hold a driver
-/// pool whose debug output includes connection options.
-impl fmt::Debug for QueryService {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("QueryService")
-            .field("redactor_is_empty", &self.redactor.is_empty())
-            .finish_non_exhaustive()
-    }
+/// A thin wrapper over [`ServiceCore`], which holds the collaborators and runs the
+/// preflight this service shares with [`crate::ExplainService`]. What is left here is
+/// what genuinely differs: the operation constant, the root span, the gated call, the
+/// error-to-outcome map, and the redaction step.
+#[derive(Debug)]
+pub struct QueryService {
+    core: ServiceCore,
 }
 
 impl QueryService {
@@ -72,11 +57,7 @@ impl QueryService {
         shutdown: CancellationToken,
     ) -> Self {
         Self {
-            registry,
-            engine,
-            audit,
-            redactor,
-            shutdown,
+            core: ServiceCore::new(registry, engine, audit, redactor, shutdown),
         }
     }
 
@@ -108,86 +89,16 @@ impl QueryService {
         );
         let outcome_parent = span.clone();
         async move {
-            let runtime = {
-                let _entered = tracing::debug_span!("connection.resolve").entered();
-                self.registry.get(request.connection())
-            }?;
+            let preflight = self
+                .core
+                .preflight(context, request, AuditOperation::Query)
+                .await?;
+            let (runtime, attempt, authorized) = preflight.into_parts();
 
-            let analysis_result = {
-                let _entered = tracing::debug_span!("sql.analyze").entered();
-                runtime.analyzer().analyze(request)
-            };
-            let analyzed = match analysis_result {
-                Ok(analyzed) => analyzed,
-                Err(error) => {
-                    // SPEC section 6, invariant 24: an attempt that never reached policy
-                    // is still an attempt. `AnalyzeError::deny_reason` is the only
-                    // producer of `DenyCode::ParserRecursionLimit`, and it copies no
-                    // parser text into the record.
-                    let attempt = audit::attempt(
-                        context,
-                        runtime.metadata(),
-                        AuditOperation::Query,
-                        StatementFacts {
-                            kind: Some(StatementKind::Unknown),
-                            fingerprint: None,
-                        },
-                        vec![error.deny_reason()],
-                    );
-                    self.refuse(&attempt, AuditOutcome::Denied, error.public_code())
-                        .await;
-                    return Err(error.into());
-                }
-            };
-
-            let statement_kind = analyzed.analysis().root_kind();
-            let fingerprint = analyzed.analysis().fingerprint().cloned();
-            // `runtime.limits()` and nothing else: `AuthorizedQuery::limits()` is whatever
-            // the caller passed here, and the adapter treats it as authoritative for the
-            // row and byte bounds (crates/warden-ports/src/runtime.rs).
-            let authorization = {
-                let _entered = tracing::debug_span!("policy.evaluate").entered();
-                self.engine
-                    .authorize(context, runtime.metadata(), analyzed, runtime.limits())
-            };
-            let authorized = match authorization {
-                Ok(authorized) => authorized,
-                Err(rejection) => {
-                    let attempt = audit::attempt(
-                        context,
-                        runtime.metadata(),
-                        AuditOperation::Query,
-                        StatementFacts {
-                            kind: Some(statement_kind),
-                            fingerprint,
-                        },
-                        rejection.reasons().to_vec(),
-                    );
-                    self.refuse(&attempt, AuditOutcome::Denied, rejection.public_code())
-                        .await;
-                    return Err(rejection.into());
-                }
-            };
-
-            let attempt = audit::attempt(
-                context,
-                runtime.metadata(),
-                AuditOperation::Query,
-                StatementFacts {
-                    kind: Some(statement_kind),
-                    fingerprint,
-                },
-                Vec::new(),
-            );
-            let (gate, guard) = match ExecutionGate::enter(
-                &runtime,
-                Arc::clone(&self.audit),
-                &attempt,
-                authorized,
-                self.shutdown.child_token(),
-                outcome_parent,
-            )
-            .await
+            let (gate, guard) = match self
+                .core
+                .gate(&runtime, &attempt, authorized, outcome_parent)
+                .await
             {
                 Ok(gate) => gate,
                 // No attempt was recorded, so there is no outcome to complete.
@@ -201,7 +112,7 @@ impl QueryService {
                 Ok(mut result) => {
                     {
                         let _entered = tracing::debug_span!("result.redact").entered();
-                        self.redactor.redact_result(&mut result);
+                        self.core.redactor().redact_result(&mut result);
                     }
                     guard
                         .complete(AuditOutcomeEvent {
@@ -255,69 +166,20 @@ impl QueryService {
         .instrument(span)
         .await
     }
-
-    /// Records a refused attempt and its terminal outcome together.
-    ///
-    /// Analysis and policy refusals happen before [`ExecutionGate`] records an
-    /// attempt. The attempt write's failure is logged rather than returned: the
-    /// statement was already refused, so there is no execution window for a
-    /// fail-closed rule to protect (ADR-0022).
-    async fn refuse(
-        &self,
-        attempt: &AuditAttempt,
-        outcome: AuditOutcome,
-        error_code: warden_core::error::PublicErrorCode,
-    ) {
-        if let Err(error) = audit::record_attempt(self.audit.as_ref(), attempt).await {
-            tracing::error!(
-                target: "warden.audit",
-                attempt_id = %attempt.id,
-                %error,
-                "the audit attempt could not be recorded for a refused statement"
-            );
-        }
-        // No gate was ever entered for a refused statement, so there is no permit
-        // acquisition to time.
-        self.complete(attempt, outcome, None, None, error_code)
-            .await;
-    }
-
-    /// Records the terminal state of an attempt without writing the attempt again.
-    async fn complete(
-        &self,
-        attempt: &AuditAttempt,
-        outcome: AuditOutcome,
-        duration: Option<Duration>,
-        queue_wait: Option<Duration>,
-        error_code: warden_core::error::PublicErrorCode,
-    ) {
-        audit::record_outcome(
-            self.audit.as_ref(),
-            AuditOutcomeEvent {
-                attempt_id: attempt.id,
-                outcome,
-                duration,
-                queue_wait,
-                rows_returned: None,
-                result_bytes: None,
-                error_code: Some(error_code),
-            },
-        )
-        .await;
-    }
 }
 
 #[cfg(test)]
-pub(crate) fn redactor_arc(service: &QueryService) -> &Arc<Redactor> {
-    &service.redactor
+pub(crate) fn redactor_arc(service: &QueryService) -> &Redactor {
+    service.core.redactor()
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use std::sync::Arc;
     use std::time::Duration;
+
+    use std::sync::Arc;
 
     use warden_core::dialect::Dialect;
     use warden_core::error::{PublicError, PublicErrorCode};

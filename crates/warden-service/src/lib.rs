@@ -236,11 +236,15 @@ mod composition_tests {
         })
         .unwrap();
 
-        assert!(Arc::ptr_eq(
+        // One `Redactor`, parsed once and shared, rather than three that agree today.
+        // Pointer identity rather than equality: two `Redactor`s built from the same
+        // settings would compare equal and still be two, which is the drift this
+        // asserts against.
+        assert!(std::ptr::eq(
             query::redactor_arc(services.query()),
             explain::redactor_arc(services.explain())
         ));
-        assert!(Arc::ptr_eq(
+        assert!(std::ptr::eq(
             query::redactor_arc(services.query()),
             schema::redactor_arc(services.schema())
         ));

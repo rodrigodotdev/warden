@@ -21,23 +21,323 @@
 //! that calls the ports directly, and it does not replace database privileges
 //! (ADR-0016).
 
+use std::fmt;
 use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
-use warden_core::error::PublicError as _;
+use warden_core::analysis::StatementKind;
+use warden_core::context::RequestContext;
+use warden_core::error::{PublicError as _, PublicErrorCode};
 use warden_core::explain::QueryPlan;
+use warden_core::query::QueryRequest;
 use warden_core::result::ResultSet;
-use warden_policy::AuthorizedQuery;
+use warden_policy::{AuthorizedQuery, PolicyEngine, PolicyRejection};
 use warden_ports::{
-    AuditAttempt, AuditError, AuditOutcome, AuditOutcomeEvent, AuditSink, ConnectionError,
-    ConnectionRuntime, ExecuteError, ExplainError, QueryPermit,
+    AnalyzeError, AuditAttempt, AuditError, AuditOperation, AuditOutcome, AuditOutcomeEvent,
+    AuditSink, ConnectionError, ConnectionRegistry, ConnectionRuntime, ExecuteError, ExplainError,
+    QueryPermit,
 };
 
-use crate::audit;
+use crate::audit::{self, StatementFacts};
 use crate::limits::RequestBudget;
+use crate::redaction::Redactor;
+
+/// The collaborators every service in this crate holds, and the sequence two of them
+/// share.
+///
+/// All three services — query, explain, schema — held the identical five fields and an
+/// identical `new`. Two of them also ran the identical preflight: resolve the
+/// connection, analyse the statement, authorise it, build the attempt, each with its
+/// own span and its own audited refusal arm. That was ~150 duplicated lines in which
+/// the *order* is the security property (ADR-0022), which is the worst possible thing
+/// to keep two copies of.
+///
+/// This deduplicates a body, not a concept. The three services stay separate public
+/// types with separate error enums, because `docs/security.md` section 10 wants that
+/// error map readable.
+#[derive(Clone)]
+pub(crate) struct ServiceCore {
+    registry: Arc<dyn ConnectionRegistry>,
+    engine: Arc<PolicyEngine>,
+    audit: Arc<dyn AuditSink>,
+    redactor: Arc<Redactor>,
+    shutdown: CancellationToken,
+}
+
+/// Prints only non-secret configuration state.
+///
+/// Port implementations are deliberately omitted: an adapter may hold a driver pool
+/// whose debug output includes connection options. The cancellation token is omitted
+/// too — token state is runtime coordination rather than useful configuration.
+impl fmt::Debug for ServiceCore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ServiceCore")
+            .field("redactor_is_empty", &self.redactor.is_empty())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Everything decided before a permit is taken: the connection, the authorised
+/// statement, and the attempt that must be recorded before either is used.
+///
+/// The caller owns this, and [`ServiceCore::gate`] borrows from it. That split is not
+/// stylistic: `ExecutionGate<'a>` borrows the `ConnectionRuntime`, and
+/// `ConnectionRegistry::get` returns an owned `Arc`, so a single call that both
+/// resolved the connection and opened the gate would be returning a borrow of its own
+/// local. It also matches the two halves ADR-0022 already distinguishes — everything
+/// before the audited attempt, and the attempt-then-permit sequence the gate exists to
+/// make unskippable.
+pub(crate) struct Preflight {
+    runtime: Arc<ConnectionRuntime>,
+    attempt: AuditAttempt,
+    authorized: AuthorizedQuery,
+}
+
+impl Preflight {
+    /// The connection, the attempt, and the authorised statement.
+    ///
+    /// Consuming rather than borrowing, because `AuthorizedQuery` is deliberately not
+    /// `Clone`: it is the capability token that proves policy ran, and a type that can
+    /// be duplicated is a capability that can be reused (ADR-0021). The caller holds
+    /// the returned `Arc` for as long as the gate borrowed from it lives.
+    pub(crate) fn into_parts(self) -> (Arc<ConnectionRuntime>, AuditAttempt, AuthorizedQuery) {
+        (self.runtime, self.attempt, self.authorized)
+    }
+}
+
+/// Why a request was refused before it reached the gate.
+///
+/// Every variant here has already been audited: [`ServiceCore::preflight`] records the
+/// attempt and completes it before returning any of them, so a caller cannot forget to.
+/// The service error types convert from this, which is what keeps their own error maps
+/// exhaustive and readable.
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
+pub(crate) enum PreflightError {
+    /// The name resolved to no connection.
+    #[error(transparent)]
+    Connection(#[from] ConnectionError),
+    /// The statement did not parse.
+    #[error(transparent)]
+    Analyze(#[from] AnalyzeError),
+    /// Policy denied the statement.
+    #[error(transparent)]
+    Rejected(#[from] PolicyRejection),
+}
+
+impl ServiceCore {
+    /// Wires the collaborators one request needs.
+    pub(crate) fn new(
+        registry: Arc<dyn ConnectionRegistry>,
+        engine: Arc<PolicyEngine>,
+        audit: Arc<dyn AuditSink>,
+        redactor: Arc<Redactor>,
+        shutdown: CancellationToken,
+    ) -> Self {
+        Self {
+            registry,
+            engine,
+            audit,
+            redactor,
+            shutdown,
+        }
+    }
+
+    /// The response redactor, for the one step each service does differently.
+    pub(crate) fn redactor(&self) -> &Redactor {
+        &self.redactor
+    }
+
+    /// The connection registry, for `list_connections` and for schema resolution.
+    pub(crate) fn registry(&self) -> &dyn ConnectionRegistry {
+        self.registry.as_ref()
+    }
+
+    /// The audit sink, for the schema service's own attempt writes.
+    pub(crate) fn audit(&self) -> &Arc<dyn AuditSink> {
+        &self.audit
+    }
+
+    /// The policy engine, for the schema service's object filter.
+    pub(crate) fn engine(&self) -> &PolicyEngine {
+        self.engine.as_ref()
+    }
+
+    /// A token that cancels when the process shuts down.
+    ///
+    /// A child token, never the parent: cancelling one request must not cancel the
+    /// others, while a shutdown still reaches every one of them.
+    pub(crate) fn child_token(&self) -> CancellationToken {
+        self.shutdown.child_token()
+    }
+
+    /// Resolve, analyse, authorise, and build the attempt — in ADR-0022's order.
+    ///
+    /// Every failing arm records the attempt and completes it before returning, so a
+    /// refusal is audited whether or not the caller remembers to. SPEC section 6,
+    /// invariant 24: an attempt that never reached policy is still an attempt.
+    ///
+    /// # Errors
+    ///
+    /// [`PreflightError`], already audited.
+    pub(crate) async fn preflight(
+        &self,
+        context: &RequestContext,
+        request: QueryRequest,
+        operation: AuditOperation,
+    ) -> Result<Preflight, PreflightError> {
+        let runtime = {
+            let _entered = tracing::debug_span!("connection.resolve").entered();
+            self.registry.get(request.connection())
+        }?;
+
+        let analysis_result = {
+            let _entered = tracing::debug_span!("sql.analyze").entered();
+            runtime.analyzer().analyze(request)
+        };
+        let analyzed = match analysis_result {
+            Ok(analyzed) => analyzed,
+            Err(error) => {
+                // `AnalyzeError::deny_reason` is the only producer of
+                // `DenyCode::ParserRecursionLimit`, and it copies no parser text into
+                // the record.
+                let attempt = audit::attempt(
+                    context,
+                    runtime.metadata(),
+                    operation,
+                    StatementFacts {
+                        kind: Some(StatementKind::Unknown),
+                        fingerprint: None,
+                    },
+                    vec![error.deny_reason()],
+                );
+                self.refuse(&attempt, AuditOutcome::Denied, error.public_code())
+                    .await;
+                return Err(error.into());
+            }
+        };
+
+        let statement_kind = analyzed.analysis().root_kind();
+        let fingerprint = analyzed.analysis().fingerprint().cloned();
+        // `runtime.limits()` and nothing else: `AuthorizedQuery::limits()` is whatever
+        // the caller passed here, and the adapter treats it as authoritative for the
+        // row and byte bounds (`crates/warden-ports/src/runtime.rs`).
+        let authorization = {
+            let _entered = tracing::debug_span!("policy.evaluate").entered();
+            self.engine
+                .authorize(context, runtime.metadata(), analyzed, runtime.limits())
+        };
+        let authorized = match authorization {
+            Ok(authorized) => authorized,
+            Err(rejection) => {
+                let attempt = audit::attempt(
+                    context,
+                    runtime.metadata(),
+                    operation,
+                    StatementFacts {
+                        kind: Some(statement_kind),
+                        fingerprint,
+                    },
+                    rejection.reasons().to_vec(),
+                );
+                self.refuse(&attempt, AuditOutcome::Denied, rejection.public_code())
+                    .await;
+                return Err(rejection.into());
+            }
+        };
+
+        let attempt = audit::attempt(
+            context,
+            runtime.metadata(),
+            operation,
+            StatementFacts {
+                kind: Some(statement_kind),
+                fingerprint,
+            },
+            Vec::new(),
+        );
+        Ok(Preflight {
+            runtime,
+            attempt,
+            authorized,
+        })
+    }
+
+    /// Records the attempt, arms its outcome guard, then takes the permit.
+    ///
+    /// # Errors
+    ///
+    /// [`GateError`], whose two variants differ in whether an outcome is still owed.
+    pub(crate) async fn gate<'a>(
+        &self,
+        runtime: &'a ConnectionRuntime,
+        attempt: &AuditAttempt,
+        authorized: AuthorizedQuery,
+        outcome_parent: tracing::Span,
+    ) -> Result<(ExecutionGate<'a>, audit::OutcomeGuard), GateError> {
+        ExecutionGate::enter(
+            runtime,
+            Arc::clone(&self.audit),
+            attempt,
+            authorized,
+            self.shutdown.child_token(),
+            outcome_parent,
+        )
+        .await
+    }
+
+    /// Records a refused attempt and its terminal outcome together.
+    ///
+    /// Analysis and policy refusals happen before [`ExecutionGate`] records an
+    /// attempt. The attempt write's failure is logged rather than returned: the
+    /// statement was already refused, so there is no execution window for a
+    /// fail-closed rule to protect (ADR-0022).
+    pub(crate) async fn refuse(
+        &self,
+        attempt: &AuditAttempt,
+        outcome: AuditOutcome,
+        error_code: PublicErrorCode,
+    ) {
+        if let Err(error) = audit::record_attempt(self.audit.as_ref(), attempt).await {
+            tracing::error!(
+                target: "warden.audit",
+                attempt_id = %attempt.id,
+                %error,
+                "the audit attempt could not be recorded for a refused request"
+            );
+        }
+        // No gate was ever entered for a refused statement, so there is no permit
+        // acquisition to time.
+        self.complete(attempt, outcome, None, None, error_code)
+            .await;
+    }
+
+    /// Records the terminal state of an attempt without writing the attempt again.
+    pub(crate) async fn complete(
+        &self,
+        attempt: &AuditAttempt,
+        outcome: AuditOutcome,
+        duration: Option<Duration>,
+        queue_wait: Option<Duration>,
+        error_code: PublicErrorCode,
+    ) {
+        audit::record_outcome(
+            self.audit.as_ref(),
+            AuditOutcomeEvent {
+                attempt_id: attempt.id,
+                outcome,
+                duration,
+                queue_wait,
+                rows_returned: None,
+                result_bytes: None,
+                error_code: Some(error_code),
+            },
+        )
+        .await;
+    }
+}
 
 /// Why a request never reached the database.
 ///
