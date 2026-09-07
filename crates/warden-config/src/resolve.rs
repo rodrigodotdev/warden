@@ -138,37 +138,50 @@ impl Config {
             seen_names.push(connection.name.clone());
         }
 
+        // Resolving each connection's profile is also what proves the name is defined,
+        // so this replaces both a `contains_key` pass and the four `Index` lookups the
+        // rest of this function used to make. `Index` panics on a miss, and it is the
+        // one panic shape `clippy::unwrap_used` and `expect_used` cannot see — which is
+        // why `AGENTS.md` bans the others. Every key here is provably present; the
+        // point is that the proof is not what keeps startup from panicking.
+        let mut resolved: Vec<(&ConnectionEntry, &PolicyProfile)> =
+            Vec::with_capacity(self.connections.len());
         for connection in &self.connections {
-            if !self.policies.contains_key(&connection.policy) {
-                return Err(ConfigError::UnknownProfile {
+            let profile = self.policies.get(&connection.policy).ok_or_else(|| {
+                ConfigError::UnknownProfile {
                     connection: connection.name.clone(),
                     profile: connection.policy.clone(),
-                });
-            }
+                }
+            })?;
+            resolved.push((connection, profile));
         }
 
-        let mut referenced_profiles: Vec<String> = Vec::new();
-        for connection in &self.connections {
-            if !referenced_profiles.contains(&connection.policy) {
-                referenced_profiles.push(connection.policy.clone());
+        // The distinct profiles, in first-reference order, each keeping the name a
+        // disagreement message has to quote (ADR-0039).
+        let mut referenced: Vec<(&str, &PolicyProfile)> = Vec::new();
+        for (connection, profile) in &resolved {
+            if !referenced
+                .iter()
+                .any(|(name, _)| *name == connection.policy)
+            {
+                referenced.push((connection.policy.as_str(), profile));
             }
         }
-        if let Some((first_name, rest)) = referenced_profiles.split_first() {
-            // `contains_key` above already proved every name here is defined.
-            let first = &self.policies[first_name];
-            for name in rest {
-                let other = &self.policies[name];
-                agree_on_policy(first_name, first, name, other)?;
-            }
+        // `self.connections` was proved non-empty at the top, so every connection
+        // contributed a profile and `referenced` cannot be empty. Saying so with the
+        // error that check already produces costs one arm and no panic.
+        let Some(((representative_name, representative), rest)) = referenced.split_first() else {
+            return Err(ConfigError::NoConnections);
+        };
+        for (name, other) in rest {
+            agree_on_policy(representative_name, representative, name, other)?;
         }
 
         let mut connections = Vec::with_capacity(self.connections.len());
-        for connection in &self.connections {
-            let profile = &self.policies[&connection.policy];
+        for (connection, profile) in &resolved {
             connections.push(resolve_connection(connection, profile)?);
         }
 
-        let representative = &self.policies[&referenced_profiles[0]];
         let policy = ResolvedPolicy {
             allow_locking_reads: representative.allow_locking_reads,
             allow_unknown_functions: representative.allow_unknown_functions,

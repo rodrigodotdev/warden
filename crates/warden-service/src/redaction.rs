@@ -83,11 +83,18 @@ impl Rule {
             });
         }
         Ok(Self {
-            table: (table != "*").then(|| table.to_ascii_lowercase()),
-            column: column.to_ascii_lowercase(),
+            table: (table != "*").then(|| table.to_owned()),
+            column: column.to_owned(),
         })
     }
 
+    /// Whether this rule covers `table`.`column`.
+    ///
+    /// `eq_ignore_ascii_case` is the *only* place case is decided. A rule used to be
+    /// folded at parse and compared case-insensitively as well, which left a reader
+    /// unable to tell which side was authoritative; folding at parse also loses the
+    /// spelling the operator wrote. Comparing without folding keeps one rule, in the
+    /// one place a reader looks for it, and allocates nothing per column.
     fn matches(&self, table: Option<&str>, column: &str) -> bool {
         if !self.column.eq_ignore_ascii_case(column) {
             return false;
@@ -275,6 +282,22 @@ mod tests {
         redactor(&["*.password"], RedactionStrategy::Replace).redact_result(&mut set);
         assert_eq!(set.rows[0][0], ResultValue::I64(1));
         assert_eq!(set.rows[0][1], ResultValue::String(REDACTED.to_owned()));
+    }
+
+    /// Case-insensitivity holds in both directions, because nothing is folded at
+    /// parse: the rule keeps the operator's spelling and the comparison decides.
+    #[test]
+    fn an_uppercase_rule_matches_a_lowercase_column_and_the_reverse() {
+        let mut set = result();
+        redactor(&["*.PASSWORD"], RedactionStrategy::Replace).redact_result(&mut set);
+        assert_eq!(set.rows[0][1], ResultValue::String(REDACTED.to_owned()));
+
+        // The fixture's table is `orders` and its column is `SECRET`; the rule
+        // spells both the other way round.
+        let mut description = description();
+        redactor(&["ORDERS.secret"], RedactionStrategy::Null).redact_description(&mut description);
+        assert_eq!(description.schemas[0].tables[0].columns[1].default, None);
+        assert_eq!(description.schemas[0].tables[0].columns[1].comment, None);
     }
 
     #[test]

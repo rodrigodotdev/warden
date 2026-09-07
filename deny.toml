@@ -71,7 +71,16 @@ deny = [
 # `stacker`, pulled by sqlparser's default `recursive-protection`, contains `unsafe`.
 # Warden's policy covers first-party crates, not transitive dependencies; section 2.4
 # documents this reviewed exception.
-skip = []
+#
+# `sha2` appears twice in the release graph and that is a decision, not drift: Warden
+# pins 0.11 for the `v1:<sha256-hex>` audit fingerprints (docs/security.md section
+# 11.4) and `sqlx-core` 0.9 pins 0.10. Unifying by downgrading Warden's own hash
+# dependency to silence a warning is the wrong trade, and it would have to be reverted
+# the moment sqlx moves. Neither copy is reachable from the other's call sites; the
+# cost is binary size. Remove this skip once sqlx ships a 0.11 dependency.
+skip = [
+  { crate = "sha2@0.10", reason = "sqlx-core 0.9 pins 0.10; Warden pins 0.11 for audit fingerprints (docs/operations.md section 2.7)" },
+]
 skip-tree = []
 
 # ORDER MATTERS: `[[bans.features]]` is an array of tables. Keys after it belong to

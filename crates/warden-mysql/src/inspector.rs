@@ -86,11 +86,11 @@ impl MySqlSchemaInspector {
             Some(cached) => cached,
             None => {
                 let rows = guarded(
+                    deadline,
+                    cancel,
                     sqlx::query(catalog::INDEX_SQL)
                         .bind(MAX_CATALOG_ROWS as i64)
                         .fetch_all(self.pools.control()),
-                    deadline,
-                    cancel,
                 )
                 .await?;
                 let bounded = rows.len() == MAX_CATALOG_ROWS;
@@ -173,12 +173,12 @@ impl MySqlSchemaInspector {
         cancel: &CancellationToken,
     ) -> Result<Option<(String, String, warden_core::schema::TableKind)>, SchemaError> {
         let row = guarded(
+            deadline,
+            cancel,
             sqlx::query(catalog::RESOLVE_SQL)
                 .bind(selector.schema())
                 .bind(selector.name())
                 .fetch_optional(self.pools.control()),
-            deadline,
-            cancel,
         )
         .await?;
         let Some(row) = row else {
@@ -206,6 +206,8 @@ impl MySqlSchemaInspector {
         cancel: &CancellationToken,
     ) -> Result<Table, SchemaError> {
         let column_rows = guarded(
+            deadline,
+            cancel,
             sqlx::query(catalog::COLUMNS_SQL)
                 .bind(MAX_SCHEMA_VALUE_FETCH_CHARACTERS as i64)
                 .bind(MAX_SCHEMA_VALUE_FETCH_CHARACTERS as i64)
@@ -213,8 +215,6 @@ impl MySqlSchemaInspector {
                 .bind(name)
                 .bind(MAX_DESCRIBED_COLUMNS as i64)
                 .fetch_all(self.pools.control()),
-            deadline,
-            cancel,
         )
         .await?;
         let columns_bounded = column_rows.len() == MAX_DESCRIBED_COLUMNS;
@@ -234,13 +234,13 @@ impl MySqlSchemaInspector {
             .collect::<Result<Vec<_>, SchemaError>>()?;
 
         let index_rows = guarded(
+            deadline,
+            cancel,
             sqlx::query(catalog::INDEXES_SQL)
                 .bind(schema)
                 .bind(name)
                 .bind(MAX_DESCRIBED_INDEXES as i64)
                 .fetch_all(self.pools.control()),
-            deadline,
-            cancel,
         )
         .await?;
         let indexes_bounded = index_rows.len() == MAX_DESCRIBED_INDEXES;
@@ -258,13 +258,13 @@ impl MySqlSchemaInspector {
             catalog::group_indexes(index_rows, indexes_bounded);
 
         let foreign_key_rows = guarded(
+            deadline,
+            cancel,
             sqlx::query(catalog::FOREIGN_KEYS_SQL)
                 .bind(schema)
                 .bind(name)
                 .bind(MAX_DESCRIBED_FOREIGN_KEYS as i64)
                 .fetch_all(self.pools.control()),
-            deadline,
-            cancel,
         )
         .await?;
         let foreign_keys_bounded = foreign_key_rows.len() == MAX_DESCRIBED_FOREIGN_KEYS;
@@ -322,32 +322,47 @@ impl SchemaInspector for MySqlSchemaInspector {
 
 /// Races one catalog statement against the deadline and the token.
 ///
-/// `CancellationToken::run_until_cancelled` rather than `tokio::select!`: this crate
-/// depends on `tokio` with the `time` feature only, and reaching for `select!` would
-/// enable `macros` for a race the token already expresses.
+/// `tokio::select!` with `biased` rather than a cancellation combinator, which is the
+/// shape all six `guarded` functions across the two adapters use. The keyword states
+/// the priority at the point it matters — cancellation is polled first, every time —
+/// where a combinator's polling order is a property of the combinator rather than of
+/// this race. For a control whose whole purpose is deterministic cancellation under a
+/// deadline, that ordering is a decision and belongs in the code.
 ///
 /// The server-side bound already exists — `MAX_EXECUTION_TIME` is pinned in this
 /// connection's session hardening and applies to `SELECT`, which every statement
 /// here is — so losing this race leaves at most that bound running, not an
 /// unbounded query (ADR-0024).
 async fn guarded<T>(
-    future: impl Future<Output = Result<T, sqlx::Error>>,
     deadline: Instant,
     cancel: &CancellationToken,
+    future: impl Future<Output = Result<T, sqlx::Error>>,
 ) -> Result<T, SchemaError> {
-    // `timeout_at` polls its inner future *before* it consults the deadline and
-    // reports success whenever that first poll is ready, so a catalog read whose
-    // reply is already buffered outruns a deadline that expired long ago. Refusing
-    // up front is what keeps expired work from reaching the connection at all.
-    if Instant::now() >= deadline {
+    if expired(deadline) {
         return Err(SchemaError::Timeout);
     }
-    let Some(result) = cancel
-        .run_until_cancelled(timeout_at(deadline, future))
-        .await
-    else {
-        return Err(SchemaError::Cancelled);
-    };
+    tokio::select! {
+        biased;
+        () = cancel.cancelled() => Err(SchemaError::Cancelled),
+        result = timeout_at(deadline, future) => finish(result),
+    }
+}
+
+/// Whether the deadline has already passed, checked before any work begins.
+///
+/// `timeout_at` polls its inner future *before* it consults the deadline and reports
+/// success whenever that first poll is ready, so a catalog read whose reply is already
+/// buffered outruns a deadline that expired long ago. Refusing up front is what keeps
+/// expired work from reaching the connection at all; the deadline still bounds the
+/// call itself once it starts.
+fn expired(deadline: Instant) -> bool {
+    Instant::now() >= deadline
+}
+
+/// Collapses a `timeout_at` result into the port's error type.
+fn finish<T>(
+    result: Result<Result<T, sqlx::Error>, tokio::time::error::Elapsed>,
+) -> Result<T, SchemaError> {
     match result {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(error)) => Err(database_error(error)),
@@ -423,12 +438,35 @@ mod tests {
     /// has been descheduled long enough for the reply to arrive.
     #[tokio::test]
     async fn an_expired_deadline_outranks_work_that_could_answer_at_once() {
-        let expired = tokio::time::Instant::now() - std::time::Duration::from_millis(1);
+        let expired_deadline = tokio::time::Instant::now() - std::time::Duration::from_millis(1);
         let cancel = tokio_util::sync::CancellationToken::new();
 
-        let outcome = super::guarded(async { Ok::<_, sqlx::Error>(()) }, expired, &cancel).await;
+        let outcome = super::guarded(expired_deadline, &cancel, async {
+            Ok::<_, sqlx::Error>(())
+        })
+        .await;
 
         assert_eq!(outcome.unwrap_err(), SchemaError::Timeout);
+    }
+
+    /// Cancellation outranks work that is already able to answer.
+    ///
+    /// This is what `biased` buys and what a cancellation combinator does not: the
+    /// token's arm is polled first, every time, so a shutdown is honoured even when
+    /// the catalog read could have completed on its first poll. All six `guarded`
+    /// functions in the two adapters share this ordering (ADR-0024).
+    #[tokio::test]
+    async fn a_cancelled_token_outranks_work_that_could_answer_at_once() {
+        let live = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        cancel.cancel();
+
+        let outcome = super::guarded(live, &cancel, async { Ok::<_, sqlx::Error>(7) }).await;
+
+        assert!(
+            matches!(outcome, Err(SchemaError::Cancelled)),
+            "{outcome:?}"
+        );
     }
 
     /// The guard refuses only expired deadlines, never a live one.
@@ -437,7 +475,7 @@ mod tests {
         let live = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         let cancel = tokio_util::sync::CancellationToken::new();
 
-        let outcome = super::guarded(async { Ok::<_, sqlx::Error>(7) }, live, &cancel).await;
+        let outcome = super::guarded(live, &cancel, async { Ok::<_, sqlx::Error>(7) }).await;
 
         assert_eq!(outcome.unwrap(), 7);
     }

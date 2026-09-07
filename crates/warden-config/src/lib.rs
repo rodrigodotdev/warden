@@ -26,6 +26,13 @@
 //! error variant in this crate carries a DSN, a password, or a file's contents — only the
 //! name of the variable or the path that failed.
 
+// `Index` panics on a miss and is the one panic shape `clippy::unwrap_used` and
+// `expect_used` cannot see, which is why `AGENTS.md` bans the others. This crate runs
+// on the startup path, where a panic is a failed boot rather than a contained
+// request. Scoped to `not(test)` because test code indexes assertions freely and the
+// goal is to catch a panic before serving, not to fight a fixture.
+#![cfg_attr(not(test), warn(clippy::indexing_slicing))]
+
 mod duration;
 mod error;
 mod model;

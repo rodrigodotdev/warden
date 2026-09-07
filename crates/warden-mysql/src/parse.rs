@@ -3,22 +3,7 @@
 use sqlparser::ast::Statement;
 use sqlparser::dialect::MySqlDialect;
 use sqlparser::parser::{Parser, ParserError};
-
-/// The parser's explicit recursion bound.
-///
-/// ADR-0006 requires this to be set explicitly rather than inherited. It equals
-/// sqlparser 0.62's own default, so pinning it changes nothing today and prevents an
-/// upstream default change from silently moving Warden's bound. It is the middle of
-/// three layers: `QueryRequest` caps the input at 64 KiB before parsing
-/// (`docs/data-model.md` section 2), this bound caps nesting, and sqlparser's default
-/// `recursive-protection` feature keeps a deep tree from overflowing the stack
-/// (`docs/operations.md` section 2.4).
-///
-/// Measured against sqlparser 0.62: 2000 chained `OR`s parse well within it, because
-/// an operator chain is iterative, not recursive. What it stops is depth — roughly 50
-/// nested parentheses or subqueries.
-pub(crate) const RECURSION_LIMIT: usize = 50;
-
+use warden_core::SQL_RECURSION_LIMIT;
 /// Why the MySQL grammar produced no statement list.
 ///
 /// Kept separate from `warden_ports::error::AnalyzeError` because [`Self::Empty`]
@@ -29,7 +14,7 @@ pub(crate) enum ParseFailure {
     /// The grammar rejected the statement. Carries the parser's own message, which
     /// quotes the offending token and therefore never leaves a diagnostic path.
     Syntax(String),
-    /// The statement nests deeper than [`RECURSION_LIMIT`].
+    /// The statement nests deeper than [`SQL_RECURSION_LIMIT`].
     Recursion,
     /// The input contained no statement at all, such as a lone `;`.
     Empty,
@@ -42,7 +27,7 @@ pub(crate) enum ParseFailure {
 /// evidence model cannot represent and must not be invented downstream.
 pub(crate) fn statements(sql: &str) -> Result<Vec<Statement>, ParseFailure> {
     let parsed = Parser::new(&MySqlDialect {})
-        .with_recursion_limit(RECURSION_LIMIT)
+        .with_recursion_limit(SQL_RECURSION_LIMIT)
         .try_with_sql(sql)
         .and_then(|mut parser| parser.parse_statements());
 
@@ -98,7 +83,10 @@ mod tests {
 
     #[test]
     fn nesting_past_the_bound_is_a_recursion_failure_not_a_stack_overflow() {
-        let sql = format!("SELECT {}1{}", "(".repeat(200), ")".repeat(200));
+        // Expressed against the shared bound rather than a literal: if either
+        // adapter ever stops honouring it, this is what fails.
+        let depth = SQL_RECURSION_LIMIT * 4;
+        let sql = format!("SELECT {}1{}", "(".repeat(depth), ")".repeat(depth));
         assert_eq!(statements(&sql).unwrap_err(), ParseFailure::Recursion);
     }
 

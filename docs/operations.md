@@ -153,6 +153,17 @@ shared data. Any redistribution that includes this root store must preserve that
 notice. A `webpki-roots` update requires a fresh provenance and license review before
 its version-pinned exception can change.
 
+`deny.toml` also carries one deliberate duplicate-version exception. `sha2` is in the
+release graph twice: Warden pins `0.11` for the `v1:<sha256-hex>` audit fingerprints
+(section 11.4 of `docs/security.md`) and `sqlx-core@0.9` pins `0.10`. Unifying by
+downgrading Warden's own hash dependency would trade a current crate for a silenced
+warning and would have to be reverted as soon as SQLx moves, so the duplicate is
+accepted instead. Neither copy is reachable from the other's call sites and the cost is
+binary size, not correctness. The `[bans] skip` entry is what makes this a recorded
+decision rather than a standing warning; remove it when SQLx ships a `sha2 0.11`
+dependency. `base64` is duplicated too, but only through `bollard`, a dev-dependency,
+so it never enters a release artifact and needs no exception.
+
 `LICENSES/webpki-roots-1.0.9-CDLA-Permissive-2.0.txt` is the unmodified text
 distributed by that crate. It is a third-party redistribution notice, **not**
 Warden's project license. Today's distributable artifact is the source repository;
