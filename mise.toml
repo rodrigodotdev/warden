@@ -33,6 +33,15 @@ run = ["cargo fmt --all --check", "taplo fmt --check"]
 description = "Check all workspace targets"
 run = "cargo check --workspace --all-targets"
 
+[tasks."check:standalone"]
+# A workspace build unifies features across the graph, so a crate that uses a feature it
+# never declared still compiles. Checking each package alone is the only way to see
+# that, and it is the local half of the CI gate job's own step. The glob is the
+# workspace's `members = ["crates/*"]` plus the root; no `--lib`, because the root
+# package is a binary.
+description = "Check that every crate builds on its own, with only the features it declares"
+run = 'for manifest in Cargo.toml crates/*/Cargo.toml; do cargo check --manifest-path "$manifest" || exit 1; done'
+
 [tasks.lint]
 description = "Run Clippy with warnings denied"
 run = "cargo clippy --workspace --all-targets --all-features -- -D warnings"
@@ -79,4 +88,12 @@ run = "cargo +1.94.0 check --workspace --all-targets"
 
 [tasks.ci]
 description = "Run the complete CI-equivalent gate"
-depends = ["fmt:check", "check", "lint", "doc", "test", "deny"]
+depends = [
+  "fmt:check",
+  "check",
+  "check:standalone",
+  "lint",
+  "doc",
+  "test",
+  "deny",
+]

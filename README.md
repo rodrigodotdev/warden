@@ -103,9 +103,15 @@ max_rows = 200
 columns = ["*.password_hash", "*.access_token"]
 ```
 
-Warden never reads a DSN from this file. `dsn_env` names the environment variable
-that holds it. Alternatively, `dsn_file` names a secret file—usually the better choice
-for Docker or Kubernetes secret mounts.
+Warden never reads a DSN from this file. `dsn_env` names the environment variable that
+holds it; `dsn_file` names a secret file instead.
+
+**Prefer `dsn_file` where the deployment allows it.** The two are not equally strong. A
+DSN read from a file exists only in a buffer Warden zeroes as soon as it is parsed. One
+read from the environment cannot be: the value stays in the process environment block
+for the process lifetime, readable through `/proc/self/environ` by anything that can
+read the process — which is exactly the local agent the threat model below describes.
+`dsn_file` also fits Docker and Kubernetes secret mounts.
 
 A DSN describes only the connection target: scheme, host, user, database, and optionally
 a port and password. It cannot contain a query string. TLS and every other behavior are
@@ -264,8 +270,8 @@ attempt.
 ## Project status
 
 Warden has reached its first developer-usable release. Milestone 12 ships
-`warden serve --transport stdio`, `warden check`, and all five MCP tools for MySQL and
-PostgreSQL.
+`warden serve --transport stdio`, `warden check`, all five MCP tools for MySQL and
+PostgreSQL, and an audit trail written through the process's stderr subscriber.
 
 Milestone 13 makes that audit trail durable and reviewable: `query`, `explain`, and both
 catalog reads record two phases to a versioned, append-only audit file; raw SQL and
@@ -297,6 +303,7 @@ mise tasks
 |---|---|:---:|
 | `mise run fmt:check` | Check Rust and TOML formatting | No |
 | `mise run check` | Type-check every workspace target | No |
+| `mise run check:standalone` | Check that every crate builds on its own | No |
 | `mise run lint` | Run Clippy with warnings denied | No |
 | `mise run test` | Run the fast workspace test suite | No |
 | `RUST_TEST_THREADS=4 mise run test:docker` | Verify both adapters and the MCP server against real databases at the documented container-capacity limit | Yes |
@@ -309,7 +316,15 @@ The canonical milestone gate remains:
 cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+for manifest in Cargo.toml crates/*/Cargo.toml; do
+  cargo check --manifest-path "$manifest" || exit 1
+done
 ```
+
+The last one is not redundant with `cargo check --workspace`. A workspace build unifies
+features across the dependency graph, so a crate that uses a feature it never declared
+still compiles — and every other command here is workspace-wide, which is why this class
+of error went unnoticed until a crate was built on its own. `mise run ci` includes it.
 
 Before changing implementation or architecture, read [`SPEC.md`](SPEC.md) and
 [`AGENTS.md`](AGENTS.md). Work proceeds one milestone at a time, and architectural

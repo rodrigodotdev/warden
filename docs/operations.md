@@ -1046,10 +1046,20 @@ produce noise and cargo-cult suppressions.
 ```text
 cargo fmt --check
 cargo check --workspace --all-targets
+for manifest in Cargo.toml crates/*/Cargo.toml; do cargo check --manifest-path "$manifest"; done
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace
 cargo deny --workspace check
 ```
+
+**The per-manifest loop is not redundant with `cargo check --workspace`.** A workspace
+build unifies features across the dependency graph, so a crate that uses a feature it
+never declared compiles anyway; every other command above is workspace-wide, and
+`cargo test -p <crate>` does not help either, because it pulls that crate's
+dev-dependencies. `warden-mysql` shipped for two milestones declaring `tokio` with
+`time` while using `tokio::select!`, which `macros` gates, and nothing in CI could see
+it. `--manifest-path` resolves features for one package alone; no `--lib`, because the
+root package is a binary. `mise run check:standalone` is the same loop.
 
 Database integration tests run in a dedicated Docker job. CI denies warnings; do not
 force developers to deny warnings in every exploratory local command.

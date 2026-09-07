@@ -1,8 +1,10 @@
 # Milestones
 
 Implement one milestone at a time. At the end of each, run `cargo fmt --check`,
-`cargo clippy --workspace --all-targets -- -D warnings`, and
-`cargo test --workspace`, then report deviations.
+`cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace`, and
+`mise run check:standalone`, then report deviations. The last one builds each crate on
+its own: the others are workspace-wide, and a workspace build unifies features across
+the graph, so a crate that uses a feature it never declared still compiles.
 
 ---
 

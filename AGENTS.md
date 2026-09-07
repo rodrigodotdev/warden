@@ -16,7 +16,10 @@ prevails.
    official documentation before writing code. Do not copy feature flags from
    outdated examples.
 6. Run `cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`,
-   and `cargo test --workspace` at the end of each milestone.
+   `cargo test --workspace`, and `mise run check:standalone` at the end of each
+   milestone. The last one builds each crate on its own: the other three are
+   workspace-wide, and a workspace build unifies features across the graph, so a crate
+   that uses a feature it never declared still compiles.
 7. Explicitly list **every deviation** from the specification in each milestone
    report.
 
