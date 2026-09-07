@@ -15,7 +15,7 @@
 //! `GRANT` is the only thing left standing. That is the point: the two barriers are
 //! independent, and this file measures the lower one.
 
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use sqlx::{AssertSqlSafe, Connection, Row};
 use testcontainers_modules::postgres::Postgres;

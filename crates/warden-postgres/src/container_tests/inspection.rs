@@ -4,7 +4,7 @@
 //! visibility, search-path resolution, identifier folding, metadata decoding, and
 //! pool isolation are server properties rather than behaviors a mock can establish.
 
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::sync::Arc;
 use std::time::Duration;

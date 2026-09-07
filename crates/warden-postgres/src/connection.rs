@@ -327,7 +327,7 @@ fn normalized_path(value: &str) -> Vec<&str> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use std::str::FromStr;
 
     use super::*;

@@ -56,6 +56,9 @@ serde_json = { workspace = true }
 time = { workspace = true }
 
 [dev-dependencies]
+# `tests/adapter_rules.rs` reads this crate's own AST (ADR-0046). Dev-only, and
+# `warden-guards` may depend on no Warden crate, so no cycle is possible.
+warden-guards = { workspace = true }
 # Depend only on `testcontainers-modules`, which re-exports `testcontainers`. A
 # direct dependency would select an incompatible version and compile two copies
 # whose types do not unify.

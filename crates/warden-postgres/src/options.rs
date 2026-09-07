@@ -202,7 +202,7 @@ fn ssl_mode(mode: TlsMode) -> PgSslMode {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use std::process::Command;
 

@@ -1,0 +1,27 @@
+[package]
+name = "warden-guards"
+version = "0.1.0"
+description = "AST machinery the workspace's mechanical source guards share (ADR-0046)"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+# `syn`, `proc-macro2` and `std`, and nothing else. Not a single Warden crate, not even
+# for this crate's own tests: a guard that can see the code it guards is a guard that
+# can be made to pass (ADR-0046). `tests/architecture.rs` pins that in FORBIDDEN_EDGES.
+[dependencies]
+# `span-locations` is what lets a failing guard name the line it failed on. It is a
+# fallback-only proc-macro2 feature, so it costs nothing outside a proc macro, and this
+# crate is reached only through dev-dependencies.
+proc-macro2 = { workspace = true, features = ["span-locations"] }
+quote = { workspace = true }
+syn = { workspace = true }
+
+[dev-dependencies]
+# The fixtures are `syn::Item` values, so the tests name the same syn as the library.
+syn = { workspace = true }

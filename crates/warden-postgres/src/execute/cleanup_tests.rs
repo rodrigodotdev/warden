@@ -1,6 +1,6 @@
 //! Real-server lifecycle checks for the temporary named executor statement.
 
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;

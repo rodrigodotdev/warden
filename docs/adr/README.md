@@ -50,6 +50,7 @@ supersedes it; never change it silently.
 | [0043](0043-the-persistent-audit-sink.md) | The persistent audit sink |
 | [0044](0044-spans-are-the-observability-surface.md) | Spans are the observability surface |
 | [0045](0045-panic-reports-carry-a-location-never-a-payload.md) | Panic reports carry a location, never a payload |
+| [0046](0046-mechanical-guards-share-one-ast-implementation.md) | Mechanical guards share one AST implementation |
 | [0047](0047-the-byte-budget-bounds-the-database-result.md) | The byte budget bounds the database result, not the redacted response |
 
 ADRs 0021–0026 are new in v0.3. ADR-0002 supersedes the v0.2 MSRV definition;

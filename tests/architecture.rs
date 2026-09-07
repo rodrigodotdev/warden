@@ -29,6 +29,25 @@ const FORBIDDEN_EDGES: &[(&str, &[&str])] = &[
     ("warden-mcp", &["sqlx", "sqlparser"]),
     ("warden-mysql", &["rmcp"]),
     ("warden-postgres", &["rmcp"]),
+    // `warden-guards` reads the source of every crate. It must not be able to depend on
+    // any of them: a guard that can see the code it guards is a guard that can be made
+    // to pass (ADR-0046). The whole workspace is forbidden, not a selection.
+    (
+        "warden-guards",
+        &[
+            "sqlx",
+            "rmcp",
+            "sqlparser",
+            "warden-core",
+            "warden-policy",
+            "warden-ports",
+            "warden-config",
+            "warden-service",
+            "warden-mcp",
+            "warden-mysql",
+            "warden-postgres",
+        ],
+    ),
 ];
 
 /// Expected workspace crates. Adding one requires an explicit boundary decision.
@@ -36,6 +55,7 @@ const EXPECTED_MEMBERS: &[&str] = &[
     "warden",
     "warden-config",
     "warden-core",
+    "warden-guards",
     "warden-mcp",
     "warden-mysql",
     "warden-policy",
@@ -1003,6 +1023,83 @@ fn docker_copy_parser_rejects_a_notice_copied_only_into_a_builder_stage() {
         "COPY --from=builder /app/warden /usr/local/bin/warden\n",
     );
     assert!(!dockerfile_copies_licenses(fixture));
+}
+
+/// The one allow `AGENTS.md` sanctions, spelled exactly one way.
+const SANCTIONED_TEST_ALLOW: &str = "clippy::unwrap_used, clippy::expect_used";
+
+/// The other sanctioned allow: unused fixtures in a crate's `testing.rs`.
+const SANCTIONED_FIXTURE_ALLOW: &str = "dead_code";
+
+#[test]
+fn the_only_allows_in_the_workspace_are_the_two_agents_md_sanctions() {
+    // `AGENTS.md` names `#![allow(clippy::unwrap_used, clippy::expect_used)]` as "the
+    // one standing exception" — the single allow anyone may grep for. That only works
+    // if there is one spelling: nine files in `warden-postgres` wrote the pair in the
+    // other order, so a grep, or this guard, had to know both. Normalising them was the
+    // easy half; this is the half that keeps them normalised.
+    //
+    // The second sanction is `#![allow(dead_code)]`, once per crate's `testing.rs`,
+    // for fixtures that not every test uses.
+    //
+    // Deliberately not a count: a guard that asserts "four dead_code allows" fails when
+    // a crate legitimately gains a `testing.rs` and says nothing about a fifth allow of
+    // some *other* lint, which is the thing that actually matters.
+    let mut violations = Vec::new();
+    for path in workspace_source_files() {
+        let source = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("could not read {}: {error}", path.display()));
+        let file = syn::parse_file(&source)
+            .unwrap_or_else(|error| panic!("could not parse {}: {error}", path.display()));
+        for allow in warden_guards::allow_attributes(&file) {
+            let sanctioned = allow.detail == SANCTIONED_TEST_ALLOW
+                || (allow.detail == SANCTIONED_FIXTURE_ALLOW
+                    && path.file_name().is_some_and(|name| name == "testing.rs"));
+            if !sanctioned {
+                violations.push(format!(
+                    "  {}:{}: #[allow({})]",
+                    path.display(),
+                    allow.line,
+                    allow.detail
+                ));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "an unsanctioned `allow` is in the workspace:\n{}\n\n\
+         `AGENTS.md` allows exactly two: `{SANCTIONED_TEST_ALLOW}` at the top of a \
+         `#[cfg(test)]` module or a `tests/` file, and `{SANCTIONED_FIXTURE_ALLOW}` in \
+         a crate's `testing.rs`. Every other lint stays on. If proceeding needs one \
+         off, that is a decision for an ADR, not an attribute.",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn the_allow_scan_rejects_a_reordered_pair_and_an_unrelated_lint() {
+    // The scan must fail on what it exists to catch, or normalising the nine files was
+    // the whole fix and nothing keeps them that way.
+    let reordered = syn::parse_file("#![allow(clippy::expect_used, clippy::unwrap_used)]").unwrap();
+    let unrelated = syn::parse_file("#![allow(clippy::indexing_slicing)]").unwrap();
+    let sanctioned =
+        syn::parse_file("#![allow(clippy::unwrap_used, clippy::expect_used)]").unwrap();
+
+    assert_eq!(
+        warden_guards::allow_attributes(&reordered)[0].detail,
+        "clippy::expect_used, clippy::unwrap_used",
+        "a reordered pair must read differently from the sanctioned spelling"
+    );
+    assert_ne!(
+        warden_guards::allow_attributes(&unrelated)[0].detail,
+        SANCTIONED_TEST_ALLOW
+    );
+    assert_eq!(
+        warden_guards::allow_attributes(&sanctioned)[0].detail,
+        SANCTIONED_TEST_ALLOW,
+        "the sanctioned spelling must be recognised, or the guard bans everything"
+    );
 }
 
 /// Span names Warden creates, read out of the workspace's own source.

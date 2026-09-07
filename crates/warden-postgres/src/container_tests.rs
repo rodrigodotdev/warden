@@ -8,7 +8,7 @@
 //! Every test starts its own container, so a test that saturates a pool cannot
 //! change another test's result.
 
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod execution;
 mod inspection;

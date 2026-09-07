@@ -19,6 +19,7 @@ warden-postgres = { path = "crates/warden-postgres" }
 warden-service = { path = "crates/warden-service" }
 warden-mcp = { path = "crates/warden-mcp" }
 warden-config = { path = "crates/warden-config" }
+warden-guards = { path = "crates/warden-guards" }
 
 # Runtime
 tokio = { version = "1.53", default-features = false }
@@ -95,6 +96,9 @@ syn = { version = "2", features = ["full", "visit"] }
 # `syn::Macro` deliberately leaves a macro body as a token stream, so a guard that must
 # see inside one walks those token trees itself.
 proc-macro2 = "1"
+# `quote` renders a `syn` node back to text so a failing guard can quote what it saw.
+# Already in the lock as syn's own dependency; dev-only, through `warden-guards`.
+quote = "1"
 
 # Serialization and errors
 serde = { version = "1.0", features = ["derive"] }
@@ -221,6 +225,8 @@ docker = []
 
 [dev-dependencies]
 proc-macro2 = { workspace = true }
+# `tests/architecture.rs` reads the workspace's own AST (ADR-0046).
+warden-guards = { workspace = true }
 sha2 = { workspace = true }
 syn = { workspace = true }
 toml = { workspace = true }

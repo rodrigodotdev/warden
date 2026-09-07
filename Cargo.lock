@@ -3138,6 +3138,7 @@ dependencies = [
  "tracing-subscriber",
  "warden-config",
  "warden-core",
+ "warden-guards",
  "warden-mcp",
  "warden-mysql",
  "warden-policy",
@@ -3172,6 +3173,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "warden-guards"
+version = "0.1.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.119",
+]
+
+[[package]]
 name = "warden-mcp"
 version = "0.1.0"
 dependencies = [
@@ -3186,6 +3196,7 @@ dependencies = [
  "tracing",
  "uuid",
  "warden-core",
+ "warden-guards",
  "warden-policy",
  "warden-ports",
  "warden-service",
@@ -3209,6 +3220,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "warden-core",
+ "warden-guards",
  "warden-policy",
  "warden-ports",
 ]
@@ -3255,6 +3267,7 @@ dependencies = [
  "tokio-util",
  "tracing",
  "warden-core",
+ "warden-guards",
  "warden-policy",
  "warden-ports",
 ]

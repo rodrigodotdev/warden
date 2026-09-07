@@ -53,6 +53,9 @@ sha2 = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+# `tests/adapter_rules.rs` reads this crate's own AST (ADR-0046). Dev-only, and
+# `warden-guards` may depend on no Warden crate, so no cycle is possible.
+warden-guards = { workspace = true }
 # Depend only on `testcontainers-modules`, which re-exports `testcontainers`.
 testcontainers-modules = { workspace = true }
 syn = { workspace = true }

@@ -31,6 +31,8 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+# `tests/mcp_rules.rs` reads this crate's own AST (ADR-0046).
+warden-guards = { workspace = true }
 # Ports and policy are a *dev* dependency only. `docs/architecture.md` section 3 keeps
 # the production edge at core + service + rmcp; the fakes in `src/testing.rs` have to
 # implement the port traits and build a real `PolicyEngine`, and `tests/architecture.rs`

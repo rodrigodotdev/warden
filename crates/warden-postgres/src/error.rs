@@ -86,7 +86,7 @@ impl ConnectError {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used, clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     const LEAKY: &str = "postgres://warden:hunter2@db-02.internal/analytics";
 

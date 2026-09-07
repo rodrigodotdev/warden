@@ -499,3 +499,137 @@ fn the_scans_detect_the_violations_they_exist_to_catch() {
         "error.rs moved; the source layout the guards assume needs updating"
     );
 }
+
+/// The last path segment of a type, if it is a plain path.
+fn quote_path(node: &syn::Type) -> Option<String> {
+    let syn::Type::Path(path) = node else {
+        return None;
+    };
+    path.path
+        .segments
+        .last()
+        .map(|segment| segment.ident.to_string())
+}
+
+/// The one tool runner that deliberately spawns nothing.
+///
+/// `list_connections` reads a `Vec` the registry already holds. It awaits nothing, so
+/// there is no task to lose and nothing for a panic to escape from.
+const UNSPAWNED_RUNNER: &str = "run_list_connections";
+
+/// Every tool runner on `WardenServer`, paired with the calls in its body.
+///
+/// A runner is a `run_*` method that returns `CallToolResult`. Both halves matter:
+/// `run_in_task` is a `run_*` method and is the helper being checked for, so a
+/// name-only scan would demand that the containment helper contain itself; and the
+/// `#[tool]`-annotated entry points also return `CallToolResult` but only resolve an
+/// identity and delegate to one of these, which is where the work actually happens.
+fn tool_runners() -> Vec<(String, usize, Vec<String>)> {
+    let items = warden_guards::production_items(&crate_src().join("server.rs"));
+    let mut runners = Vec::new();
+    for item in &items {
+        let syn::Item::Impl(block) = item else {
+            continue;
+        };
+        for impl_item in &block.items {
+            let syn::ImplItem::Fn(method) = impl_item else {
+                continue;
+            };
+            let name = method.sig.ident.to_string();
+            if !name.starts_with("run_") {
+                continue;
+            }
+            let returns_tool_result = matches!(
+                &method.sig.output,
+                syn::ReturnType::Type(_, returned)
+                    if quote_path(returned).is_some_and(|path| path.ends_with("CallToolResult"))
+            );
+            if !returns_tool_result {
+                continue;
+            }
+            let body = std::slice::from_ref(impl_item);
+            let calls = warden_guards::called_paths_in_impl_items(body);
+            runners.push((name, method.sig.ident.span().start().line, calls));
+        }
+    }
+    runners
+}
+
+#[test]
+fn every_tool_runner_contains_its_work_in_its_own_task() {
+    // `AGENTS.md`, "Request path": run each request in its own task so a panic becomes
+    // `internal_error` instead of terminating the process (`docs/security.md` section
+    // 14, ADR-0045). `WardenServer::run_in_task` is how that is done, and it is written
+    // out once per tool — four times today.
+    //
+    // Duplication is safe where a guard watches it and unsafe where none does. Nothing
+    // watched this: a fifth tool that awaited a service directly would compile, pass
+    // every functional test, and take the connection down on the first panic. That is
+    // the finding, and a guard is the answer to it rather than an abstraction — four
+    // flat runners a reviewer can read top to bottom are worth more than the twenty
+    // lines a generic dispatcher would save.
+    let runners = tool_runners();
+    assert!(
+        runners.len() >= 5,
+        "found {} tool runners; the scan is reading the wrong impl block",
+        runners.len()
+    );
+
+    let mut violations = Vec::new();
+    for (name, line, calls) in &runners {
+        let contained = calls.iter().any(|call| call.ends_with("run_in_task"));
+        if name == UNSPAWNED_RUNNER {
+            assert!(
+                !contained,
+                "{name} now spawns a task; if that is deliberate, it stops being the \
+                 documented exception and this guard should simply cover it too"
+            );
+            continue;
+        }
+        if !contained {
+            violations.push(format!("  src/server.rs:{line}: {name}"));
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "a tool runner does not contain its work in a task:\n{}\n\n\
+         A panic inside one of these escapes into the rmcp handler and takes the \
+         connection with it, instead of becoming `internal_error` \
+         (`docs/security.md` section 14). Wrap the service call in \
+         `Self::run_in_task`.",
+        violations.join("\n")
+    );
+}
+
+#[test]
+fn the_containment_scan_rejects_a_runner_that_awaits_directly() {
+    // The scan must fail on the shape it exists to catch.
+    let fixture = warden_guards::production_items_of(
+        r#"
+        impl WardenServer {
+            async fn run_contained(&self) -> CallToolResult {
+                Self::run_in_task(async move { services.query().execute().await }).await
+            }
+            async fn run_direct(&self) -> CallToolResult {
+                self.services.query().execute().await
+            }
+        }
+        "#,
+    );
+    let syn::Item::Impl(block) = &fixture[0] else {
+        panic!("expected an impl block");
+    };
+    let calls_of = |index: usize| {
+        warden_guards::called_paths_in_impl_items(std::slice::from_ref(&block.items[index]))
+    };
+
+    assert!(
+        calls_of(0).iter().any(|call| call.ends_with("run_in_task")),
+        "a contained runner must be recognised"
+    );
+    assert!(
+        !calls_of(1).iter().any(|call| call.ends_with("run_in_task")),
+        "a runner that awaits a service directly must not pass"
+    );
+}

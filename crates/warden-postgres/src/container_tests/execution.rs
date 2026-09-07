@@ -12,7 +12,7 @@
 //! reinforcement inside it, the binding, the type table, and every way a value can
 //! fail safely.
 
-#![allow(clippy::expect_used, clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::num::NonZeroUsize;
 use std::sync::Arc;
