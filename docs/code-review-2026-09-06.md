@@ -18,6 +18,31 @@ effort estimate and a line delta where the change removes code.
 
 ---
 
+## Status: executed
+
+All six phases landed on 2026-09-06. The document below is kept as the reasoning
+behind them; where the code and this plan disagree, the code is what was decided and
+the commit message says why. Five proposals were withdrawn or reshaped during
+execution because the tree contradicted them:
+
+| Item | What execution found |
+|---|---|
+| §1.1 | The proposed CI loop used `cargo check -p "$c" --lib`, which fails on the root package — it is a binary. It also needed `jq`, which nothing provisions. The gate iterates `Cargo.toml crates/*/Cargo.toml` with `--manifest-path` instead: no JSON parser, no undeclared tool. |
+| §1.3 | Part 2 rested on a false premise — `fs::read_to_string` pre-reserves from file metadata. Withdrawn. `secrecy` was also already a `warden-config` dependency. |
+| §2.4 | Folding the incoming identifier and comparing with `==` would have *added* an allocation per column. Deleting the parse-time fold and keeping `eq_ignore_ascii_case` as the single case authority is simpler and allocation-free. |
+| §3 | `AuditMode` went to `warden-core`, not `warden-ports`. The `TlsMode` precedent the plan cited lives there, and `warden-ports` has no `serde`. |
+| §4.3 | The generic `dispatch` was withdrawn: it did not compile as sketched, and fixed it would trade four readable runners for ~20 lines. The real finding was that nothing enforced `run_in_task`, so a guard replaced it. |
+| §5.1 | The port fakes are not duplicates — `FakeExecutor` has 1 field in `warden-ports`, 7 in `warden-service`, 2 in `warden-mcp`. Only the byte-identical value fixtures moved, into a dev-only `warden-testing` crate rather than a `testing` feature. |
+| §5.5 | Inverted: six of the eight helpers already clean up; two in `warden-config` did not. Scope cut from half a day to twenty minutes — and the cleanup exposed five tests that passed only because the directory leaked. |
+
+Three guards were written during execution rather than planned, each because the work
+uncovered something nothing was watching: that every MCP tool runner is contained by
+`run_in_task`, that the audit record format declares no forbidden field name, and that
+no dev-only crate is a normal dependency. The last one failed open on its first version
+and was rewritten.
+
+---
+
 ## 0. Assessment
 
 The codebase is unusually disciplined. Default-deny is structural rather than

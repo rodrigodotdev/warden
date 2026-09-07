@@ -5,9 +5,9 @@
 //! live in the binary, which made it the only port in the system whose implementations
 //! did (ADR-0048).
 //!
-//! [`record`] is the single declaration of what an audit record contains: its shape,
-//! its key order, and the names no record may ever carry. [`tracing_sink`] writes it
-//! through the process's stderr subscriber; [`file`] appends it to a JSON Lines trail
+//! `record` is the single declaration of what an audit record contains: its shape,
+//! its key order, and the names no record may ever carry. `tracing_sink` writes it
+//! through the process's stderr subscriber; `file` appends it to a JSON Lines trail
 //! with the durability protocol ADR-0043 specifies. Both project the same field set
 //! from the same declaration, which `tests/audit_rules.rs` asserts from outside.
 //!

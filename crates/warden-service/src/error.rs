@@ -46,7 +46,7 @@ pub enum QueryServiceError {
 
 /// Every preflight refusal is already audited when it arrives here.
 ///
-/// [`crate::pipeline::ServiceCore::preflight`] records the attempt and completes it
+/// `ServiceCore::preflight` records the attempt and completes it
 /// before returning, so this conversion adds the service's own vocabulary and nothing
 /// else. The variants stay spelled out rather than collapsed behind a generic: this map
 /// is what `docs/security.md` section 10 asks a reader to check.
@@ -98,7 +98,7 @@ pub enum ExplainServiceError {
 
 /// Every preflight refusal is already audited when it arrives here.
 ///
-/// [`crate::pipeline::ServiceCore::preflight`] records the attempt and completes it
+/// `ServiceCore::preflight` records the attempt and completes it
 /// before returning, so this conversion adds the service's own vocabulary and nothing
 /// else. The variants stay spelled out rather than collapsed behind a generic: this map
 /// is what `docs/security.md` section 10 asks a reader to check.

@@ -37,7 +37,7 @@ use crate::redaction::Redactor;
 
 /// Plans one agent statement through the same safety boundaries as execution.
 ///
-/// A thin wrapper over [`ServiceCore`], which holds the collaborators and runs the
+/// A thin wrapper over `ServiceCore`, which holds the collaborators and runs the
 /// preflight this service shares with [`crate::QueryService`]. What is left here is
 /// what genuinely differs: the operation constant, the root span, the gated call, the
 /// error-to-outcome map, and the redaction step.
