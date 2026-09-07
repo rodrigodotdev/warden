@@ -8,9 +8,20 @@
 //! ADR-0031's rules live. This module never logs, never returns, and never formats
 //! the text it read; only the variable name or the path it came from ever reaches an
 //! error (`docs/operations.md` section 3.3).
+//!
+//! The buffer holding the text is a [`SecretString`] for the length of the parse, so
+//! it is zeroed when it drops rather than left in freed heap — the same property
+//! `warden_core::secret`'s header claims for the string a `Dsn` is built from.
+//!
+//! **The two sources are not equally strong.** `dsn_file` is read into that buffer and
+//! nothing else holds it. `dsn_env` cannot be: the value stays in the process
+//! environment block for the process lifetime, readable through `/proc/self/environ`
+//! by anything that can read the process — which is the local agent `docs/mcp.md`
+//! section 7 already warns about. Prefer `dsn_file` where the deployment allows it.
 
 use std::path::PathBuf;
 
+use secrecy::{ExposeSecret, SecretString};
 use warden_core::connection::ConnectionName;
 use warden_core::secret::Dsn;
 
@@ -41,7 +52,7 @@ pub(crate) fn resolve(
     connection: &ConnectionName,
     source: &SecretSource,
 ) -> Result<Dsn, ConfigError> {
-    let raw = match source {
+    let raw = SecretString::from(match source {
         SecretSource::Environment(variable) => {
             std::env::var(variable).map_err(|_error| ConfigError::DsnVariableMissing {
                 connection: connection.clone(),
@@ -55,9 +66,9 @@ pub(crate) fn resolve(
                 message: error.to_string(),
             })?
         }
-    };
+    });
 
-    Dsn::try_from(raw.trim().to_owned()).map_err(|error| ConfigError::InvalidDsn {
+    Dsn::try_from(raw.expose_secret().trim().to_owned()).map_err(|error| ConfigError::InvalidDsn {
         connection: connection.clone(),
         message: error.to_string(),
     })

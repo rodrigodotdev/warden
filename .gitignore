@@ -13,6 +13,11 @@
 !.env.example
 /secrets/
 
+# Agent session artefacts — transcripts can quote configuration and DSNs
+/codex-session-*.md
+/*-local-command-caveat*.txt
+/.codex/sessions/
+
 # Editors
 .idea/
 .vscode/

@@ -284,6 +284,37 @@ mod tests {
         assert_eq!(set.rows[0][1], ResultValue::Null);
     }
 
+    /// Pins the figure ADR-0047 and `docs/security.md` section 8 state.
+    ///
+    /// `max_result_bytes` is enforced while rows arrive and redaction runs after it,
+    /// so a `Replace` rule can push a response over the budget Warden reported
+    /// enforcing. The overshoot is bounded by what the sentinel costs: twelve encoded
+    /// bytes, replacing a value that cost at least one. If the sentinel or the JSON
+    /// accounting changes, this fails rather than silently widening the overshoot.
+    #[test]
+    fn replace_grows_a_response_by_at_most_twelve_bytes_per_cell() {
+        assert_eq!(
+            ResultValue::String(REDACTED.to_owned()).json_bytes(),
+            12,
+            "the redaction sentinel no longer costs the documented twelve bytes"
+        );
+
+        // `NULL` is the case the documentation cites: four bytes in, twelve out.
+        let mut set = result();
+        set.rows[0][1] = ResultValue::Null;
+        set.stats.bytes = set.rows.iter().map(|row| row_json_bytes(row)).sum();
+        let before = set.stats.bytes;
+
+        redactor(&["*.password"], RedactionStrategy::Replace).redact_result(&mut set);
+
+        assert_eq!(set.rows[0][1], ResultValue::String(REDACTED.to_owned()));
+        assert_eq!(
+            set.stats.bytes - before,
+            12 - ResultValue::Null.json_bytes()
+        );
+        assert!(set.stats.bytes - before < 12);
+    }
+
     #[test]
     fn redacting_recomputes_the_byte_figure_the_agent_actually_receives() {
         let mut set = result();

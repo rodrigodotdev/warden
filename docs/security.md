@@ -435,6 +435,14 @@ defaults and comments, and `redact_plan` for structured plan documents. A rule i
 and plan members carry no table provenance, so only `*.column` can match them;
 described columns can match either form.
 
+**The byte budget bounds the result as the database produced it.** Redaction runs
+after the budget and may grow a response: `RedactionStrategy::Replace` costs at most
+12 bytes per matched cell, so a redacted `NULL` or small integer gets larger. Warden
+does not truncate afterwards, because discarding rows the agent was authorised to see
+— because a rule matched some other column — is a worse outcome than a response a few
+bytes over budget (ADR-0047). A deployment that needs the bound to hold post-redaction
+uses `strategy = "null"`, which can only shrink a response.
+
 The limits remain intentional. Aliasing a result column or selecting an expression
 changes the output name and can bypass a rule. Plan redaction matches JSON member keys
 but does not scan free text such as a node's `Filter` string. These are consequences

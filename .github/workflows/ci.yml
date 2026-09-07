@@ -52,6 +52,17 @@ jobs:
       - run: cargo fmt --all --check
       - run: taplo fmt --check
       - run: cargo check --workspace --all-targets
+      # A workspace build unifies features across the graph, so a crate that uses a
+      # feature it never declared still compiles anyway. Checking each package alone is
+      # the only way to see that; `--manifest-path` selects one package and resolves
+      # features for it alone. The glob is the workspace's own `members = ["crates/*"]`
+      # plus the root, so it needs no `cargo metadata` and no JSON parser, and
+      # `tests/architecture.rs` already fails if a member appears outside `crates/`.
+      - name: Each crate must build on its own
+        run: |
+          for manifest in Cargo.toml crates/*/Cargo.toml; do
+            cargo check --manifest-path "$manifest" || exit 1
+          done
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo doc --workspace --no-deps --document-private-items
         env:

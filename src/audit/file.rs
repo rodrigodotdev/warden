@@ -125,7 +125,12 @@ fn open_regular_file_sync_with(
             | OFlags::CLOEXEC
             | OFlags::NONBLOCK
             | OFlags::NOFOLLOW,
-        Mode::RUSR | Mode::WUSR | Mode::RGRP | Mode::WGRP | Mode::ROTH | Mode::WOTH,
+        // `0600`, not `0666`: the trail is the evidence ADR-0022 fails closed to
+        // protect, and a mode nobody chose is not a mode. This applies only at
+        // `O_CREAT`, so an operator whose collector runs as another user pre-creates
+        // the file at `0640` with the group it needs and Warden appends unchanged
+        // (ADR-0043).
+        Mode::RUSR | Mode::WUSR,
     )?;
     let file = validate_opened_file(descriptor.into())?;
     file.sync_all()?;
@@ -262,6 +267,31 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Unsupported);
         assert!(!file.path().exists());
+    }
+
+    /// The trail is created for its owner alone.
+    ///
+    /// `0o177` rather than `0o077`, so a stray owner-execute bit fails too. The mode
+    /// applies only at `O_CREAT`; this asserts the default Warden chooses, not the
+    /// mode of a file an operator pre-created (ADR-0043).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_created_trail_is_readable_only_by_its_owner() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let file = TempPath::new("permissions");
+        let sink = FileAuditSink::open(file.path().to_owned(), AuditMode::Fingerprint)
+            .await
+            .unwrap();
+        sink.record_attempt(&attempt()).await.unwrap();
+
+        let mode = std::fs::metadata(file.path()).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o177,
+            0,
+            "the audit trail was created with mode {:o}",
+            mode & 0o777
+        );
     }
 
     #[cfg(unix)]
