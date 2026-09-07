@@ -1,0 +1,19 @@
+[package]
+name = "warden-testing"
+version = "0.1.0"
+description = "Fixtures and tracing helpers the workspace's test suites share (ADR-0049)"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+# Reached from `[dev-dependencies]` only. `tests/architecture.rs` asserts that it
+# appears in no normal dependency edge, which is what keeps a fixture structurally
+# unable to reach a release build (ADR-0049).
+[dependencies]
+warden-core = { workspace = true }
+tracing = { workspace = true }

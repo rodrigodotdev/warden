@@ -48,6 +48,11 @@ const FORBIDDEN_EDGES: &[(&str, &[&str])] = &[
             "warden-postgres",
         ],
     ),
+    // Fixtures the test suites share (ADR-0049). Like `warden-guards` it is dev-only,
+    // but unlike it this one *does* name Warden crates — that is its job, since a
+    // fixture builds domain values. What must never happen is the reverse edge, which
+    // `no_dev_only_crate_is_a_normal_dependency` covers.
+    ("warden-testing", &["sqlx", "rmcp", "sqlparser"]),
     ("warden-mysql", &["rmcp"]),
     ("warden-postgres", &["rmcp"]),
     // `warden-guards` reads the source of every crate. It must not be able to depend on
@@ -84,6 +89,7 @@ const EXPECTED_MEMBERS: &[&str] = &[
     "warden-ports",
     "warden-postgres",
     "warden-service",
+    "warden-testing",
 ];
 
 const WEBPKI_ROOTS_LICENSE: &str =
@@ -1052,6 +1058,48 @@ const SANCTIONED_TEST_ALLOW: &str = "clippy::unwrap_used, clippy::expect_used";
 
 /// The other sanctioned allow: unused fixtures in a crate's `testing.rs`.
 const SANCTIONED_FIXTURE_ALLOW: &str = "dead_code";
+
+/// Crates that exist only for tests and must never be linked into a shipped artifact.
+const DEV_ONLY_CRATES: &[&str] = &["warden-guards", "warden-testing"];
+
+#[test]
+fn no_dev_only_crate_is_a_normal_dependency() {
+    // This is what makes a shared fixture structurally unable to ship. A
+    // `FakeAuditSink` reachable from a release build is an audit sink that records
+    // nothing, and ADR-0049 chose a dev-only crate over a `testing` feature precisely
+    // because a feature can reach one through a single mistyped manifest line while a
+    // crate that appears in no normal dependency edge cannot.
+    //
+    // `reaches` walks only normal and build edges — `graph` filters dev ones out — so
+    // any path it finds here is one that ships.
+    let md = metadata();
+    let names = package_names(&md);
+    let graph = graph(&md);
+
+    let mut violations = Vec::new();
+    for member in EXPECTED_MEMBERS {
+        for dev_only in DEV_ONLY_CRATES {
+            if member == dev_only {
+                continue;
+            }
+            if let Some(path) = reaches(&graph, &names, member, dev_only) {
+                violations.push(format!(
+                    "  {member} → {dev_only}  (via {})",
+                    path.join(" → ")
+                ));
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "a dev-only crate is a normal dependency:\n{}\n\n\
+         `warden-guards` and `warden-testing` are reached from `[dev-dependencies]` \
+         alone (ADR-0046, ADR-0049). A normal edge puts test fixtures and guard \
+         machinery into a shipped artifact.",
+        violations.join("\n")
+    );
+}
 
 #[test]
 fn the_only_allows_in_the_workspace_are_the_two_agents_md_sanctions() {

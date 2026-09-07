@@ -17,4 +17,7 @@ serde = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+# Shared fixtures (ADR-0049). Dev-only: `tests/architecture.rs` proves it appears in no
+# normal dependency edge.
+warden-testing = { workspace = true }
 serde_json = { workspace = true }

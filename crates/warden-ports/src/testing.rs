@@ -14,7 +14,6 @@
 // editing happens not to use is not dead code.
 #![allow(dead_code)]
 
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,13 +23,13 @@ use tokio_util::sync::CancellationToken;
 use warden_core::analysis::{
     ObjectKind, ObjectRef, QueryAnalysis, QueryAnalysisParts, SqlIdentifier, StatementKind,
 };
-use warden_core::connection::{Capabilities, ConnectionMetadata, Environment};
+use warden_core::connection::{ConnectionMetadata, Environment};
 use warden_core::context::RequestContext;
 use warden_core::dialect::Dialect;
 use warden_core::explain::{PlanSummary, QueryPlan};
 use warden_core::limits::ExecutionLimits;
 use warden_core::query::{InputLimits, QueryRequest};
-use warden_core::result::{QueryStats, ResultColumn, ResultSet, ResultValue};
+use warden_core::result::ResultSet;
 use warden_core::schema::{
     ColumnDescription, MatchReason, Schema, SchemaDescribeRequest, SchemaDescription, SchemaMatch,
     SchemaSearchRequest, SchemaSearchResult, Table, TableKind,
@@ -52,6 +51,7 @@ use crate::explainer::Explainer;
 use crate::inspector::SchemaInspector;
 use crate::registry::ConnectionRegistry;
 use crate::runtime::{ConnectionRuntime, ConnectionRuntimeParts, QueryPermit};
+pub(crate) use warden_testing::{capabilities, connection, parts, request_context, result_set};
 
 /// The statement every fixture uses.
 pub(crate) const SQL: &str = "SELECT id FROM orders";
@@ -65,51 +65,6 @@ pub(crate) fn request() -> QueryRequest {
         &InputLimits::default(),
     )
     .unwrap()
-}
-
-/// A fixed request identity.
-pub(crate) fn request_context() -> RequestContext {
-    RequestContext::new(
-        "req-1".parse().unwrap(),
-        "alice@example.com".parse().unwrap(),
-        "Claude Code".parse().unwrap(),
-    )
-}
-
-/// A production connection on the given dialect.
-pub(crate) fn connection(dialect: Dialect) -> ConnectionMetadata {
-    ConnectionMetadata {
-        name: "production-db".parse().unwrap(),
-        dialect,
-        environment: Environment::Production,
-        database: "app".to_owned(),
-    }
-}
-
-/// An adapter that can do everything.
-pub(crate) fn capabilities() -> Capabilities {
-    Capabilities {
-        read_only_transactions: true,
-        structured_explain: true,
-        server_statement_timeout: true,
-        schema_search: true,
-    }
-}
-
-/// The baseline evidence: one safe `SELECT`, no risks, no objects.
-pub(crate) fn parts(dialect: Dialect) -> QueryAnalysisParts {
-    QueryAnalysisParts {
-        dialect,
-        statement_count: NonZeroUsize::MIN,
-        root_kind: StatementKind::Select,
-        nested_kinds: Vec::new(),
-        objects: Vec::new(),
-        functions: Vec::new(),
-        risks: Vec::new(),
-        has_locking_clause: false,
-        has_side_effects: false,
-        fingerprint: None,
-    }
 }
 
 /// The baseline, frozen.
@@ -243,24 +198,6 @@ pub(crate) fn describe_request() -> SchemaDescribeRequest {
         vec!["app.orders".parse().unwrap()],
     )
     .unwrap()
-}
-
-/// One normalized row, so a fake result is a valid result.
-pub(crate) fn result_set() -> ResultSet {
-    ResultSet {
-        columns: vec![ResultColumn {
-            name: "id".to_owned(),
-            database_type: "BIGINT".to_owned(),
-            nullable: Some(false),
-        }],
-        rows: vec![vec![ResultValue::I64(1)]],
-        truncated: false,
-        stats: QueryStats {
-            rows_returned: 1,
-            bytes: 1,
-            duration: Duration::from_millis(1),
-        },
-    }
 }
 
 /// An executor that pretends the database takes `duration`.

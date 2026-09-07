@@ -27,6 +27,9 @@ time = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+# Shared fixtures (ADR-0049). Dev-only: `tests/architecture.rs` proves it appears in no
+# normal dependency edge.
+warden-testing = { workspace = true }
 # `QueryPlan::plan` is a `serde_json::Value`, so the explainer fake needs the crate.
 serde_json = { workspace = true }
 # `test-util` provides `#[tokio::test(start_paused = true)]`, which makes every

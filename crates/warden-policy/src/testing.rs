@@ -10,14 +10,9 @@
 // editing happens not to use is not dead code.
 #![allow(dead_code)]
 
-use std::num::NonZeroUsize;
-
 use warden_core::analysis::{
-    FunctionClassification, FunctionRef, ObjectKind, ObjectRef, QueryAnalysis, QueryAnalysisParts,
-    SqlIdentifier, StatementKind,
+    FunctionClassification, FunctionRef, ObjectKind, ObjectRef, QueryAnalysis, SqlIdentifier,
 };
-use warden_core::connection::{ConnectionMetadata, Environment};
-use warden_core::context::RequestContext;
 use warden_core::dialect::Dialect;
 use warden_core::limits::ExecutionLimits;
 use warden_core::query::{InputLimits, QueryRequest};
@@ -26,41 +21,7 @@ use crate::decision::{DenyCode, DenyReason, PolicyDecision};
 use crate::input::{PolicyContext, PolicyInput};
 use crate::policy::{ObjectAccessPolicy, Policy};
 use crate::state::AnalyzedQuery;
-
-/// A fixed request identity.
-pub(crate) fn request_context() -> RequestContext {
-    RequestContext::new(
-        "req-1".parse().unwrap(),
-        "alice@example.com".parse().unwrap(),
-        "Claude Code".parse().unwrap(),
-    )
-}
-
-/// A production connection on the given dialect.
-pub(crate) fn connection(dialect: Dialect) -> ConnectionMetadata {
-    ConnectionMetadata {
-        name: "production-db".parse().unwrap(),
-        dialect,
-        environment: Environment::Production,
-        database: "app".to_owned(),
-    }
-}
-
-/// The baseline every test mutates: one safe `SELECT`, no risks, no objects.
-pub(crate) fn parts(dialect: Dialect) -> QueryAnalysisParts {
-    QueryAnalysisParts {
-        dialect,
-        statement_count: NonZeroUsize::MIN,
-        root_kind: StatementKind::Select,
-        nested_kinds: Vec::new(),
-        objects: Vec::new(),
-        functions: Vec::new(),
-        risks: Vec::new(),
-        has_locking_clause: false,
-        has_side_effects: false,
-        fingerprint: None,
-    }
-}
+pub(crate) use warden_testing::{connection, parts, request_context};
 
 /// The baseline, frozen.
 pub(crate) fn analysis(dialect: Dialect) -> QueryAnalysis {

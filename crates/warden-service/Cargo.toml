@@ -33,6 +33,9 @@ serde_json = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+# Shared fixtures and the one callsite-interest primitive (ADR-0049). Dev-only: it
+# appears in no normal dependency edge, which `tests/architecture.rs` proves.
+warden-testing = { workspace = true }
 # `test-util` provides `#[tokio::test(start_paused = true)]`, which makes every
 # deadline and queue-wait test deterministic and instant.
 tokio = { workspace = true, features = ["macros", "rt", "test-util"] }

@@ -31,6 +31,9 @@ tracing = { workspace = true }
 uuid = { workspace = true }
 
 [dev-dependencies]
+# Shared fixtures and the one callsite-interest primitive (ADR-0049). Dev-only: it
+# appears in no normal dependency edge, which `tests/architecture.rs` proves.
+warden-testing = { workspace = true }
 # `tests/mcp_rules.rs` reads this crate's own AST (ADR-0046).
 warden-guards = { workspace = true }
 # Ports and policy are a *dev* dependency only. `docs/architecture.md` section 3 keeps

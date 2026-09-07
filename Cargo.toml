@@ -21,6 +21,7 @@ warden-mcp = { path = "crates/warden-mcp" }
 warden-audit = { path = "crates/warden-audit" }
 warden-config = { path = "crates/warden-config" }
 warden-guards = { path = "crates/warden-guards" }
+warden-testing = { path = "crates/warden-testing" }
 
 # Runtime
 tokio = { version = "1.53", default-features = false }

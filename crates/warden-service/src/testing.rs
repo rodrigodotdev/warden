@@ -12,7 +12,6 @@
 // editing happens not to use is not dead code.
 #![allow(dead_code)]
 
-use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -23,7 +22,6 @@ use warden_core::analysis::{
     ObjectKind, ObjectRef, QueryAnalysis, QueryAnalysisParts, SqlIdentifier, StatementKind,
 };
 use warden_core::connection::{Capabilities, ConnectionMetadata, Environment};
-use warden_core::context::RequestContext;
 use warden_core::dialect::Dialect;
 use warden_core::explain::{PlanSummary, QueryPlan};
 use warden_core::limits::ExecutionLimits;
@@ -48,6 +46,7 @@ use crate::explain::ExplainService;
 use crate::query::QueryService;
 use crate::schema::SchemaService;
 use crate::{RedactionSettings, Redactor, StaticConnectionRegistry};
+pub(crate) use warden_testing::{capabilities, connection, parts, request_context, result_set};
 
 /// The statement every fixture uses.
 pub(crate) const SQL: &str = "SELECT id FROM orders";
@@ -66,15 +65,6 @@ pub(crate) fn request_for(connection: &str) -> QueryRequest {
         &InputLimits::default(),
     )
     .unwrap()
-}
-
-/// A fixed request identity.
-pub(crate) fn request_context() -> RequestContext {
-    RequestContext::new(
-        "req-1".parse().unwrap(),
-        "alice@example.com".parse().unwrap(),
-        "Claude Code".parse().unwrap(),
-    )
 }
 
 /// A bounded search request against the fixture connection.
@@ -101,16 +91,6 @@ pub(crate) fn describe_request_for(connection: &str) -> SchemaDescribeRequest {
     .unwrap()
 }
 
-/// A production connection on the given dialect.
-pub(crate) fn connection(dialect: Dialect) -> ConnectionMetadata {
-    ConnectionMetadata {
-        name: "production-db".parse().unwrap(),
-        dialect,
-        environment: Environment::Production,
-        database: "app".to_owned(),
-    }
-}
-
 /// A valid audit attempt with no policy denials.
 pub(crate) fn attempt() -> AuditAttempt {
     AuditAttempt {
@@ -129,37 +109,11 @@ pub(crate) fn attempt() -> AuditAttempt {
     }
 }
 
-/// An adapter that can do everything.
-pub(crate) fn capabilities() -> Capabilities {
-    Capabilities {
-        read_only_transactions: true,
-        structured_explain: true,
-        server_statement_timeout: true,
-        schema_search: true,
-    }
-}
-
 /// An adapter without schema search.
 pub(crate) fn capabilities_without_search() -> Capabilities {
     Capabilities {
         schema_search: false,
         ..capabilities()
-    }
-}
-
-/// The baseline evidence: one safe `SELECT`, no risks, no objects.
-pub(crate) fn parts(dialect: Dialect) -> QueryAnalysisParts {
-    QueryAnalysisParts {
-        dialect,
-        statement_count: NonZeroUsize::MIN,
-        root_kind: StatementKind::Select,
-        nested_kinds: Vec::new(),
-        objects: Vec::new(),
-        functions: Vec::new(),
-        risks: Vec::new(),
-        has_locking_clause: false,
-        has_side_effects: false,
-        fingerprint: None,
     }
 }
 
@@ -214,24 +168,6 @@ pub(crate) fn rejection_with_internal_detail() -> PolicyRejection {
             ExecutionLimits::default(),
         )
         .unwrap_err()
-}
-
-/// A valid normalized result.
-pub(crate) fn result_set() -> ResultSet {
-    ResultSet {
-        columns: vec![ResultColumn {
-            name: "id".to_owned(),
-            database_type: "BIGINT".to_owned(),
-            nullable: Some(false),
-        }],
-        rows: vec![vec![ResultValue::I64(1)]],
-        truncated: false,
-        stats: QueryStats {
-            rows_returned: 1,
-            bytes: 1,
-            duration: Duration::from_millis(1),
-        },
-    }
 }
 
 /// A normalized result containing one column that the query-service tests redact.
@@ -1105,62 +1041,9 @@ pub(crate) async fn saturated_explain_service() -> (ExplainService, Arc<FakeAudi
 
 /// Keeps every callsite's cached interest dynamic for the rest of this process.
 ///
-/// `tracing-core` caches one `Interest` per callsite for the whole program and computes
-/// it the first time *any* thread reaches that callsite. While exactly one dispatcher is
-/// registered it takes a fast path that asks whichever subscriber is default on that
-/// thread — so a span callsite first reached by a sibling test thread, which has none, is
-/// cached as `never` for every thread, including the one that scopes a capturing
-/// subscriber over the same code a moment later. That is a lost span here and nowhere in
-/// production, where the process installs a subscriber before it serves anything.
-///
-/// Registering two dispatchers that are never dropped keeps that fast path off for the
-/// rest of the process: interest is then always the union over the live dispatchers, so
-/// it stays `sometimes` and `enabled` decides per call, on the thread doing the emitting.
+/// One line, because the mechanism lives in `warden-testing` now: it used to be this
+/// function, triplicated, leaking two dispatchers and rebuilding the interest cache
+/// (ADR-0049).
 pub(crate) fn keep_callsite_interest_dynamic() {
-    /// Registers interest in every callsite and enables none of them: this subscriber
-    /// exists to be counted, not to record.
-    #[derive(Debug)]
-    struct AlwaysAsk;
-
-    impl tracing::Subscriber for AlwaysAsk {
-        fn register_callsite(
-            &self,
-            _metadata: &'static tracing::Metadata<'static>,
-        ) -> tracing::subscriber::Interest {
-            tracing::subscriber::Interest::sometimes()
-        }
-
-        fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
-            false
-        }
-
-        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
-            Some(tracing::level_filters::LevelFilter::TRACE)
-        }
-
-        fn new_span(&self, _attributes: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-            tracing::span::Id::from_u64(1)
-        }
-
-        fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
-
-        fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
-
-        fn event(&self, _event: &tracing::Event<'_>) {}
-
-        fn enter(&self, _span: &tracing::span::Id) {}
-
-        fn exit(&self, _span: &tracing::span::Id) {}
-    }
-
-    static REGISTERED: std::sync::OnceLock<[tracing::Dispatch; 2]> = std::sync::OnceLock::new();
-    REGISTERED.get_or_init(|| {
-        [
-            tracing::Dispatch::new(AlwaysAsk),
-            tracing::Dispatch::new(AlwaysAsk),
-        ]
-    });
-    // Callsites reached before those two were registered still hold the interest they
-    // were given then. Re-evaluating covers them.
-    tracing::callsite::rebuild_interest_cache();
+    warden_testing::tracing_interest::ask_every_callsite();
 }

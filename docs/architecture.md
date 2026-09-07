@@ -67,7 +67,8 @@ warden/
 │   ├── warden-mcp/       server, tools, mappings, stdio, HTTP
 │   ├── warden-config/    model, loading, validation, secrets
 │   ├── warden-audit/     the record format and the two sinks that write it
-│   └── warden-guards/    dev-only: the AST machinery every source guard shares
+│   ├── warden-guards/    dev-only: the AST machinery every source guard shares
+│   └── warden-testing/   dev-only: the fixtures and tracing helpers tests share
 │
 ├── src/main.rs           composition root
 ├── tests/e2e/
@@ -80,9 +81,13 @@ concrete boundary reason.
 
 `warden-audit` is an adapter like `warden-mysql` and `warden-postgres`: it implements
 the `AuditSink` port rather than composing anything, and it lived in the binary only by
-inertia (ADR-0048). `warden-guards` is dev-only — it is reached from
-`[dev-dependencies]` alone, ships in nothing, and may depend on no Warden crate, so
-that a guard cannot be made to pass by the code it guards (ADR-0046).
+inertia (ADR-0048). `warden-guards` and `warden-testing` are dev-only: both are reached from
+`[dev-dependencies]` alone and ship in nothing, which
+`no_dev_only_crate_is_a_normal_dependency` proves. `warden-guards` may additionally
+depend on no Warden crate, so a guard cannot be made to pass by the code it guards
+(ADR-0046). `warden-testing` does name them — a fixture builds domain values — and
+holds only what is genuinely identical between crates; the port fakes stay with the
+tests that observe through them (ADR-0049).
 
 ## 3. Dependency direction
 

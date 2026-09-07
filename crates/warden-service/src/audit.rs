@@ -244,8 +244,8 @@ mod tests {
 
     use std::collections::BTreeMap;
     use std::fmt;
-    use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::{Arc, Mutex, OnceLock};
+
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use tracing::field::{Field, Visit};
@@ -257,7 +257,7 @@ mod tests {
     use super::*;
     use crate::testing;
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     struct CapturedEvent {
         target: String,
         fields: BTreeMap<String, String>,
@@ -311,33 +311,50 @@ mod tests {
         }
     }
 
-    static ALARM_TEST_LOCK: AtomicBool = AtomicBool::new(false);
-
-    struct AlarmTestLock;
-
-    impl Drop for AlarmTestLock {
-        fn drop(&mut self) {
-            ALARM_TEST_LOCK.store(false, Ordering::Release);
-        }
+    /// The `warden.audit` alarms emitted while `body` runs.
+    ///
+    /// Scoped rather than global (ADR-0049). This used to install a process-wide
+    /// subscriber behind a hand-rolled spinlock that serialised the three tests using
+    /// it — and `set_global_default` succeeds once per process, so it also made a
+    /// second global subscriber in this binary impossible. A scoped capture needs
+    /// neither: each test sees only its own events, and they run in parallel again.
+    ///
+    /// `ask_every_callsite` first, because a callsite another test reached before this
+    /// subscriber existed would otherwise be cached as `never` for the whole process.
+    fn alarms_while<T>(body: impl FnOnce() -> T) -> (T, Vec<CapturedEvent>) {
+        warden_testing::tracing_interest::ask_every_callsite();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = AuditAlarmSubscriber {
+            events: Arc::clone(&events),
+        };
+        let value = tracing::subscriber::with_default(subscriber, body);
+        let captured = events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        (value, captured)
     }
 
-    fn alarm_test_lock() -> AlarmTestLock {
-        while ALARM_TEST_LOCK.swap(true, Ordering::Acquire) {
-            std::thread::yield_now();
-        }
-        AlarmTestLock
-    }
+    /// The `warden.audit` alarms a future emits.
+    ///
+    /// `WithSubscriber` rather than `with_default`: the dispatcher rides the future, so
+    /// it is still in effect after an `.await` and inside anything the future spawns.
+    async fn alarms_of<F: std::future::Future>(future: F) -> (F::Output, Vec<CapturedEvent>) {
+        use tracing::instrument::WithSubscriber as _;
 
-    fn alarm_events() -> Arc<Mutex<Vec<CapturedEvent>>> {
-        static EVENTS: OnceLock<Arc<Mutex<Vec<CapturedEvent>>>> = OnceLock::new();
-        Arc::clone(EVENTS.get_or_init(|| {
-            let events = Arc::new(Mutex::new(Vec::new()));
-            tracing::subscriber::set_global_default(AuditAlarmSubscriber {
-                events: Arc::clone(&events),
-            })
-            .unwrap();
-            events
-        }))
+        warden_testing::tracing_interest::ask_every_callsite();
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let subscriber = AuditAlarmSubscriber {
+            events: Arc::clone(&events),
+        };
+        let value = future
+            .with_subscriber(tracing::Dispatch::new(subscriber))
+            .await;
+        let captured = events
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        (value, captured)
     }
 
     fn outcome() -> AuditOutcomeEvent {
@@ -377,23 +394,21 @@ mod tests {
         use std::future::Future as _;
         use std::task::{Context, Waker};
 
-        let _lock = alarm_test_lock();
-        let events = alarm_events();
-        events.lock().unwrap().clear();
         let sink = Arc::new(PendingOutcomeSink(Mutex::new(Vec::new())));
         let recorded = outcome();
-        let guard = OutcomeGuard::arm(sink.clone(), recorded.attempt_id, tracing::Span::none());
-        let mut completion = Box::pin(guard.complete(recorded));
-        assert!(
-            completion
-                .as_mut()
-                .poll(&mut Context::from_waker(Waker::noop()))
-                .is_pending()
-        );
-        assert_eq!(*sink.0.lock().unwrap(), vec![recorded]);
-        drop(completion);
+        let ((), events) = alarms_while(|| {
+            let guard = OutcomeGuard::arm(sink.clone(), recorded.attempt_id, tracing::Span::none());
+            let mut completion = Box::pin(guard.complete(recorded));
+            assert!(
+                completion
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            assert_eq!(*sink.0.lock().unwrap(), vec![recorded]);
+            drop(completion);
+        });
 
-        let events = events.lock().unwrap();
         let alarms: Vec<_> = events
             .iter()
             .filter(|event| {
@@ -474,24 +489,18 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_slow_outcome_write_is_cancelled_at_the_audit_timeout() {
-        let _guard = alarm_test_lock();
-        let _events = alarm_events();
         let sink = testing::FakeAuditSink::taking(AUDIT_WRITE_TIMEOUT * 10);
-        record_outcome(&sink, outcome()).await;
+        let ((), _alarms) = alarms_of(record_outcome(&sink, outcome())).await;
         assert!(sink.outcomes().is_empty());
     }
 
     #[tokio::test]
     async fn a_broken_outcome_write_raises_a_sanitized_alarm_without_failing_the_request() {
-        let _guard = alarm_test_lock();
-        let events = alarm_events();
-        events.lock().unwrap().clear();
         let sink = testing::FakeAuditSink::broken_outcomes();
         let recorded = outcome();
 
-        record_outcome(&sink, recorded).await;
+        let ((), events) = alarms_of(record_outcome(&sink, recorded)).await;
 
-        let events = events.lock().unwrap();
         let alarms: Vec<_> = events
             .iter()
             .filter(|event| {

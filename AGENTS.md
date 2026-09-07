@@ -40,10 +40,18 @@ Every rule in this table is deliberately mechanical. If proceeding requires
 disabling one, stop and report it; do not annotate it with `#[allow]`.
 
 **The one standing exception** is `#![allow(clippy::unwrap_used, clippy::expect_used)]`
-at the top of a `#[cfg(test)]` module or a `tests/` file. A test asserts by panicking,
-and the two lints exist to keep panics out of the request path, not out of assertions.
+at the top of a `#[cfg(test)]` module, a `tests/` file, or a dev-only crate reached from
+`[dev-dependencies]` alone (`warden-testing`; ADR-0049). A test asserts by panicking, a
+fixture asserts by panicking, and the two lints exist to keep panics out of the request
+path, not out of assertions. `tests/architecture.rs` proves the dev-only crates appear
+in no normal dependency edge, so nothing they panic in can reach one.
 The allow is module-scoped and never appears on a production item, so a new `unwrap`
-in shipping code still fails the build. No other lint may be allowed anywhere.
+in shipping code still fails the build. It is also spelled exactly one way, which is
+what makes it the single allow anyone may grep for;
+`tests/architecture.rs::the_only_allows_in_the_workspace_are_the_two_agents_md_sanctions`
+refuses any other spelling and any other lint. The second sanction is
+`#![allow(dead_code)]`, once per crate's `testing.rs`, for fixtures not every test uses.
+No other lint may be allowed anywhere.
 
 ## Code rules
 

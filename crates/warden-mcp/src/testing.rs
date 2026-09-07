@@ -18,7 +18,6 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -28,7 +27,7 @@ use warden_core::dialect::Dialect;
 use warden_core::explain::{PlanSummary, QueryPlan};
 use warden_core::limits::ExecutionLimits;
 use warden_core::query::QueryRequest;
-use warden_core::result::{QueryStats, ResultColumn, ResultSet, ResultValue};
+use warden_core::result::ResultSet;
 use warden_core::schema::{
     ColumnDescription, MatchReason, Schema, SchemaDescribeRequest, SchemaDescription, SchemaMatch,
     SchemaSearchRequest, SchemaSearchResult, Table, TableKind,
@@ -40,6 +39,7 @@ use warden_ports::{
     QueryAnalyzer, QueryExecutor, QueryPermit, SchemaError, SchemaInspector,
 };
 use warden_service::{RedactionSettings, ServiceParts, Services, StaticConnectionRegistry};
+pub(crate) use warden_testing::{capabilities, result_set};
 
 /// The connection every fixture registry holds.
 pub(crate) const CONNECTION: &str = "production-db";
@@ -59,16 +59,6 @@ pub(crate) fn connection_named(name: &str, dialect: Dialect) -> ConnectionMetada
         dialect,
         environment: Environment::Production,
         database: "app".to_owned(),
-    }
-}
-
-/// An adapter that can do everything, schema search included.
-pub(crate) fn capabilities() -> Capabilities {
-    Capabilities {
-        read_only_transactions: true,
-        structured_explain: true,
-        server_statement_timeout: true,
-        schema_search: true,
     }
 }
 
@@ -95,24 +85,6 @@ fn writing_analysis(dialect: Dialect) -> QueryAnalysis {
         nested_kinds: vec![StatementKind::Delete],
         ..analysis_parts(dialect)
     })
-}
-
-/// A one-row normalized result.
-pub(crate) fn result_set() -> ResultSet {
-    ResultSet {
-        columns: vec![ResultColumn {
-            name: "id".to_owned(),
-            database_type: "BIGINT".to_owned(),
-            nullable: Some(false),
-        }],
-        rows: vec![vec![ResultValue::I64(1)]],
-        truncated: false,
-        stats: QueryStats {
-            rows_returned: 1,
-            bytes: 1,
-            duration: Duration::from_millis(1),
-        },
-    }
 }
 
 /// A structured plan with an engine document.

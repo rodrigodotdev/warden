@@ -53,6 +53,7 @@ supersedes it; never change it silently.
 | [0046](0046-mechanical-guards-share-one-ast-implementation.md) | Mechanical guards share one AST implementation |
 | [0047](0047-the-byte-budget-bounds-the-database-result.md) | The byte budget bounds the database result, not the redacted response |
 | [0048](0048-the-audit-sink-is-an-adapter.md) | The audit sink is an adapter |
+| [0049](0049-shared-test-fixtures-live-in-a-dev-only-crate.md) | Shared test fixtures live in a dev-only crate |
 
 ADRs 0021–0026 are new in v0.3. ADR-0002 supersedes the v0.2 MSRV definition;
 ADR-0022 supersedes the single-event audit model; ADR-0023 resolves v0.2 open
