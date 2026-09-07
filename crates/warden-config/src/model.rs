@@ -18,6 +18,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use warden_core::audit::AuditMode;
 use warden_core::connection::{ConnectionName, Environment};
 use warden_core::dialect::Dialect;
 use warden_core::limits::ExecutionLimits;
@@ -332,20 +333,6 @@ pub enum AuditDestinationEntry {
     Stderr,
     /// Append JSON Lines records to `audit.path`.
     File,
-}
-
-/// What the audit sink records.
-///
-/// Both stderr and file destinations apply this mode to the same record shape.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AuditMode {
-    /// Record a fingerprint of the statement, never its literal values.
-    #[default]
-    Fingerprint,
-    /// Record nothing beyond that a request happened.
-    #[serde(rename = "none")]
-    None_,
 }
 
 #[cfg(test)]

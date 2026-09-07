@@ -75,6 +75,7 @@ pub const SQL_RECURSION_LIMIT: usize = 50;
 mod identifier;
 
 pub mod analysis;
+pub mod audit;
 pub mod connection;
 pub mod context;
 pub mod dialect;

@@ -1,0 +1,46 @@
+[package]
+name = "warden-audit"
+version = "0.1.0"
+description = "The audit record format and the two sinks that write it"
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+# The port this crate implements, and the domain values a record carries. Not
+# `warden-config`: a sink is an adapter, and turning configuration into one is the
+# composition root's job (ADR-0048).
+warden-core = { workspace = true }
+warden-ports = { workspace = true }
+# `fs` and `io-util` write the trail, `sync` serialises writers behind one lock, and
+# `rt` supplies the `spawn_blocking` the open path uses for its blocking syscalls. No
+# runtime is started here: the binary owns that.
+tokio = { workspace = true, features = ["fs", "io-util", "rt", "sync"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# ADR-0043's record timestamps.
+time = { workspace = true }
+tracing = { workspace = true }
+# `same-file` compares the opened descriptor with the path it was opened from, which is
+# the TOCTOU check the file sink makes before it trusts either.
+same-file = { workspace = true }
+
+# Directory-entry persistence needs `openat`/`fsync` on the directory itself, which no
+# safe cross-platform API exposes. The sink refuses to start elsewhere (ADR-0043).
+[target.'cfg(unix)'.dependencies]
+rustix = { workspace = true }
+
+[dev-dependencies]
+# Tests build a `DenyReason` to put in an `AuditAttempt`. `warden-ports` already names
+# that type in the attempt's own fields, so this crate links the policy crate either
+# way; declaring it here only makes the tests able to write the path. Production code
+# in this crate never mentions it.
+warden-policy = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }
+warden-guards = { workspace = true }
+syn = { workspace = true }

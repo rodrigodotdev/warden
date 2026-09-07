@@ -16,16 +16,16 @@ use std::io;
 use std::io::{Read as _, Seek as _};
 use std::path::{Path, PathBuf};
 
-use warden_config::AuditMode;
+use warden_core::audit::AuditMode;
 use warden_ports::{AuditAttempt, AuditError, AuditOutcomeEvent, AuditSink, BoxFuture};
 
-use super::record::{AttemptRecord, OutcomeRecord};
+use crate::record::{AttemptRecord, OutcomeRecord};
 
 mod writer;
 use writer::Writer;
 
 /// Appends the shared audit record shape to a JSON Lines file.
-pub(crate) struct FileAuditSink {
+pub struct FileAuditSink {
     mode: AuditMode,
     /// The open file, held across write and flush so two concurrent records cannot
     /// interleave halves of a line.
@@ -44,7 +44,7 @@ impl FileAuditSink {
     /// [`std::io::ErrorKind::InvalidData`] for an unterminated existing tail. Also returns
     /// [`std::io::ErrorKind::InvalidInput`] when the target is not a regular file or
     /// resolves to the same file target as stdout.
-    pub(crate) async fn open(path: PathBuf, mode: AuditMode) -> Result<Self, std::io::Error> {
+    pub async fn open(path: PathBuf, mode: AuditMode) -> Result<Self, std::io::Error> {
         let file = open_regular_file(&path).await?;
         Ok(Self {
             mode,
@@ -254,9 +254,9 @@ mod tests {
     use warden_ports::AuditOutcome;
     use warden_ports::{AuditEventId, AuditOperation};
 
-    #[cfg(unix)]
-    use super::super::record::RECORD_SCHEMA;
     use super::*;
+    #[cfg(unix)]
+    use crate::record::RECORD_SCHEMA;
 
     #[cfg(not(unix))]
     #[tokio::test]

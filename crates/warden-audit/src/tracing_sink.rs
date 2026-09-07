@@ -20,7 +20,7 @@
 //! else (ADR-0026 — the record itself is invariant 24, so the mode can narrow what
 //! it describes but never switch it off).
 
-use warden_config::AuditMode;
+use warden_core::audit::AuditMode;
 use warden_ports::{AuditAttempt, AuditError, AuditOutcomeEvent, AuditSink, BoxFuture};
 
 /// Every field [`TracingAuditSink::record_attempt`] emits, in the order it emits
@@ -65,14 +65,14 @@ const AUDIT_TARGET: &str = "warden.audit";
 /// which is still the whole reason [`AuditSink::record_attempt`] and
 /// [`AuditSink::record_outcome`] cannot fail here.
 #[derive(Debug, Clone, Copy)]
-pub(crate) struct TracingAuditSink {
+pub struct TracingAuditSink {
     mode: AuditMode,
 }
 
 impl TracingAuditSink {
     /// Builds a sink that gates `statement_kind` and `fingerprint` on `mode`, the
     /// same way `record::AttemptRecord::new` gates them.
-    pub(crate) fn new(mode: AuditMode) -> Self {
+    pub fn new(mode: AuditMode) -> Self {
         Self { mode }
     }
 }

@@ -14,6 +14,7 @@
 
 use std::path::PathBuf;
 
+use warden_core::audit::AuditMode;
 use warden_core::connection::{ConnectionMetadata, ConnectionName, Environment};
 use warden_core::dialect::Dialect;
 use warden_core::limits::ExecutionLimits;
@@ -23,7 +24,7 @@ use warden_core::tls::TlsSettings;
 
 use crate::error::ConfigError;
 use crate::model::{
-    AuditDestinationEntry, AuditEntry, AuditMode, Config, ConnectionEntry, PolicyProfile,
+    AuditDestinationEntry, AuditEntry, Config, ConnectionEntry, PolicyProfile,
     RedactionStrategyEntry,
 };
 use crate::secrets::{self, SecretSource};

@@ -600,8 +600,8 @@ string, so an outcome cannot record a code outside the closed set of section 10.
 Both types live in `warden-ports`, not `warden-core`: `AuditAttempt` carries
 `DenyReason`, which belongs to `warden-policy`, downstream of the core. Neither
 derives `Serialize` — a record carrying internal denial detail must not be attachable
-to a tool response by accident. `src/audit/record.rs` projects the permitted fields
-into `warden.audit.v1` JSON Lines; `src/audit/tracing_sink.rs` emits its tracing form.
+to a tool response by accident. `crates/warden-audit/src/record.rs` projects the permitted fields
+into `warden.audit.v1` JSON Lines; `crates/warden-audit/src/tracing_sink.rs` emits its tracing form.
 Internal denial details are absent from both. Operations section 10.2 enumerates
 the envelope and payload fields, including their different denial-code encoding.
 

@@ -65,7 +65,9 @@ warden/
 │   │   ├── pipeline.rs   private execution gate
 │   │   └── error.rs      typed service and startup errors
 │   ├── warden-mcp/       server, tools, mappings, stdio, HTTP
-│   └── warden-config/    model, loading, validation, secrets
+│   ├── warden-config/    model, loading, validation, secrets
+│   ├── warden-audit/     the record format and the two sinks that write it
+│   └── warden-guards/    dev-only: the AST machinery every source guard shares
 │
 ├── src/main.rs           composition root
 ├── tests/e2e/
@@ -75,6 +77,12 @@ warden/
 
 The root package is the executable and composition root. Do not add crates without a
 concrete boundary reason.
+
+`warden-audit` is an adapter like `warden-mysql` and `warden-postgres`: it implements
+the `AuditSink` port rather than composing anything, and it lived in the binary only by
+inertia (ADR-0048). `warden-guards` is dev-only — it is reached from
+`[dev-dependencies]` alone, ships in nothing, and may depend on no Warden crate, so
+that a guard cannot be made to pass by the code it guards (ADR-0046).
 
 ## 3. Dependency direction
 

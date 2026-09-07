@@ -903,7 +903,7 @@ output stays on stderr; stdout carries only MCP messages.
 
 ### 10.2 Fields
 
-`src/audit/record.rs` defines the JSON Lines format, with schema
+`crates/warden-audit/src/record.rs` defines the JSON Lines format, with schema
 `warden.audit.v1`. Each attempt contains, in wire order: `schema`, `event`,
 `attempt_id`, `timestamp`, `request_id`, `principal_id`, `client`, `connection`,
 `dialect`, `environment`, `operation`, `statement_kind`, `fingerprint`, and
@@ -913,7 +913,7 @@ output stays on stderr; stdout carries only MCP messages.
 creation time and the outcome's serialization time respectively. Missing optional
 values are JSON `null`. `deny_codes` is a JSON array of fixed code strings.
 
-`src/audit/tracing_sink.rs` emits the same logical fields except `schema` and
+`crates/warden-audit/src/tracing_sink.rs` emits the same logical fields except `schema` and
 `timestamp`: the formatter supplies time, level, and the `warden.audit` target,
 plus the fixed message `audit attempt` or `audit outcome`. Tracing omits unset
 optional values and renders `deny_codes` as a comma-joined string. Tests cover

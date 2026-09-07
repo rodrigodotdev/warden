@@ -3122,20 +3122,17 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "proc-macro2",
- "rustix",
- "same-file",
- "serde",
  "serde_json",
  "sha2 0.11.0",
  "sqlx",
  "syn 2.0.119",
  "testcontainers-modules",
- "time",
  "tokio",
  "tokio-util",
  "toml",
  "tracing",
  "tracing-subscriber",
+ "warden-audit",
  "warden-config",
  "warden-core",
  "warden-guards",
@@ -3145,6 +3142,24 @@ dependencies = [
  "warden-ports",
  "warden-postgres",
  "warden-service",
+]
+
+[[package]]
+name = "warden-audit"
+version = "0.1.0"
+dependencies = [
+ "rustix",
+ "same-file",
+ "serde",
+ "serde_json",
+ "syn 2.0.119",
+ "time",
+ "tokio",
+ "tracing",
+ "warden-core",
+ "warden-guards",
+ "warden-policy",
+ "warden-ports",
 ]
 
 [[package]]

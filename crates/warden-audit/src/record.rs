@@ -14,8 +14,8 @@
 
 use serde::Serialize;
 use time::OffsetDateTime;
-use warden_config::AuditMode;
 use warden_core::analysis::StatementKind;
+use warden_core::audit::AuditMode;
 use warden_core::fingerprint::QueryFingerprint;
 use warden_ports::{AuditAttempt, AuditOutcomeEvent};
 

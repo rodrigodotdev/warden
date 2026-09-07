@@ -18,6 +18,7 @@ warden-mysql = { path = "crates/warden-mysql" }
 warden-postgres = { path = "crates/warden-postgres" }
 warden-service = { path = "crates/warden-service" }
 warden-mcp = { path = "crates/warden-mcp" }
+warden-audit = { path = "crates/warden-audit" }
 warden-config = { path = "crates/warden-config" }
 warden-guards = { path = "crates/warden-guards" }
 
@@ -176,6 +177,7 @@ workspace = true
 # The composition root is the one place that names every layer at once
 # (`docs/architecture.md` section 2). Nothing else in the workspace depends on both
 # an adapter and the MCP crate, which is what keeps the dependency direction real.
+warden-audit = { workspace = true }
 warden-config = { workspace = true }
 warden-core = { workspace = true }
 warden-mcp = { workspace = true }
@@ -196,26 +198,12 @@ tokio = { workspace = true, features = [
   "macros",
   "signal",
   "time",
-  "fs",
-  "io-util",
-  "sync",
 ] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 # stderr only: stdout carries MCP (`docs/mcp.md` section 5.1).
 tracing-subscriber = { workspace = true }
-# `warden.audit.v1` (`src/audit/record.rs`) is a `serde` struct; the audit module is
-# no longer test-only code that can borrow the dev-dependency.
-serde = { workspace = true }
-serde_json = { workspace = true }
-same-file = { workspace = true }
-# `AuditAttempt::timestamp` and every record's own `timestamp` are the concrete
-# `time::OffsetDateTime` the port and the record expose; production code names it
-# now, not only the sink's tests.
-time = { workspace = true }
 
-[target.'cfg(unix)'.dependencies]
-rustix = { workspace = true }
 
 [features]
 default = []
@@ -225,6 +213,10 @@ docker = []
 
 [dev-dependencies]
 proc-macro2 = { workspace = true }
+# `tests/architecture.rs` parses `cargo metadata` output to walk the dependency graph.
+# A dev-dependency since the audit sinks moved to `warden-audit` (ADR-0048): the binary
+# itself no longer serializes anything.
+serde_json = { workspace = true }
 # `tests/architecture.rs` reads the workspace's own AST (ADR-0046).
 warden-guards = { workspace = true }
 sha2 = { workspace = true }

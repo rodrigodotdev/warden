@@ -42,8 +42,8 @@ mod secrets;
 pub use duration::HumanDuration;
 pub use error::ConfigError;
 pub use model::{
-    AuditDestinationEntry, AuditEntry, AuditMode, Config, ConnectionEntry, PolicyProfile,
-    PoolProfile, RedactionEntry, RedactionStrategyEntry, SUPPORTED_VERSION, TlsEntry,
+    AuditDestinationEntry, AuditEntry, Config, ConnectionEntry, PolicyProfile, PoolProfile,
+    RedactionEntry, RedactionStrategyEntry, SUPPORTED_VERSION, TlsEntry,
 };
 pub use resolve::{
     AuditDestination, ResolvedAudit, ResolvedConfig, ResolvedConnection, ResolvedPolicy,

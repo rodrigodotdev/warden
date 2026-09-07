@@ -1,24 +1,17 @@
-//! The audit module: one record format, and the sinks that write it.
+//! Choosing the audit sink the configuration named.
 //!
-//! `record` is the single declaration of what an audit record contains — its shape,
-//! its key order, and the names no record may ever carry. `tracing_sink` is the
-//! stderr sink that has existed since Milestone 12, rebuilt on that declaration so
-//! the field list is no longer duplicated between a `tracing` call and a constant
-//! beside it. `file` is the append-only sink Milestone 13 adds beside it, on the
-//! same declaration.
+//! The sinks themselves are an adapter and live in `warden-audit` (ADR-0048). What is
+//! left here is composition: `AuditDestination` is a `warden-config` type naming a
+//! deployment choice, and turning one into a port implementation is what a composition
+//! root is for — the same shape as `startup.rs`'s `policy_settings` and
+//! `redaction_settings`.
 
 use std::sync::Arc;
 
 use anyhow::Context as _;
+use warden_audit::{FileAuditSink, TracingAuditSink};
 use warden_config::{AuditDestination, ResolvedAudit};
 use warden_ports::AuditSink;
-
-mod file;
-mod record;
-mod tracing_sink;
-
-use file::FileAuditSink;
-use tracing_sink::TracingAuditSink;
 
 /// Builds the sink the configuration selected.
 ///

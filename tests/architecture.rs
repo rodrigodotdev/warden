@@ -27,6 +27,27 @@ const FORBIDDEN_EDGES: &[(&str, &[&str])] = &[
     ("warden-config", &["sqlx", "rmcp", "sqlparser"]),
     ("warden-service", &["sqlx", "sqlparser", "rmcp"]),
     ("warden-mcp", &["sqlx", "sqlparser"]),
+    // The audit sink is an adapter (ADR-0048). It implements a port and writes a file;
+    // it must reach neither a driver, nor the MCP surface, nor the layers above it —
+    // a boundary that was unenforceable while these files lived in the binary.
+    //
+    // `warden-policy` is not on this list and cannot be: `warden-ports` names
+    // `DenyReason` in `AuditAttempt`'s own fields, so any implementer of `AuditSink`
+    // reaches the policy crate transitively. What the list forbids is a *direct*
+    // decision to depend on something this crate has no business naming.
+    (
+        "warden-audit",
+        &[
+            "sqlx",
+            "rmcp",
+            "sqlparser",
+            "warden-config",
+            "warden-service",
+            "warden-mcp",
+            "warden-mysql",
+            "warden-postgres",
+        ],
+    ),
     ("warden-mysql", &["rmcp"]),
     ("warden-postgres", &["rmcp"]),
     // `warden-guards` reads the source of every crate. It must not be able to depend on
@@ -53,6 +74,7 @@ const FORBIDDEN_EDGES: &[(&str, &[&str])] = &[
 /// Expected workspace crates. Adding one requires an explicit boundary decision.
 const EXPECTED_MEMBERS: &[&str] = &[
     "warden",
+    "warden-audit",
     "warden-config",
     "warden-core",
     "warden-guards",
