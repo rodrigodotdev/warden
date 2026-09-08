@@ -178,15 +178,22 @@ jobs:
 
       # One `SHA256SUMS` rather than a sidecar per archive: it is what
       # `sha256sum --check` consumes directly, and one file is one thing to verify.
-      # `LC_ALL=C sort` keeps the order stable across runners. The redirection creates
-      # the file before `find` runs, so `find` has to exclude it by name or the
-      # manifest lists its own empty self and then fails its own `--check`.
+      # `LC_ALL=C sort` keeps the order stable across runners.
+      #
+      # The list is collected before `sha256sum` opens the manifest for writing. A
+      # single pipeline ending in `> SHA256SUMS` would put the same file at both ends
+      # of it (shellcheck SC2094), and the redirection would create the file before
+      # `find` walked the directory, so the manifest would list its own empty self and
+      # then fail its own `--check`. The name is excluded as well, so a re-run in a
+      # workspace that already holds one behaves the same way.
       - name: Checksum every asset
         run: |
           set -euo pipefail
           cd dist
-          find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\n' \
-            | LC_ALL=C sort | xargs sha256sum > SHA256SUMS
+          mapfile -t assets < <(
+            find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\n' | LC_ALL=C sort
+          )
+          sha256sum "${assets[@]}" > SHA256SUMS
           cat SHA256SUMS
 
       # Signed SLSA build provenance for every published file, verifiable with

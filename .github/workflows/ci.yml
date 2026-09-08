@@ -39,7 +39,9 @@ jobs:
         with:
           version: 2026.8.8
           install: true
-          install_args: taplo aqua:EmbarkStudios/cargo-deny aqua:rhysd/actionlint
+          install_args: >-
+            taplo aqua:EmbarkStudios/cargo-deny aqua:rhysd/actionlint
+            aqua:koalaman/shellcheck
           cache: true
 
       - name: Cache Cargo artifacts
@@ -53,7 +55,9 @@ jobs:
       - run: taplo fmt --check
       # release.yml runs on a tag, so a typo in it surfaces at the worst moment.
       # actionlint checks expressions, runner labels, and action inputs here instead.
-      - run: actionlint
+      # `-shellcheck` is named rather than left to auto-detection so this step and
+      # `mise run lint:actions` run the same pinned binary over the same `run` blocks.
+      - run: actionlint -shellcheck shellcheck
       - run: cargo check --workspace --all-targets
       # A workspace build unifies features across the graph, so a crate that uses a
       # feature it never declared still compiles anyway. Checking each package alone is
@@ -138,10 +142,17 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     steps:
+      # `ref` is what makes this job see the branch. On a `pull_request` event
+      # `actions/checkout` defaults to `refs/pull/N/merge`, so `HEAD` is the merge
+      # commit GitHub generates for the pull request — which has no Conventional
+      # type and which `committed.toml` disallows outright, so every pull request
+      # failed this job on a commit its author never wrote. Checking out the head
+      # commit puts the branch's own commits, and only those, in the range below.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
+          ref: ${{ github.event.pull_request.head.sha }}
 
       - uses: jdx/mise-action@3c2e0cf82a5b2e5249f0d3635a4d83d0ae861518 # v4.2.5
         with:
@@ -150,7 +161,11 @@ jobs:
           install_args: aqua:crate-ci/committed
           cache: true
 
-      - run: committed ${{ github.event.pull_request.base.sha }}..HEAD
+      # Both ends are named explicitly rather than relying on `HEAD`: the range is
+      # then the same whatever the checkout resolves to.
+      - run: >
+          committed
+          ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}
 
   coverage:
     name: coverage

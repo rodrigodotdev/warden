@@ -1051,6 +1051,8 @@ produce noise and cargo-cult suppressions.
 
 ```text
 cargo fmt --check
+taplo fmt --check
+actionlint -shellcheck shellcheck
 cargo check --workspace --all-targets
 for manifest in Cargo.toml crates/*/Cargo.toml; do cargo check --manifest-path "$manifest"; done
 cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -1066,6 +1068,21 @@ dev-dependencies. `warden-mysql` shipped for two milestones declaring `tokio` wi
 `time` while using `tokio::select!`, which `macros` gates, and nothing in CI could see
 it. `--manifest-path` resolves features for one package alone; no `--lib`, because the
 root package is a binary. `mise run check:standalone` is the same loop.
+
+**Name shellcheck rather than letting actionlint find it.** actionlint shells out to
+shellcheck for every `run` block and silently skips that half when it is absent. GitHub
+runners ship shellcheck and a developer's machine may not, so leaving it to
+auto-detection makes the local task a weaker check than the CI step that shares its
+name — which is how a real SC2094 in `release.yml` reached CI from a green local gate.
+`mise.toml` pins the binary and both callers name it.
+
+**A pull-request job must check out the head commit, not the merge commit.**
+`actions/checkout` defaults to `refs/pull/N/merge` on a `pull_request` event, so `HEAD`
+is the merge commit GitHub generates for the pull request. The commit-convention job
+ran `committed <base>..HEAD` against that, and `committed.toml` sets
+`merge_commit = false`: every pull request failed on a commit its author never wrote.
+The job now checks out `github.event.pull_request.head.sha` and names both ends of the
+range explicitly.
 
 Database integration tests run in a dedicated Docker job. CI denies warnings; do not
 force developers to deny warnings in every exploratory local command.
