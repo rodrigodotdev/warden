@@ -55,6 +55,7 @@ supersedes it; never change it silently.
 | [0048](0048-the-audit-sink-is-an-adapter.md) | The audit sink is an adapter |
 | [0049](0049-shared-test-fixtures-live-in-a-dev-only-crate.md) | Shared test fixtures live in a dev-only crate |
 | [0050](0050-mit-license.md) | MIT is the project license |
+| [0051](0051-the-handshake-answers-a-legacy-version.md) | An `initialize` handshake is answered with a legacy version |
 
 ADRs 0021–0026 are new in v0.3. ADR-0002 supersedes the v0.2 MSRV definition;
 ADR-0022 supersedes the single-event audit model; ADR-0023 resolves v0.2 open
@@ -67,3 +68,5 @@ ADR-0042 resolves open question 21, ADR-0043 is what makes ADR-0022's fail-close
 attempt a tested behaviour rather than a structural claim, ADR-0044 fixes the span
 taxonomy and levels, and ADR-0045 keeps panic reports free of data-bearing payloads.
 ADR-0050 resolves open question 12 and is what unblocked the first tagged release.
+ADR-0051 refines ADR-0041's echo rule after `rmcp` 3.2 implemented the `2026-07-28`
+versioning specification, and resolves open question 27.

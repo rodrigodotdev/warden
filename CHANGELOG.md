@@ -25,9 +25,11 @@ database credentials to the model.
   tools — `list_connections`, `search_schema`, `describe_schema`, `query`, and
   `explain` — with populated annotations and an output schema on every tool. The
   schemas are identical for MySQL and PostgreSQL and are snapshotted in CI, so an
-  agent needs no per-engine tooling. `initialize` advertises the `2025-11-25` and
-  `2026-07-28` protocol versions and refuses anything else rather than substituting
-  silently.
+  agent needs no per-engine tooling. Warden speaks the `2025-11-25` and `2026-07-28`
+  protocol revisions, over the `initialize` handshake and the inline lifecycle alike,
+  and refuses anything else rather than substituting silently. A handshake is answered
+  with `2025-11-25` whatever it requested, because sending `initialize` is itself the
+  selection of legacy semantics.
 - **`warden check`.** Validates the configuration, resolves every DSN, proves the
   audit destination writable, and reports what a deployment would do — before any
   database pool opens.

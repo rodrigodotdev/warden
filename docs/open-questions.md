@@ -248,7 +248,8 @@ otherwise, none blocks M0–M5.
     `warden_audit_write_failures_total` is the alarm ADR-0022 names, and it is a
     `tracing` event today.
 
-27. **Does Warden actually implement `2026-07-28`, or only advertise it?** A routine
+27. **Resolved in v0.1.0 by ADR-0051 — does Warden actually implement `2026-07-28`,
+    or only advertise it?** It implements it. A routine
     `cargo update` moved rmcp to 3.2.0 and
     `initialization_reports_tools_and_echoes_the_requested_version` failed: an
     `initialize` naming `2026-07-28` came back as `2025-11-25`. That is not an SDK
@@ -257,18 +258,21 @@ otherwise, none blocks M0–M5.
     legacy semantics** — for stdio as much as for HTTP — so a server answering one must
     answer with a legacy version. A client wanting `2026-07-28` semantics does not send
     `initialize` at all. `WARDEN_PROTOCOL_VERSIONS`
-    (`crates/warden-mcp/src/server.rs`) lists `V_2026_07_28`, and `initialize` echoes
-    whichever of the two was asked for, so a client that names `2026-07-28` is told it
-    negotiated a revision whose lifecycle Warden has not implemented. That is ADR-0041's
-    own failure mode — advertising what is not implemented — reached from the other
-    direction, and Milestone 14 is where the modern lifecycle is actually planned.
-    Resolving it is a choice between dropping `V_2026_07_28` from the advertised list
-    until M14 implements it, and keeping the list while answering every `initialize`
-    with the newest *legacy* version. Both are behaviour changes to a documented
-    contract, with `docs/mcp.md`, ADR-0041, and
-    `crates/warden-mcp/tests/snapshots/tools.json` to follow. **Until it is decided,
-    `Cargo.lock` holds `rmcp` at 3.1.4**; the manifest requirement is still `3.1.3`, so
-    the next unpinned update will surface this again through the same test.
+    (`crates/warden-mcp/src/server.rs`) listed `V_2026_07_28` and `initialize` echoed
+    whichever of the two was asked for, so a client naming `2026-07-28` was told it had
+    negotiated the modern lifecycle over a handshake that means the opposite.
+
+    **The question's first framing read that as an over-claim** — Warden advertising a
+    lifecycle Milestone 14 had not built — and proposed dropping `V_2026_07_28` from the
+    advertised list. That was wrong, and the suite says so:
+    `a_session_that_never_initializes_still_serves_a_supported_version` drives a full
+    `query` over the **inline** lifecycle at `2026-07-28` — no `initialize`, version in
+    `_meta` — and `an_unimplemented_version_declared_inline_is_refused_before_any_tool_runs`
+    proves an unspoken version is refused on that path before a tool runs. Both pass under
+    rmcp 3.2.0 and passed before it. Warden implements that lifecycle; the entry earns its
+    place. What was wrong was one line, `initialize` echoing `request.protocol_version`.
+    ADR-0051 keeps the list, adds `WARDEN_HANDSHAKE_VERSION`, and answers every handshake
+    with `2025-11-25`. rmcp is unpinned again at 3.2.0.
 
 ## 3. Future work deliberately outside v0.x
 

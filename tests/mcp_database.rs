@@ -65,6 +65,12 @@ const DSN_VARIABLE: &str = "WARDEN_E2E_DSN";
 /// The newest protocol version Warden implements (ADR-0041).
 const PROTOCOL_VERSION: &str = "2026-07-28";
 
+/// What an `initialize` is answered with, whatever it requested (ADR-0051).
+///
+/// The handshake itself selects legacy semantics under the `2026-07-28` versioning rules,
+/// so the answer names a legacy revision even when the request named a newer one.
+const HANDSHAKE_VERSION: &str = "2025-11-25";
+
 /// `docs/testing.md` section 4 requires MySQL 8.4; the module defaults to 8.1.
 const MYSQL_TAG: &str = "8.4";
 
@@ -946,7 +952,7 @@ async fn an_agent_can_find_a_table_describe_it_query_it_and_plan_it() {
         );
         assert_eq!(
             responses[0]["result"]["protocolVersion"],
-            json!(PROTOCOL_VERSION),
+            json!(HANDSHAKE_VERSION),
             "{engine:?}: {}",
             responses[0]
         );
