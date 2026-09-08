@@ -61,9 +61,18 @@ otherwise, none blocks M0–M5.
     PostgreSQL RLS state is still not exposed in schema metadata; Milestone 9 did not
     change that.
 
-12. **Which license?** This blocks the `deny.toml` license allowlist. Apache-2.0
-    provides a patent grant and is common for security infrastructure; AGPL prevents
-    closed-source SaaS resale. This is a product decision.
+12. **Resolved in v0.1.0 by ADR-0050 — which license?** The question framed the
+    choice as Apache-2.0, for its patent grant, against AGPL, which prevents
+    closed-source SaaS resale, and noted that it blocked the `deny.toml` license
+    allowlist. **MIT.** Warden holds no patents and expects none, so Apache-2.0's
+    grant guards a risk that does not exist while adding text to every downstream
+    legal review; AGPL's network-use clause would deter the internal deployment
+    Warden is built for in order to prevent a competitor it does not have. The
+    allowlist is unblocked in the other direction from the one the question assumed:
+    `[licenses.private] ignore = false` now checks Warden's own crates too, so a
+    member crate missing `license.workspace = true` fails CI. `LICENSE` ships inside
+    every release archive, enforced by
+    `every_release_archive_carries_both_licenses` in `tests/architecture.rs`.
 
 13. **Can `SchemaInspector` filter objects at the source without changing its
     signature?** No — **resolved in Milestone 9 by ADR-0036.** `docs/security.md`
@@ -238,6 +247,32 @@ otherwise, none blocks M0–M5.
     metrics, so this is now a wiring decision rather than a design one.
     `warden_audit_write_failures_total` is the alarm ADR-0022 names, and it is a
     `tracing` event today.
+
+27. **Resolved in v0.1.0 by ADR-0051 — does Warden actually implement `2026-07-28`,
+    or only advertise it?** It implements it. A routine
+    `cargo update` moved rmcp to 3.2.0 and
+    `initialization_reports_tools_and_echoes_the_requested_version` failed: an
+    `initialize` naming `2026-07-28` came back as `2025-11-25`. That is not an SDK
+    bug. rmcp's own fix (modelcontextprotocol/rust-sdk#1228) implements the
+    `2026-07-28` versioning spec, under which **an `initialize` request itself selects
+    legacy semantics** — for stdio as much as for HTTP — so a server answering one must
+    answer with a legacy version. A client wanting `2026-07-28` semantics does not send
+    `initialize` at all. `WARDEN_PROTOCOL_VERSIONS`
+    (`crates/warden-mcp/src/server.rs`) listed `V_2026_07_28` and `initialize` echoed
+    whichever of the two was asked for, so a client naming `2026-07-28` was told it had
+    negotiated the modern lifecycle over a handshake that means the opposite.
+
+    **The question's first framing read that as an over-claim** — Warden advertising a
+    lifecycle Milestone 14 had not built — and proposed dropping `V_2026_07_28` from the
+    advertised list. That was wrong, and the suite says so:
+    `a_session_that_never_initializes_still_serves_a_supported_version` drives a full
+    `query` over the **inline** lifecycle at `2026-07-28` — no `initialize`, version in
+    `_meta` — and `an_unimplemented_version_declared_inline_is_refused_before_any_tool_runs`
+    proves an unspoken version is refused on that path before a tool runs. Both pass under
+    rmcp 3.2.0 and passed before it. Warden implements that lifecycle; the entry earns its
+    place. What was wrong was one line, `initialize` echoing `request.protocol_version`.
+    ADR-0051 keeps the list, adds `WARDEN_HANDSHAKE_VERSION`, and answers every handshake
+    with `2025-11-25`. rmcp is unpinned again at 3.2.0.
 
 ## 3. Future work deliberately outside v0.x
 

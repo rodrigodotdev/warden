@@ -167,12 +167,15 @@ checkbox for two-phase auditing does not flip in M11.
 Built here: `warden-config` parses the documented TOML, resolves DSNs from environment
 variables and files straight into `warden_core::secret::Dsn` without ever holding one in
 a struct that derives `Serialize`, and refuses a deployment it cannot serve.
-`warden-mcp` exposes the five generic tools over rmcp 3.1.4 with populated
+`warden-mcp` exposes the five generic tools over rmcp 3.x with populated
 `ToolAnnotations`, an `output_schema` on every tool, and the section 1.3 descriptions,
 each written as a doc comment the `#[tool]` macro lifts. A successful result carries its
 data in `structured_content` and one counting line in `content` rather than a second copy
-of the rows (ADR-0040). `initialize` advertises `2025-11-25` and `2026-07-28` and refuses
-anything else instead of substituting silently (ADR-0041). `src/startup.rs` assembles
+of the rows (ADR-0040). Warden advertises `2025-11-25` and `2026-07-28` and refuses
+anything else instead of substituting silently, on the handshake lifecycle and the inline
+one alike (ADR-0041). A handshake is answered with `2025-11-25` whatever it requested,
+because an `initialize` request is itself the selection of legacy semantics (ADR-0051,
+v0.1.0). `src/startup.rs` assembles
 configuration, adapters, policy, and services in the composition root, and `warden serve
 --transport stdio` and `warden check` are the CLI over it.
 
@@ -298,6 +301,8 @@ that the supposedly generic core was secretly shaped around MySQL.
 - [x] A security corpus exists
 - [x] README documents secure deployment and the SPEC section 7 guarantee boundaries
 - [x] Security documentation states that database privileges are mandatory
+- [x] A license is selected and ships inside every distributed artifact (ADR-0050)
+- [x] Signed, checksummed binaries exist for Linux, macOS, and Windows
 
 Both claims are now reviewable against the versioned audit-record format and its field
 allowlist, not only against structure. The persistent file sink's read-only

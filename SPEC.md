@@ -272,3 +272,10 @@ guarantees.
 Rust crate APIs are internal implementation details before 1.0. MCP tool schemas are
 user-facing contracts from the first release and change cautiously. The configuration
 format is versioned from the beginning.
+
+**This document carries its own revision number, and it is not the software version.**
+The `v0.3` above is the third revision of the specification; the software is released
+as `vX.Y.Z` git tags recorded in `CHANGELOG.md`, starting at `v0.1.0`. Where
+`docs/open-questions.md` says a question was resolved "in v0.3" it means the
+specification revision, and where a document says a behaviour holds "in v0.1" it means
+the release line.

@@ -1,5 +1,11 @@
 # Security policy
 
+## Supported versions
+
+Only the latest release receives security fixes. Warden is a `0.x` line: a fix ships
+as a new patch or minor release rather than as a backport to an older tag, and there
+are no long-term support versions before `1.0`.
+
 ## Reporting a vulnerability
 
 Do not open a public issue. Use GitHub [private vulnerability

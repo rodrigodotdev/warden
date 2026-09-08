@@ -2,18 +2,27 @@
 
 **SDK:** official `rmcp` 3.x
 
-**`V_2026_07_28` is not "the newest version."** In the `rmcp` 3.1.x source,
+**`V_2026_07_28` is not "the newest version."** In the `rmcp` source,
 `ProtocolVersion::LATEST` is `V_2025_11_25`; `V_2026_07_28` is
 `ProtocolVersion::STANDARD_HEADERS`, the first protocol version that requires SEP-2243
-standard HTTP headers. Both are in `KNOWN_VERSIONS` and both negotiate. Targeting
-`2026-07-28` means requiring SEP-2243 HTTP headers, which matters only from Milestone
-14 (Streamable HTTP); it is not a claim of using the protocol's leading edge.
+standard HTTP headers. Both are in `KNOWN_VERSIONS`. Targeting `2026-07-28` means
+requiring SEP-2243 HTTP headers, which matters only from Milestone 14 (Streamable
+HTTP); it is not a claim of using the protocol's leading edge.
+
+**`2026-07-28` and later do not use an `initialize` handshake.** That revision's
+versioning rules make an `initialize` request itself the selection of legacy semantics,
+for stdio as much as for HTTP; a client wanting the newer lifecycle declares its version
+per request in `_meta` and never sends `initialize`. Warden implements both lifecycles
+and answers every handshake with `2025-11-25` accordingly (ADR-0051).
 
 **The client, not the server, determines the session's effective version.**
-`negotiate_protocol_version` echoes a requested version whenever it appears in
+`negotiate_protocol_version` echoes a requested legacy version whenever it appears in
 `KNOWN_VERSIONS`, while the SDK's default `supported_protocol_versions` contains all
 five known versions from `2024-11-05` through `2026-07-28`. Milestone 0.5 confirmed
-this with a real handshake: requesting `2026-07-28` returned `2026-07-28`.
+this with a real handshake against `rmcp` 3.1: requesting `2026-07-28` returned
+`2026-07-28`. `rmcp` 3.2 corrected that specific answer to `2025-11-25`, for the
+handshake-is-legacy reason above; the point the measurement was making — that the
+server does not get to choose — is unchanged.
 
 **For an unsupported version, the SDK silently substitutes instead of rejecting.**
 Milestone 0.5 requested `1999-01-01`; the server returned `2025-11-25` (`LATEST`) and
@@ -24,13 +33,19 @@ request.
 **Decided in Milestone 12: Warden advertises only what it implements (ADR-0041).**
 `supported_protocol_versions` returns exactly two revisions — `V_2025_11_25` and
 `V_2026_07_28` — rather than the five the SDK knows, because advertising a revision
-Warden has neither implemented nor tested is a claim it cannot keep. Silent substitution
-is closed the only way the SDK allows: `negotiate_protocol_version` has no error hook, so
-`ServerHandler::initialize` is overridden instead, and a request naming any other revision
-returns `ErrorData::unsupported_protocol_version` carrying the supported list in its
-`data`, so the client can retry with a version both sides actually implement. A refusal
-returned from a handler's `initialize` is written to the transport before the session
-ends, so it reaches the client rather than only stderr.
+Warden has neither implemented nor tested is a claim it cannot keep. `2026-07-28` is on
+that list for the inline lifecycle, which `rmcp` validates against it per request. Silent
+substitution is closed the only way the SDK allows: `negotiate_protocol_version` has no
+error hook, so `ServerHandler::initialize` is overridden instead, and a request naming any
+other revision returns `ErrorData::unsupported_protocol_version` carrying the supported
+list in its `data`, so the client can retry with a version both sides actually implement.
+A refusal returned from a handler's `initialize` is written to the transport before the
+session ends, so it reaches the client rather than only stderr.
+
+**Refined in v0.1.0 (ADR-0051): a supported version is not echoed back.** A handshake is
+answered with `WARDEN_HANDSHAKE_VERSION`, the newest legacy revision Warden implements,
+because reaching `initialize` at all is what selects legacy semantics. The refusal above
+is unchanged, on both lifecycles.
 
 Do not hand-roll framing or Streamable HTTP semantics supplied by the official SDK.
 

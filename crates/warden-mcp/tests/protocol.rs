@@ -542,11 +542,19 @@ async fn exchange(requests: &[Value]) -> Vec<Value> {
 // ---------------------------------------------------------------------------------
 
 #[tokio::test]
-async fn initialization_reports_tools_and_echoes_the_requested_version() {
+async fn initialization_reports_tools_and_answers_the_legacy_version() {
+    // ADR-0051. Both advertised versions are accepted, and both are answered with
+    // `2025-11-25`: an `initialize` request is itself the selection of legacy semantics
+    // under the 2026-07-28 versioning rules, so echoing `2026-07-28` back would name a
+    // lifecycle this session is not using. `a_session_that_never_initializes_still_serves
+    // _a_supported_version` covers the lifecycle that does use it.
     for version in ["2025-11-25", "2026-07-28"] {
         let response = &exchange(&[initialize(version)]).await[0];
         assert!(response["error"].is_null(), "{response}");
-        assert_eq!(response["result"]["protocolVersion"], version);
+        assert_eq!(
+            response["result"]["protocolVersion"], "2025-11-25",
+            "requested {version}: {response}"
+        );
         assert!(
             !response["result"]["capabilities"]["tools"].is_null(),
             "{response}"

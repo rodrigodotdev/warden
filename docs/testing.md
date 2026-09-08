@@ -41,6 +41,15 @@ Milestone 13 adds these no-database observability rows:
 | Span tree | a capturing subscriber proves phase order, parentage, levels, the field allowlist, and absence of the statement literal |
 | Span-tree guard | `tests/architecture.rs` parses every fenced `text` tree in `docs/operations.md` section 10.1 and production `*_span!` macros with `syn`, rather than comparing either side with a hard-coded name list |
 
+The v0.1.0 release adds one more guard to the same file, for the same reason the
+Dockerfile guard was written before any image existed:
+`every_release_archive_carries_both_licenses` finds every workflow that builds a
+distributable archive — by the archiving command, not by file name, so a second release
+workflow inherits the rule — and fails unless it stages both `LICENSE` and the
+`webpki-roots` notice into it. Its own unit tests pin the parser: a destination merely
+named `LICENSES` does not satisfy it, either license alone does not, and a `tar`
+invocation wrapped across continued lines is still detected.
+
 The milestone close also ties its two audit claims to behavior rather than prose: the
 record field allowlist has no raw-statement or parameter field. The file sink's
 read-only regular-file fixture proves that a real attempt write becomes

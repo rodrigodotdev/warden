@@ -1,0 +1,236 @@
+name: Release
+
+# A pushed tag is the only thing that publishes. `workflow_dispatch` builds and
+# checksums the same artifacts without creating a release, so the pipeline can be
+# exercised before the day it is needed — a release workflow whose first real run is
+# the release itself is a workflow nobody has tested.
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# A release is never cancelled mid-flight: half its assets uploaded is worse than a
+# duplicated run.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+# Third-party and first-party actions alike are pinned to commit SHAs, not mutable
+# tags — the same rule ci.yml follows, for the same OpenSSF Scorecard reason. Runner
+# image labels are pinned for the same reason and are reviewed the same way.
+jobs:
+  verify:
+    name: verify the tag and re-run the gate
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: release-verify
+
+      # The tag and the manifest must agree before anything is built. Publishing
+      # `v0.2.0` from a tree that still says `0.1.0` produces a binary whose own
+      # `warden version` contradicts the release it came from.
+      - name: Resolve and check the version
+        id: version
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --format-version 1 --no-deps \
+            | jq -r '.packages[] | select(.name == "warden") | .version')"
+          if [ -z "$version" ] || [ "$version" = "null" ]; then
+            echo "could not read the version of the \`warden\` package" >&2
+            exit 1
+          fi
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            tagged="${GITHUB_REF_NAME#v}"
+            if [ "$tagged" != "$version" ]; then
+              echo "tag ${GITHUB_REF_NAME} does not match Cargo.toml version ${version}" >&2
+              exit 1
+            fi
+            if ! grep -qF "## [${version}]" CHANGELOG.md; then
+              echo "CHANGELOG.md has no \`## [${version}]\` section" >&2
+              exit 1
+            fi
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      # ci.yml gates every push to main, but a tag carries no required status check,
+      # so nothing else stops a release being cut from a red commit. This is the fast
+      # half of the gate; the container suite already ran on the same commit in
+      # ci.yml, and re-running it here would add forty minutes to every release.
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace
+
+  build:
+    name: ${{ matrix.target }}
+    needs: verify
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-24.04
+          # Native arm64 rather than a cross toolchain: no `cross`, no emulation, and
+          # the linker is the one the target actually uses.
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+          - target: x86_64-apple-darwin
+            runner: macos-15
+          - target: aarch64-apple-darwin
+            runner: macos-15
+          - target: x86_64-pc-windows-msvc
+            runner: windows-2025
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The toolchain comes from rust-toolchain.toml; only the cross-compiled target
+      # has to be added. macOS ships both architectures' SDKs, so x86_64 builds on an
+      # arm64 runner without a cross linker.
+      - name: Add the target
+        run: rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          shared-key: release-${{ matrix.target }}
+
+      # `--locked` is what makes the shipped binary come from the committed
+      # Cargo.lock — the same dependency graph `cargo deny --workspace check`
+      # resolved for this target in deny.toml. A release that silently updated a
+      # dependency would ship a graph nothing reviewed.
+      #
+      # The binary is deliberately not stripped: docs/operations.md section 12.3
+      # keeps the release profile untuned until a distribution need is measured, and
+      # symbols are what make a panic report from an operator actionable.
+      - name: Build
+        run: cargo build --locked --release --target ${{ matrix.target }}
+
+      # One bash step on every platform, so there is one packaging rule rather than a
+      # POSIX one and a PowerShell one that drift apart. `LICENSE` is Warden's own;
+      # `LICENSES` carries the webpki-roots notice that CDLA-Permissive-2.0 requires
+      # to accompany the redistributed root store (docs/operations.md section 2.7).
+      # tests/architecture.rs fails the build if this step stops copying either.
+      - name: Stage and archive
+        id: archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          staging="warden-v${{ needs.verify.outputs.version }}-${{ matrix.target }}"
+          mkdir -p "$staging"
+          cp README.md "$staging/"
+          cp LICENSE "$staging/"
+          cp -R LICENSES "$staging/"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "target/${{ matrix.target }}/release/warden.exe" "$staging/"
+            7z a -tzip "${staging}.zip" "$staging" > /dev/null
+            echo "asset=${staging}.zip" >> "$GITHUB_OUTPUT"
+          else
+            cp "target/${{ matrix.target }}/release/warden" "$staging/"
+            tar -czf "${staging}.tar.gz" "$staging"
+            echo "asset=${staging}.tar.gz" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The archive has to survive to the publish job, which is where every asset is
+      # checksummed together and attested at once.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ steps.archive.outputs.asset }}
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: checksum, attest, publish
+    needs: [verify, build]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    permissions:
+      # Creating the release and uploading its assets.
+      contents: write
+      # Signing the build provenance with a short-lived OIDC identity.
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+
+      # One `SHA256SUMS` rather than a sidecar per archive: it is what
+      # `sha256sum --check` consumes directly, and one file is one thing to verify.
+      # `LC_ALL=C sort` keeps the order stable across runners.
+      #
+      # The list is collected before `sha256sum` opens the manifest for writing. A
+      # single pipeline ending in `> SHA256SUMS` would put the same file at both ends
+      # of it (shellcheck SC2094), and the redirection would create the file before
+      # `find` walked the directory, so the manifest would list its own empty self and
+      # then fail its own `--check`. The name is excluded as well, so a re-run in a
+      # workspace that already holds one behaves the same way.
+      - name: Checksum every asset
+        run: |
+          set -euo pipefail
+          cd dist
+          mapfile -t assets < <(
+            find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%f\n' | LC_ALL=C sort
+          )
+          sha256sum "${assets[@]}" > SHA256SUMS
+          cat SHA256SUMS
+
+      # Signed SLSA build provenance for every published file, verifiable with
+      # `gh attestation verify <file> --repo ${{ github.repository }}`. The checksum
+      # file is a subject too, so the list of hashes cannot be swapped either.
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/SHA256SUMS
+
+      # The release notes are the CHANGELOG's own section for this version, so the
+      # repository and the release page cannot describe the same version differently.
+      - name: Extract the release notes
+        run: |
+          set -euo pipefail
+          awk -v version="${{ needs.verify.outputs.version }}" '
+            $0 == "## [" version "]" || index($0, "## [" version "] ") == 1 { capture = 1; next }
+            capture && (/^## / || /^\[[^]]+\]: /) { exit }
+            capture { print }
+          ' CHANGELOG.md > NOTES.md
+          if [ ! -s NOTES.md ]; then
+            echo "no release notes found for ${{ needs.verify.outputs.version }}" >&2
+            exit 1
+          fi
+
+      # `gh` is preinstalled on the runner, so publishing needs no third-party action
+      # and no extra token. `--verify-tag` refuses to invent a tag that is not there.
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "Warden ${GITHUB_REF_NAME}" \
+            --notes-file NOTES.md \
+            --verify-tag \
+            dist/*

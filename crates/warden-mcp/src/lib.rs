@@ -47,5 +47,7 @@ pub use output::{
     QueryOutput, SchemaSummary, SearchOutput, StatsSummary, TableSummary, WireDialect,
     WireMatchReason, WireTableKind,
 };
-pub use server::{SERVER_INSTRUCTIONS, WARDEN_PROTOCOL_VERSIONS, WardenServer};
+pub use server::{
+    SERVER_INSTRUCTIONS, WARDEN_HANDSHAKE_VERSION, WARDEN_PROTOCOL_VERSIONS, WardenServer,
+};
 pub use stdio::{StdioError, serve_duplex, serve_stdio};

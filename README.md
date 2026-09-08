@@ -10,6 +10,8 @@
   </p>
 
   <p>
+    <a href="https://github.com/rodrigodotdev/warden/releases/latest"><img src="https://img.shields.io/github/v/release/rodrigodotdev/warden?style=flat-square&amp;label=release&amp;color=8A63D2" alt="Latest release" /></a>
+    <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-3DA639?style=flat-square" alt="MIT license" /></a>
     <a href="https://github.com/rodrigodotdev/warden/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/rodrigodotdev/warden/ci.yml?branch=main&amp;style=flat-square&amp;label=CI" alt="CI status" /></a>
     <img src="https://img.shields.io/badge/Rust-1.94%2B-000000?style=flat-square&amp;logo=rust&amp;logoColor=white" alt="Rust 1.94 or newer" />
     <img src="https://img.shields.io/badge/MCP-stdio-008B8B?style=flat-square" alt="Model Context Protocol over stdio" />
@@ -65,18 +67,37 @@ for both databases, so agents do not need separate MySQL and PostgreSQL tools.
 
 ## Quick start
 
-Warden is currently built from source. There is no published binary or container image
-yet.
+### 1. Install Warden
 
-### 1. Build Warden
+Download the archive for your platform from the
+[latest release](https://github.com/rodrigodotdev/warden/releases/latest): Linux and
+macOS on x86_64 and arm64, Windows on x86_64. Each archive holds a single
+self-contained executable — no `libmysqlclient`, no `libpq`.
+
+Verify it before you run it. Every published file carries signed build provenance, and
+`SHA256SUMS` is signed alongside the archives it lists:
+
+```bash
+sha256sum --check --ignore-missing SHA256SUMS
+gh attestation verify warden-v0.1.0-x86_64-unknown-linux-gnu.tar.gz \
+  --repo rodrigodotdev/warden
+tar -xzf warden-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
+```
+
+There is no container image yet.
+
+<details>
+<summary>Or build from source</summary>
 
 The repository pins its development toolchain in `rust-toolchain.toml`.
 
 ```bash
 git clone https://github.com/rodrigodotdev/warden.git
 cd warden
-cargo build --release
+cargo build --locked --release
 ```
+
+</details>
 
 ### 2. Create `warden.toml`
 
@@ -281,10 +302,13 @@ a failing attempt takes neither permit nor executor; the documented tracing tree
 payload-free panic reporting give operators safe diagnostics. `/dev/full` is rejected at
 open time as a special-file destination rather than used as the write-failure fixture.
 
+v0.1.0 is the first tagged release: MIT-licensed, with signed, checksummed binaries
+for Linux, macOS, and Windows. [`CHANGELOG.md`](CHANGELOG.md) records what it contains
+and what it deliberately does not.
+
 Streamable HTTP and its authorization model are planned for Milestone 14. Until then,
-remote production deployment is not supported. There is no published binary, container
-image, or selected license yet. Follow progress in
-[`docs/milestones.md`](docs/milestones.md).
+remote production deployment is not supported, and there is no container image. Follow
+progress in [`docs/milestones.md`](docs/milestones.md).
 
 ## Development
 
@@ -335,6 +359,7 @@ decisions live in [`docs/adr/`](docs/adr/).
 | Document | Start here when you need to understand… |
 |---|---|
 | [`SPEC.md`](SPEC.md) | The product, its 32 security invariants, and guarantee boundaries |
+| [`CHANGELOG.md`](CHANGELOG.md) | What a release contains, and what it deliberately does not |
 | [`AGENTS.md`](AGENTS.md) | The implementation contract for contributors and coding agents |
 | [`docs/architecture.md`](docs/architecture.md) | Layers, crates, ports, and dependency direction |
 | [`docs/mcp.md`](docs/mcp.md) | Tool contracts, protocol behavior, and transports |
@@ -345,6 +370,10 @@ decisions live in [`docs/adr/`](docs/adr/).
 
 ## License
 
-A license has not been selected yet; see
-[`docs/open-questions.md`](docs/open-questions.md), item 12. Until then, all rights
-reserved.
+[MIT](LICENSE), for the reasoning in
+[ADR-0050](docs/adr/0050-mit-license.md). Contributions arrive under the same terms;
+there is no CLA.
+
+Warden redistributes the Mozilla CCADB root store through `webpki-roots`, which carries
+a separate CDLA-Permissive-2.0 notice in [`LICENSES/`](LICENSES/). Both files ship
+inside every release archive.

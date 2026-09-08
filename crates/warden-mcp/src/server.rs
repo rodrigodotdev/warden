@@ -381,14 +381,29 @@ impl WardenServer {
 
 /// The protocol revisions Warden implements and has tested.
 ///
-/// The SDK's default is every version it knows, which for `rmcp` 3.1 is five revisions from
+/// The SDK's default is every version it knows, which for `rmcp` 3.2 is five revisions from
 /// `2024-11-05` onward. Advertising a revision Warden has neither implemented nor tested is
 /// a claim it cannot keep, so this list holds only the two Warden has implemented and
 /// tested. Both carry structured tool output, the mechanism ADR-0040 depends on — a
 /// property they share with `2025-06-18` rather than what sets them apart from it
 /// (`docs/mcp.md` preamble, ADR-0041).
+///
+/// `2026-07-28` is here for the **inline** lifecycle, where no `initialize` ever arrives
+/// and each request carries its own version in `_meta`. `rmcp` validates that against this
+/// list per request, so the entry is what makes that path work rather than a claim about
+/// the handshake — which answers `WARDEN_HANDSHAKE_VERSION` instead (ADR-0051).
 pub const WARDEN_PROTOCOL_VERSIONS: &[ProtocolVersion] =
     &[ProtocolVersion::V_2025_11_25, ProtocolVersion::V_2026_07_28];
+
+/// The version an `initialize` is answered with, whatever version it requested.
+///
+/// Under the `2026-07-28` versioning rules an `initialize` request *is* the selection of
+/// legacy semantics — for stdio as much as for HTTP — so a server answering one must
+/// answer with a legacy revision. Echoing `2026-07-28` back told a client it had
+/// negotiated a lifecycle it was, by definition, not using. `rmcp` 3.2 enforces this in
+/// `negotiate_protocol_version`; naming it here keeps Warden's own answer the same one
+/// rather than leaving the SDK to overwrite a different one (ADR-0051).
+pub const WARDEN_HANDSHAKE_VERSION: ProtocolVersion = ProtocolVersion::V_2025_11_25;
 
 /// What the client is told before it calls anything.
 pub const SERVER_INSTRUCTIONS: &str = "\
@@ -412,7 +427,7 @@ impl ServerHandler for WardenServer {
         // `InitializeResult` is `#[non_exhaustive]`, so it is built through its constructor
         // and then filled in rather than written as a literal.
         let mut info = InitializeResult::new(ServerCapabilities::builder().enable_tools().build());
-        info.protocol_version = ProtocolVersion::V_2026_07_28;
+        info.protocol_version = WARDEN_HANDSHAKE_VERSION;
         info.server_info = Implementation::new("warden", env!("CARGO_PKG_VERSION"));
         info.instructions = Some(SERVER_INSTRUCTIONS.to_owned());
         info
@@ -424,11 +439,15 @@ impl ServerHandler for WardenServer {
 
     /// Refuses a version Warden does not speak instead of silently substituting one.
     ///
-    /// The SDK's `negotiate_protocol_version` echoes a supported version and otherwise logs
-    /// a `warn!` the client cannot see and returns the server's own default. Milestone 0.5
-    /// measured that: requesting `1999-01-01` produced `2025-11-25` and no error. A client
-    /// that believes it negotiated one revision and got another is exactly the silent
-    /// mismatch a security gateway must not create (ADR-0041).
+    /// The SDK's `negotiate_protocol_version` never returns a `Result`, so it offers no hook
+    /// through which a server can refuse: Milestone 0.5 requested `1999-01-01` and got
+    /// `2025-11-25` with no error, only a `warn!` the client cannot see. A client that
+    /// believes it negotiated one revision and got another is exactly the silent mismatch a
+    /// security gateway must not create (ADR-0041).
+    ///
+    /// A version Warden *does* speak is answered with `WARDEN_HANDSHAKE_VERSION` rather than
+    /// with itself. Reaching this handler at all means the client chose the handshake
+    /// lifecycle, which the `2026-07-28` spec defines as legacy (ADR-0051).
     async fn initialize(
         &self,
         request: InitializeRequestParams,
@@ -441,10 +460,9 @@ impl ServerHandler for WardenServer {
         // `RequestContext::client_info()` return the client's name for
         // `identity::client_name`, and dropping it would blank every audit record's
         // client field.
-        context.peer.set_peer_info(request.clone());
-        let mut info = self.get_info();
-        info.protocol_version = request.protocol_version;
-        Ok(info)
+        context.peer.set_peer_info(request);
+        // `get_info` already carries the handshake version, so there is nothing to override.
+        Ok(self.get_info())
     }
 }
 
@@ -862,10 +880,15 @@ mod tests {
     }
 
     #[test]
-    fn the_advertised_default_is_the_newest_version_warden_implements() {
+    fn the_handshake_answer_is_the_newest_legacy_version() {
+        // ADR-0051. An `initialize` selects legacy semantics by existing, so answering it
+        // with `2026-07-28` would name a lifecycle the client is not using. `2026-07-28`
+        // stays in `WARDEN_PROTOCOL_VERSIONS` for the inline lifecycle, which never
+        // reaches `get_info`.
         let server = WardenServer::new(testing::services());
         let info = ServerHandler::get_info(&server);
-        assert_eq!(info.protocol_version, ProtocolVersion::V_2026_07_28);
+        assert_eq!(info.protocol_version, WARDEN_HANDSHAKE_VERSION);
+        assert_eq!(info.protocol_version, ProtocolVersion::V_2025_11_25);
         assert!(info.capabilities.tools.is_some());
         assert_eq!(info.server_info.name, "warden");
         assert!(
