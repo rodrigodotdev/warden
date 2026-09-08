@@ -11,6 +11,7 @@ cargo-binstall = "1.21.1"
 "cargo:cargo-llvm-cov" = "0.9.0"
 "aqua:EmbarkStudios/cargo-deny" = "0.20.2"
 "aqua:crate-ci/committed" = "1.1.11"
+"aqua:rhysd/actionlint" = "1.7.12"
 taplo = "0.10.0"
 
 [env]
@@ -45,6 +46,13 @@ run = 'for manifest in Cargo.toml crates/*/Cargo.toml; do cargo check --manifest
 [tasks.lint]
 description = "Run Clippy with warnings denied"
 run = "cargo clippy --workspace --all-targets --all-features -- -D warnings"
+
+[tasks."lint:actions"]
+# A workflow is only exercised when it runs, and the release workflow runs on a tag —
+# the one moment a typo is most expensive. actionlint parses every workflow, checks
+# expressions, runner labels, and action inputs, and shellchecks each `run` block.
+description = "Lint the GitHub Actions workflows"
+run = "actionlint"
 
 [tasks.test]
 description = "Run tests that do not require Docker"
@@ -93,6 +101,7 @@ depends = [
   "check",
   "check:standalone",
   "lint",
+  "lint:actions",
   "doc",
   "test",
   "deny",

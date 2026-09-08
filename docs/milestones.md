@@ -298,6 +298,8 @@ that the supposedly generic core was secretly shaped around MySQL.
 - [x] A security corpus exists
 - [x] README documents secure deployment and the SPEC section 7 guarantee boundaries
 - [x] Security documentation states that database privileges are mandatory
+- [x] A license is selected and ships inside every distributed artifact (ADR-0050)
+- [x] Signed, checksummed binaries exist for Linux, macOS, and Windows
 
 Both claims are now reviewable against the versioned audit-record format and its field
 allowlist, not only against structure. The persistent file sink's read-only

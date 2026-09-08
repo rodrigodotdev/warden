@@ -479,6 +479,9 @@ const REQUIRED_NOTICE: &str = "LICENSES/webpki-roots-1.0.9-CDLA-Permissive-2.0.t
 /// Where `docs/operations.md` section 2.7 says a release image keeps it.
 const LICENSE_DESTINATION: &str = "/opt/warden/LICENSES";
 
+/// Warden's own license, which every distributed archive carries alongside the notice.
+const PROJECT_LICENSE: &str = "LICENSE";
+
 fn container_build_files(directory: &Path, files: &mut Vec<PathBuf>) {
     for entry in std::fs::read_dir(directory)
         .unwrap_or_else(|error| panic!("could not read {}: {error}", directory.display()))
@@ -504,7 +507,12 @@ fn container_build_files(directory: &Path, files: &mut Vec<PathBuf>) {
     }
 }
 
-fn logical_docker_instructions(contents: &str) -> Vec<String> {
+/// One logical line per element: comments dropped, backslash continuations joined.
+///
+/// Shared by the Dockerfile guard and the release-workflow guard below. Both read a
+/// file whose commands may be split across lines, and a guard that only saw physical
+/// lines would pass any file that wrapped the instruction it was looking for.
+fn logical_lines(contents: &str) -> Vec<String> {
     let mut instructions = Vec::new();
     let mut current = String::new();
 
@@ -617,7 +625,7 @@ fn copy_paths(instruction: &str) -> Option<(Vec<String>, String)> {
 /// A notice copied into a builder stage is discarded with that stage. Only the last
 /// `FROM` opens the stage a release artifact is built from.
 fn final_stage_instructions(contents: &str) -> Vec<String> {
-    let instructions = logical_docker_instructions(contents);
+    let instructions = logical_lines(contents);
     let last_from = instructions.iter().rposition(|instruction| {
         instruction
             .split_once(char::is_whitespace)
@@ -658,6 +666,59 @@ fn dockerfile_copies_licenses(contents: &str) -> bool {
                     .iter()
                     .any(|source| is_required_license_source(source))
         })
+}
+
+/// Whether a workflow builds a distributable archive of Warden's binary.
+///
+/// Detection is by the archiving command rather than by file name, so a second release
+/// workflow under any name inherits the licensing rule below. Every form the runners
+/// offer is recognized; a form nobody uses costs nothing and closes an escape hatch.
+fn creates_release_archive(contents: &str) -> bool {
+    logical_lines(contents)
+        .iter()
+        .filter_map(|line| shell_words(line))
+        .any(|words| {
+            let command = words.first().map(String::as_str).unwrap_or_default();
+            let second = words.get(1).map(String::as_str).unwrap_or_default();
+            match command {
+                // `-c` may be bundled with other short flags, as in `tar -czf`.
+                "tar" => words
+                    .iter()
+                    .any(|word| word.starts_with('-') && word.contains('c')),
+                "7z" | "7zz" => second == "a",
+                "zip" => true,
+                _ => command.eq_ignore_ascii_case("Compress-Archive"),
+            }
+        })
+}
+
+/// The sources of one `cp`, with its destination removed.
+///
+/// Dropping the destination is what stops a directory merely *named* `LICENSES` from
+/// satisfying the rule — the same false positive `copy_paths` rejects for `COPY`.
+fn shell_copy_sources(line: &str) -> Option<Vec<String>> {
+    let mut words = shell_words(line)?;
+    if words.first().map(String::as_str) != Some("cp") || words.len() < 3 {
+        return None;
+    }
+    words.pop();
+    Some(words.split_off(1))
+}
+
+/// Whether a workflow stages both licenses into the archive it builds.
+///
+/// `LICENSE` is Warden's own MIT text (ADR-0050); `LICENSES` carries the notice
+/// CDLA-Permissive-2.0 requires to accompany the redistributed `webpki-roots` data.
+/// An archive is a redistribution in exactly the way a container image is.
+fn workflow_stages_licenses(contents: &str) -> bool {
+    let staged: Vec<String> = logical_lines(contents)
+        .iter()
+        .filter_map(|line| shell_copy_sources(line))
+        .flatten()
+        .collect();
+    let stages = |path: &str| staged.iter().any(|source| source == path);
+
+    stages(PROJECT_LICENSE) && (stages("LICENSES") || stages(REQUIRED_NOTICE))
 }
 
 fn sha256_hex(contents: &str) -> String {
@@ -1051,6 +1112,99 @@ fn docker_copy_parser_rejects_a_notice_copied_only_into_a_builder_stage() {
         "COPY --from=builder /app/warden /usr/local/bin/warden\n",
     );
     assert!(!dockerfile_copies_licenses(fixture));
+}
+
+/// A release archive is a redistribution, so it carries the same notice a container
+/// image would — and Warden's own license with it.
+///
+/// The rule is stated against *any* workflow that builds an archive rather than
+/// against `release.yml` by name, so a second one cannot be written without it.
+#[test]
+fn every_release_archive_carries_both_licenses() {
+    let workflows = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join(".github")
+        .join("workflows");
+    let mut guarded = Vec::new();
+
+    for entry in fs::read_dir(&workflows)
+        .unwrap_or_else(|error| panic!("could not read {}: {error}", workflows.display()))
+    {
+        let path = entry
+            .unwrap_or_else(|error| panic!("could not read directory entry: {error}"))
+            .path();
+        if !matches!(
+            path.extension().and_then(|extension| extension.to_str()),
+            Some("yml" | "yaml")
+        ) {
+            continue;
+        }
+        let contents = fs::read_to_string(&path)
+            .unwrap_or_else(|error| panic!("could not read {}: {error}", path.display()));
+        if !creates_release_archive(&contents) {
+            continue;
+        }
+
+        assert!(
+            workflow_stages_licenses(&contents),
+            "{} builds a release archive without copying both `LICENSE` and \
+             `LICENSES` (or {REQUIRED_NOTICE}) into it. Warden is MIT-licensed \
+             (ADR-0050) and redistributes Mozilla root data whose \
+             CDLA-Permissive-2.0 notice must accompany it (docs/operations.md \
+             section 2.7).",
+            path.display()
+        );
+        guarded.push(path);
+    }
+
+    assert!(
+        !guarded.is_empty(),
+        "no workflow under {} builds a release archive, so this guard now checks \
+         nothing. If distribution moved somewhere else, the licensing rule has to \
+         move with it rather than lapse.",
+        workflows.display()
+    );
+}
+
+#[test]
+fn release_archive_detection_sees_every_archiving_command() {
+    assert!(creates_release_archive("tar -czf warden.tar.gz staging"));
+    assert!(creates_release_archive("7z a -tzip warden.zip staging"));
+    assert!(creates_release_archive("zip -r warden.zip staging"));
+    assert!(creates_release_archive(
+        "Compress-Archive staging warden.zip"
+    ));
+    // Reading an archive is not building one.
+    assert!(!creates_release_archive("tar -xzf warden.tar.gz"));
+    assert!(!creates_release_archive("7z l warden.zip"));
+    assert!(!creates_release_archive("cargo build --release"));
+}
+
+#[test]
+fn release_archive_detection_survives_a_continued_line() {
+    let wrapped = "tar \\\n  --create --gzip \\\n  --file warden.tar.gz staging";
+    assert!(creates_release_archive(wrapped));
+}
+
+#[test]
+fn release_workflow_guard_rejects_a_destination_named_licenses() {
+    let fixture = "tar -czf a.tar.gz s\ncp LICENSE s/\ncp warden LICENSES";
+    assert!(creates_release_archive(fixture));
+    assert!(!workflow_stages_licenses(fixture));
+}
+
+#[test]
+fn release_workflow_guard_accepts_the_notice_path_alone() {
+    let fixture = concat!(
+        "cp README.md LICENSE staging/\n",
+        "cp LICENSES/webpki-roots-1.0.9-CDLA-Permissive-2.0.txt staging/\n",
+    );
+    assert!(workflow_stages_licenses(fixture));
+}
+
+#[test]
+fn release_workflow_guard_requires_wardens_own_license_too() {
+    assert!(!workflow_stages_licenses("cp -R LICENSES staging/"));
+    assert!(!workflow_stages_licenses("cp LICENSE staging/"));
 }
 
 /// The one allow `AGENTS.md` sanctions, spelled exactly one way.

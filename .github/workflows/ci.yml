@@ -39,7 +39,7 @@ jobs:
         with:
           version: 2026.8.8
           install: true
-          install_args: taplo aqua:EmbarkStudios/cargo-deny
+          install_args: taplo aqua:EmbarkStudios/cargo-deny aqua:rhysd/actionlint
           cache: true
 
       - name: Cache Cargo artifacts
@@ -51,6 +51,9 @@ jobs:
       # the documented Cargo gate semantics.
       - run: cargo fmt --all --check
       - run: taplo fmt --check
+      # release.yml runs on a tag, so a typo in it surfaces at the worst moment.
+      # actionlint checks expressions, runner labels, and action inputs here instead.
+      - run: actionlint
       - run: cargo check --workspace --all-targets
       # A workspace build unifies features across the graph, so a crate that uses a
       # feature it never declared still compiles anyway. Checking each package alone is

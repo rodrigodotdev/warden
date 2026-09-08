@@ -164,23 +164,29 @@ decision rather than a standing warning; remove it when SQLx ships a `sha2 0.11`
 dependency. `base64` is duplicated too, but only through `bollard`, a dev-dependency,
 so it never enters a release artifact and needs no exception.
 
+Warden's own license is **MIT** (ADR-0050), in `LICENSE` at the repository root and
+declared once as `[workspace.package] license = "MIT"`. `[licenses.private] ignore`
+is therefore `false`: cargo-deny checks the workspace's own crates against the same
+allowlist as its dependencies, so a member crate that omits `license.workspace = true`
+fails CI rather than passing in silence.
+
 `LICENSES/webpki-roots-1.0.9-CDLA-Permissive-2.0.txt` is the unmodified text
 distributed by that crate. It is a third-party redistribution notice, **not**
-Warden's project license. Today's distributable artifact is the source repository;
-there is no Dockerfile, Containerfile, or release archive yet. The architecture test
-compares its SHA-256 against the canonical crate text and parses future Dockerfile or
-Containerfile `COPY` instructions. A file passes only when the **final** build stage —
-the one a release artifact is built from, so a notice copied into a builder stage and
-discarded with it does not count — copies either `LICENSES` or that exact notice path
-to `/opt/warden/LICENSES`. A destination merely named `LICENSES`, an unrelated file
-under `LICENSES/`, and a non-normalized source such as `./LICENSES` all fail.
-Milestone 12 added no packaging, so no build file exercises that rule yet; section 12.5
-carries the obligation for whichever milestone adds the first one.
+Warden's project license, and the two ship side by side. The architecture test compares
+its SHA-256 against the canonical crate text and then guards both kinds of
+redistribution:
 
-> **PENDING:** the project license is not selected, which blocks the `deny.toml`
-> license allowlist. This is a product choice between Apache-2.0, with its patent
-> grant and common use in security infrastructure, and AGPL, which prevents
-> closed-source SaaS resale.
+- **Images.** It parses any Dockerfile or Containerfile `COPY` instruction. A file
+  passes only when the **final** build stage — the one a release artifact is built
+  from, so a notice copied into a builder stage and discarded with it does not count —
+  copies either `LICENSES` or that exact notice path to `/opt/warden/LICENSES`. A
+  destination merely named `LICENSES`, an unrelated file under `LICENSES/`, and a
+  non-normalized source such as `./LICENSES` all fail. No image exists yet; section
+  12.5 carries the obligation for whichever milestone adds the first one.
+- **Archives.** It finds every workflow that builds one — by the archiving command,
+  not by file name, so a second release workflow inherits the rule — and requires that
+  it stage both `LICENSE` and `LICENSES` into the staging directory. Section 12.7
+  describes the artifacts this produces.
 
 ## 3. Configuration
 
@@ -1080,16 +1086,22 @@ per-task panic containment (`docs/security.md` section 14) depends on unwinding.
 
 ### 12.4 Targets
 
-Linux x86_64, Linux aarch64, macOS aarch64, macOS x86_64 where worthwhile, Windows
-x86_64, and an OCI image. The selected SQL stack requires neither `libmysqlclient` nor
-`libpq`.
+Linux x86_64, Linux aarch64, macOS x86_64, macOS aarch64, and Windows x86_64 all
+ship as of v0.1.0. An OCI image does not yet. The selected SQL stack requires neither
+`libmysqlclient` nor `libpq`, which is what makes each of these a single self-contained
+executable.
+
+This list and `deny.toml`'s `[graph] targets` are the same list and change together. A
+published binary whose dependency graph the supply-chain check never resolved is a gap,
+not an omission.
 
 ### 12.5 Container
 
-**Milestone 12 ships no `Dockerfile`, `Containerfile`, or release archive.** The
-distributable artifact is still the source repository. This section is therefore a
-checklist for the day a container image appears, not a description of one that exists;
-read every requirement below as binding on that future image.
+**Warden ships no `Dockerfile` or `Containerfile`.** As of v0.1.0 the distributable
+artifacts are the release archives of section 12.7 and the source repository. This
+section is therefore a checklist for the day a container image appears, not a
+description of one that exists; read every requirement below as binding on that future
+image.
 
 Run as non-root; embed no secrets; use a read-only root filesystem where practical; a
 minimal image; explicit CA certificates; minimal egress; no shell in the final image
@@ -1113,3 +1125,52 @@ MCP clients -> authentication layer -> Warden -> MySQL/PostgreSQL replicas
 
 Do not expose database ports directly to developer machines merely to enable the AI
 workflow.
+
+### 12.7 Release artifacts
+
+A pushed `v*` tag is the only thing that publishes. `.github/workflows/release.yml`
+verifies, builds, checksums, attests, and creates the GitHub release; nothing is
+uploaded by hand.
+
+**The verify job runs first and gates the rest.** It refuses a tag whose name
+disagrees with the `warden` package version, refuses a version with no `## [x.y.z]`
+section in `CHANGELOG.md`, and re-runs `cargo fmt --check`, Clippy with warnings
+denied, and `cargo test --workspace`. A tag carries no required status check, so
+without this a release could be cut from a red commit. The container suite is not
+repeated: it already ran against the same commit in `ci.yml`, and repeating it would
+add forty minutes to every release.
+
+**One archive per target**, built with `--locked` so the binary comes from the
+committed `Cargo.lock` — the same graph cargo-deny resolved for that target. Linux and
+macOS build natively on runners of their own architecture; the x86_64 macOS binary is
+cross-compiled on the arm64 runner, which needs no cross linker because macOS ships
+both SDKs. The binary is **not** stripped: section 12.3 keeps the release profile
+untuned, and symbols are what make an operator's panic report actionable.
+
+| Asset | Contents |
+|---|---|
+| `warden-v<version>-<target>.tar.gz` | Linux and macOS: `warden`, `README.md`, `LICENSE`, `LICENSES/` |
+| `warden-v<version>-<target>.zip` | Windows: the same, with `warden.exe` |
+| `SHA256SUMS` | One line per asset, `sha256sum --check` format |
+
+Both licenses are in every archive, and `tests/architecture.rs` fails the build if the
+staging step stops copying either (section 2.7).
+
+**Every published file carries signed build provenance.** `SHA256SUMS` is a subject
+too, so the list of hashes cannot be swapped independently of what it lists. Verifying
+a download takes both steps:
+
+```bash
+sha256sum --check --ignore-missing SHA256SUMS
+gh attestation verify warden-v0.1.0-x86_64-unknown-linux-gnu.tar.gz \
+  --repo rodrigodotdev/warden
+```
+
+**`workflow_dispatch` builds and checksums the same artifacts without publishing.**
+Use it to exercise the pipeline before the release that depends on it; a release
+workflow whose first real run is the release itself is a workflow nobody has tested.
+
+Release notes come from the `CHANGELOG.md` section for that version, so the repository
+and the release page cannot describe the same version differently. Actions and runner
+image labels are pinned the same way `ci.yml` pins them, for the same OpenSSF Scorecard
+reason.
