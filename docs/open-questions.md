@@ -61,9 +61,18 @@ otherwise, none blocks M0–M5.
     PostgreSQL RLS state is still not exposed in schema metadata; Milestone 9 did not
     change that.
 
-12. **Which license?** This blocks the `deny.toml` license allowlist. Apache-2.0
-    provides a patent grant and is common for security infrastructure; AGPL prevents
-    closed-source SaaS resale. This is a product decision.
+12. **Resolved in v0.1.0 by ADR-0050 — which license?** The question framed the
+    choice as Apache-2.0, for its patent grant, against AGPL, which prevents
+    closed-source SaaS resale, and noted that it blocked the `deny.toml` license
+    allowlist. **MIT.** Warden holds no patents and expects none, so Apache-2.0's
+    grant guards a risk that does not exist while adding text to every downstream
+    legal review; AGPL's network-use clause would deter the internal deployment
+    Warden is built for in order to prevent a competitor it does not have. The
+    allowlist is unblocked in the other direction from the one the question assumed:
+    `[licenses.private] ignore = false` now checks Warden's own crates too, so a
+    member crate missing `license.workspace = true` fails CI. `LICENSE` ships inside
+    every release archive, enforced by
+    `every_release_archive_carries_both_licenses` in `tests/architecture.rs`.
 
 13. **Can `SchemaInspector` filter objects at the source without changing its
     signature?** No — **resolved in Milestone 9 by ADR-0036.** `docs/security.md`

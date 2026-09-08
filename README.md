@@ -345,6 +345,10 @@ decisions live in [`docs/adr/`](docs/adr/).
 
 ## License
 
-A license has not been selected yet; see
-[`docs/open-questions.md`](docs/open-questions.md), item 12. Until then, all rights
-reserved.
+[MIT](LICENSE), for the reasoning in
+[ADR-0050](docs/adr/0050-mit-license.md). Contributions arrive under the same terms;
+there is no CLA.
+
+Warden redistributes the Mozilla CCADB root store through `webpki-roots`, which carries
+a separate CDLA-Permissive-2.0 notice in [`LICENSES/`](LICENSES/). Both files ship
+inside every release archive.

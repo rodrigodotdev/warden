@@ -1,13 +1,17 @@
 # cargo-deny — docs/operations.md section 2.7
 #
-# The project license is not selected yet (docs/open-questions.md item 12).
-# `[licenses.private] ignore = true` keeps this check focused on dependencies,
-# where the current supply-chain risk resides.
+# Warden is MIT-licensed (ADR-0050), so `[licenses.private]` checks the workspace's
+# own crates against the same allowlist as its dependencies. That is what makes a
+# member crate missing `license.workspace = true` a CI failure rather than silence.
 
 [graph]
+# Every target a release artifact is published for (docs/operations.md section 12.4).
+# A shipped binary whose dependency graph this check never resolved is a supply-chain
+# gap, so this list and the release matrix change together.
 targets = [
   "x86_64-unknown-linux-gnu",
   "aarch64-unknown-linux-gnu",
+  "x86_64-apple-darwin",
   "aarch64-apple-darwin",
   "x86_64-pc-windows-msvc",
 ]
@@ -42,8 +46,10 @@ unused-allowed-license = "allow"
 exceptions = [{ crate = "webpki-roots@1.0.9", allow = ["CDLA-Permissive-2.0"] }]
 
 [licenses.private]
-# Workspace crates use `publish = false` and are not checked.
-ignore = true
+# Workspace crates use `publish = false`, but they are still checked: `ignore = false`
+# is what proves every member declares `license.workspace = true` and that the declared
+# license stays inside the allowlist above.
+ignore = false
 
 [bans]
 multiple-versions = "warn"
