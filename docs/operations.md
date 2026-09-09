@@ -1192,6 +1192,28 @@ untuned, and symbols are what make an operator's panic report actionable.
 | `warden-v<version>-<target>.zip` | Windows: the same, with `warden.exe` |
 | `SHA256SUMS` | One line per asset, `sha256sum --check` format |
 
+**A tag also publishes seven npm packages.** Five carry one prebuilt binary each and
+declare `os` and `cpu`, so npm installs exactly one; the sixth is `warden-db-mcp`, a
+launcher that names them as optional dependencies and execs whichever one is present.
+They are assembled from the archives above rather than from a separate build, so the
+binary on npm is the one the release page serves and the attestation covers, and each
+tarball is published with `npm publish --provenance`.
+
+A seventh package, `warden-sql-mcp`, is an alias: no binary and no logic, depending on
+the launcher at an exact version and calling its `main` in the same process. It is
+published and then deprecated with a message naming the canonical package, so it
+installs and runs while telling anyone who used it which name to prefer. It exists
+because that name in someone else's hands would be an MCP server installing itself next
+to database credentials, and npm's name-dispute policy protects a name that is used
+rather than one merely held. **Never give the launcher an `exports` field**: the alias
+reaches it through a deep path that an `exports` map would make unresolvable.
+
+**No package in that set declares a lifecycle script**, and `npm/test/shim.test.mjs`
+asserts it on every generated manifest. An install script that downloads or executes is
+the pattern this distribution exists to avoid; npm's own `os`/`cpu` resolution replaces
+it. `warden-mcp` was taken on npm by an unrelated package, which is why the canonical
+name is `warden-db-mcp`.
+
 Both licenses are in every archive, and `tests/architecture.rs` fails the build if the
 staging step stops copying either (section 2.7).
 

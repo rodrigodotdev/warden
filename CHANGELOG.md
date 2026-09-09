@@ -13,6 +13,12 @@ implementation details before `1.0` and change without notice (`SPEC.md` section
 
 ### Added
 
+- **npm distribution.** `npx -y warden-db-mcp` installs one prebuilt binary for the
+  platform and runs it, so an MCP client configuration needs no path to a downloaded
+  file. No package in the set declares an install script; npm resolves the platform
+  through `os` and `cpu` fields. Every tarball is published with npm provenance from
+  the same tag that publishes the release archives. `warden-sql-mcp` is published as a
+  deprecated alias of the same server, so the neighbouring name resolves to Warden.
 - **Onboarding subcommands.** `warden init` writes a starting configuration and
   refuses to overwrite one. `warden role` prints the least-privilege `CREATE ROLE` and
   `GRANT` statements for MySQL or PostgreSQL — the database role is the real write

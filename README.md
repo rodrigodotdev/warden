@@ -69,18 +69,25 @@ for both databases, so agents do not need separate MySQL and PostgreSQL tools.
 
 ### 1. Install Warden
 
-On macOS or Linux with [Homebrew](https://brew.sh):
+The quickest path, and the one an MCP client can run directly:
 
 ```bash
-brew install rodrigodotdev/tap/warden
+npx -y warden-db-mcp version
 ```
 
-Download the archive for your platform from the
-[latest release](https://github.com/rodrigodotdev/warden/releases/latest): Linux and
-macOS on x86_64 and arm64, Windows on x86_64. Each archive holds a single
-self-contained executable — no `libmysqlclient`, no `libpq`.
+That installs one prebuilt binary for your platform — Linux and macOS on x64 and arm64,
+Windows on x64 — and nothing else. The package declares **no install script**: npm picks
+the platform package through its `os` and `cpu` fields, so nothing is downloaded or
+executed while installing.
 
-Verify it before you run it. Every published file carries signed build provenance, and
+<details>
+<summary>Or download the release archive</summary>
+
+Download the archive for your platform from the
+[latest release](https://github.com/rodrigodotdev/warden/releases/latest). Each archive
+holds a single self-contained executable — no `libmysqlclient`, no `libpq`.
+
+Verify it before you run it — every published file carries signed build provenance, and
 `SHA256SUMS` is signed alongside the archives it lists:
 
 ```bash
@@ -90,7 +97,7 @@ gh attestation verify warden-v0.1.0-x86_64-unknown-linux-gnu.tar.gz \
 tar -xzf warden-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
 ```
 
-There is no container image yet.
+</details>
 
 <details>
 <summary>Or build from source</summary>
@@ -104,6 +111,9 @@ cargo build --locked --release
 ```
 
 </details>
+
+The Linux builds link glibc. On Alpine or another musl distribution, build from source.
+There is no container image yet.
 
 ### 2. Create `warden.toml`
 
@@ -164,12 +174,31 @@ a development machine; a real database keeps the default.
 
 ### 5. Connect your MCP client
 
+If you installed through npm, the client spawns Warden itself and needs no path to a
+binary:
+
+```json
+{
+  "mcpServers": {
+    "warden": {
+      "command": "npx",
+      "args": ["-y", "warden-db-mcp", "serve", "--config", "/absolute/path/to/warden.toml"]
+    }
+  }
+}
+```
+
+The `--config` path is still absolute: a client spawns its servers with an arbitrary
+working directory.
+
+With a binary on disk — Homebrew, the release archive, or a source build — let Warden
+write the block instead of typing two absolute paths:
+
 ```bash
 warden mcp-config
 ```
 
-That prints the block below with the real absolute paths already filled in — copy it
-into your client's MCP configuration:
+It prints the following with the real paths already resolved:
 
 ```json
 {
