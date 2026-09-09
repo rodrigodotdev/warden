@@ -1,0 +1,7 @@
+{
+  "name": "warden-npm-workspace",
+  "private": true,
+  "scripts": {
+    "test": "node --test test/"
+  }
+}
