@@ -295,3 +295,80 @@ jobs:
           branch="$(git rev-parse --abbrev-ref HEAD)"
           git push "https://x-access-token:${GH_TOKEN}@github.com/rodrigodotdev/homebrew-tap.git" \
             "HEAD:refs/heads/${branch}"
+
+  npm:
+    name: publish to npm
+    needs: [verify, build, publish]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      # npm provenance is signed with a short-lived OIDC identity, the same mechanism
+      # the build attestation uses.
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+
+      # The archives are the published artifacts, unchanged: the npm packages carry the
+      # same binaries the release page serves and the attestation covers.
+      - name: Unpack every archive
+        run: |
+          set -euo pipefail
+          mkdir -p unpacked
+          cd dist
+          for archive in *.tar.gz; do
+            tar -xzf "$archive" -C ../unpacked
+          done
+          for archive in *.zip; do
+            unzip -q "$archive" -d ../unpacked
+          done
+          ls -1 ../unpacked
+
+      - name: Assemble the packages
+        run: >
+          node npm/build.mjs
+          --version ${{ needs.verify.outputs.version }}
+          --archives unpacked
+          --out packages
+
+      # Publication order is dependency order. Platform packages first: the launcher
+      # names them as optional dependencies, and a launcher published before them
+      # resolves to nothing for anyone installing in the gap. The alias last, because
+      # it pins the launcher at this exact version.
+      #
+      # `--provenance` links each published tarball to this workflow run and this
+      # commit, the npm counterpart of the build attestation on the release assets.
+      - name: Publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          for package in packages/warden-db-mcp-*; do
+            npm publish "$package" --access public --provenance
+          done
+          npm publish packages/warden-db-mcp --access public --provenance
+          npm publish packages/warden-sql-mcp --access public --provenance
+
+      # The alias installs and runs; the deprecation is the signpost that says which
+      # name to use. Re-running it every release keeps the newest version marked too,
+      # since `npm deprecate` applies to the versions matching the range and a fresh
+      # publish is not deprecated by an earlier call.
+      - name: Signpost the alias
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          npm deprecate 'warden-sql-mcp@*' \
+            'This is an alias. Install warden-db-mcp; it is the same server.'
