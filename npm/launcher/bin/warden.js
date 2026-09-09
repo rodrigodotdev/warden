@@ -70,6 +70,16 @@ function main() {
         "warden: it is an optional dependency, so an install run with --no-optional or\n" +
         "warden: --omit=optional skips it. Reinstall without that flag.\n",
     );
+    // The platform packages declare `libc: ["glibc"]`, so a musl distribution is a
+    // second way to reach this branch: npm skipped the optional dependency on purpose
+    // rather than being told to.
+    if (platform === "linux") {
+      process.stderr.write(
+        "warden: on Alpine or another musl distribution it is skipped by design — the\n" +
+          "warden: Linux builds link glibc. Build from source:\n" +
+          "warden: https://github.com/rodrigodotdev/warden\n",
+      );
+    }
     process.exit(1);
   }
 
@@ -80,6 +90,16 @@ function main() {
 
   if (result.error) {
     process.stderr.write(`warden: ${path.basename(binary)} could not be started: ${result.error.message}\n`);
+    // A binary that resolved but will not start is, on Linux, almost always a glibc
+    // build on a musl distribution: the kernel reports the missing loader as ENOENT
+    // for the executable itself, which reads as "the file is not there" when the file
+    // plainly is. Say so here rather than leaving the operator to decode it.
+    if (platform === "linux") {
+      process.stderr.write(
+        "warden: on Alpine or another musl distribution this is expected — the Linux\n" +
+          "warden: builds link glibc. Build from source: https://github.com/rodrigodotdev/warden\n",
+      );
+    }
     process.exit(1);
   }
   // A child killed by a signal reports a null status. Exit non-zero rather than

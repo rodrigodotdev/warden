@@ -20,9 +20,17 @@ policy-checked before it runs, and only a single `SELECT` can reach execution.
 }
 ```
 
-Run `npx -y warden-db-mcp init` to write a starting configuration and
-`npx -y warden-db-mcp role --dialect postgresql --user warden_ro --database app` to
-print the least-privilege grant that Warden requires.
+Before an agent points at it, check the configuration:
+
+```bash
+npx -y warden-db-mcp check --config /absolute/path/to/warden.toml
+```
+
+`check` validates the file and probes every connection, so a bad DSN or a missing
+read-only grant surfaces as an error you can read rather than as a failing tool call.
+`npx -y warden-db-mcp version` reports which build is installed, and
+`npx -y warden-db-mcp help` lists the whole command surface: `serve`, `check`,
+`version`, `help`.
 
 ## What this package contains
 

@@ -67,6 +67,9 @@ for (const target of selected) {
   // and the failure surfaces as EACCES from the launcher rather than as a bad package.
   fs.chmodSync(binary, 0o755);
   copyLicenses(staged, destination);
+  // One shared page for all five, so npmjs.com does not render a blank listing for a
+  // security product. It says what the package is and points at the one to install.
+  fs.copyFileSync(path.join(HERE, "platform", "README.md"), path.join(destination, "README.md"));
 
   fs.writeFileSync(
     path.join(destination, "package.json"),
@@ -77,9 +80,17 @@ for (const target of selected) {
         description: `Warden binary for ${target.platform} ${target.arch}. Installed automatically by ${LAUNCHER_PACKAGE}.`,
         license: "MIT",
         repository: { type: "git", url: `git+${REPOSITORY}.git` },
+        homepage: REPOSITORY,
+        bugs: { url: `${REPOSITORY}/issues` },
         os: [target.platform],
         cpu: [target.arch],
-        files: ["bin/", "LICENSE", "LICENSES/"],
+        // The Linux binaries link glibc. Without this, npm installs the package on
+        // Alpine — `os` and `cpu` both match — and `spawnSync` then fails with ENOENT
+        // for the missing loader, which reads as a missing file. npm 10.4 and later,
+        // pnpm, and Yarn all honour `libc`, so the optional dependency is skipped
+        // instead and the launcher's own "is not installed" message is what appears.
+        ...(target.platform === "linux" ? { libc: ["glibc"] } : {}),
+        files: ["bin/", "README.md", "LICENSE", "LICENSES/"],
         preferUnplugged: true,
       },
       null,
