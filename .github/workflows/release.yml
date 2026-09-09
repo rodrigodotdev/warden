@@ -269,14 +269,18 @@ jobs:
       # A fine-grained token scoped to the tap alone: GITHUB_TOKEN cannot push to
       # another repository, and a broader token would put this one at risk for a
       # formula bump.
+      #
+      # The clone stays anonymous — the tap is public — and the token is supplied
+      # only on the `git push` command line, never on `git clone`. A tokenized
+      # clone URL is written verbatim into tap/.git/config, leaving the PAT in
+      # plaintext on disk for the rest of the job.
       - name: Commit it to the tap
         env:
           GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           VERSION: ${{ needs.verify.outputs.version }}
         run: |
           set -euo pipefail
-          git clone --depth 1 \
-            "https://x-access-token:${GH_TOKEN}@github.com/rodrigodotdev/homebrew-tap.git" tap
+          git clone --depth 1 https://github.com/rodrigodotdev/homebrew-tap.git tap
           mkdir -p tap/Formula
           cp warden.rb tap/Formula/warden.rb
           cd tap
@@ -288,4 +292,6 @@ jobs:
             exit 0
           fi
           git commit -m "warden ${VERSION}"
-          git push
+          branch="$(git rev-parse --abbrev-ref HEAD)"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/rodrigodotdev/homebrew-tap.git" \
+            "HEAD:refs/heads/${branch}"
