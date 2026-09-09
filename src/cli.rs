@@ -49,6 +49,11 @@ pub(crate) enum Command {
         /// The configuration file to read.
         config: PathBuf,
     },
+    /// Write a starting configuration file.
+    Init {
+        /// The path to create. Never overwritten.
+        config: PathBuf,
+    },
 }
 
 /// The transports `warden serve` can carry MCP over.
@@ -173,6 +178,7 @@ where
         "help" | "--help" | "-h" => Ok(Command::Help),
         "serve" => parse_serve(args),
         "check" => parse_check(args),
+        "init" => parse_init(args),
         // The subcommand position holds a bare word, and a bare word is as likely to be a
         // pasted secret as a typo. Only a near miss of a name Warden itself defines is
         // quoted back; anything further away is refused without being repeated.
@@ -186,7 +192,7 @@ where
 /// The flag spellings (`--version`, `-h`) are deliberately absent: they are flag-shaped,
 /// so a typo of one is already quotable through [`is_flag_shaped`] when it reaches a
 /// subcommand's flag loop, and a near miss of `-h` is one edit from most short words.
-const COMMANDS: [&str; 4] = ["serve", "check", "version", "help"];
+const COMMANDS: [&str; 5] = ["serve", "check", "init", "version", "help"];
 
 /// The transport names Warden itself defines, for the same near-miss reporting.
 ///
@@ -234,6 +240,30 @@ where
     }
 
     Ok(Command::Check {
+        config: config.unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH)),
+    })
+}
+
+/// Parses `init`'s `--config`.
+///
+/// The same flag `serve` and `check` read, so the three commands name one file the
+/// same way: `warden init --config /etc/warden.toml` then
+/// `warden check --config /etc/warden.toml`.
+fn parse_init<I>(mut args: I) -> Result<Command, CliError>
+where
+    I: Iterator<Item = String>,
+{
+    let mut config = None;
+
+    while let Some(argument) = args.next() {
+        let (flag, inline) = split_inline_value(&argument);
+        match flag {
+            "--config" => config = Some(PathBuf::from(value_of("--config", inline, &mut args)?)),
+            unknown => return Err(unknown_argument(unknown)),
+        }
+    }
+
+    Ok(Command::Init {
         config: config.unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH)),
     })
 }
@@ -380,10 +410,12 @@ pub(crate) fn run(command: Command, out: &mut dyn Write) -> io::Result<()> {
     match command {
         Command::Version => writeln!(out, "warden {}", env!("CARGO_PKG_VERSION")),
         Command::Help => write!(out, "{HELP}"),
-        Command::Serve { .. } | Command::Check { .. } => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "`serve` and `check` require the runtime that `main` owns",
-        )),
+        Command::Serve { .. } | Command::Check { .. } | Command::Init { .. } => {
+            Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "`serve`, `check`, and `init` are executed by `main`",
+            ))
+        }
     }
 }
 
@@ -396,6 +428,7 @@ USAGE:
 COMMANDS:
     serve      Serve the MCP tools over the selected transport
     check      Validate the configuration and probe every connection
+    init       Write a starting configuration file
     version    Show the version
     help       Show this message
 
@@ -723,6 +756,32 @@ mod tests {
         ] {
             assert!(text.contains(expected), "help omits {expected}:\n{text}");
         }
+    }
+
+    #[test]
+    fn parses_init_with_and_without_a_config_path() {
+        assert_eq!(
+            parse(args(&["init"])).unwrap(),
+            Command::Init {
+                config: PathBuf::from(DEFAULT_CONFIG_PATH)
+            }
+        );
+        assert_eq!(
+            parse(args(&["init", "--config", "/etc/warden.toml"])).unwrap(),
+            Command::Init {
+                config: PathBuf::from("/etc/warden.toml")
+            }
+        );
+    }
+
+    #[test]
+    fn init_refuses_a_flag_it_does_not_define() {
+        assert_eq!(
+            parse(args(&["init", "--transport", "stdio"])),
+            Err(CliError::UnknownFlag {
+                flag: "--transport".to_owned()
+            })
+        );
     }
 
     #[test]

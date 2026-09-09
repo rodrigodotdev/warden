@@ -126,6 +126,56 @@ fn write_temp_config(contents: &str) -> PathBuf {
     path
 }
 
+/// Creates a unique, empty directory under the system temporary directory.
+///
+/// `init` needs a directory rather than a bare file path so the test can remove
+/// everything it created in one call; a name carrying the process id and a counter
+/// keeps concurrent test binaries from colliding, the same scheme `write_temp_config`
+/// uses for its file names.
+fn unique_temp_dir(label: &str) -> PathBuf {
+    static NEXT: AtomicU32 = AtomicU32::new(0);
+
+    let directory = std::env::temp_dir().join(format!(
+        "warden-{label}-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&directory).expect("failed to create the temporary directory");
+    directory
+}
+
+#[test]
+fn init_writes_a_configuration_that_does_not_exist_yet() {
+    let directory = unique_temp_dir("init");
+    let path = directory.join("warden.toml");
+
+    let output = warden(&["init", "--config", path.to_str().unwrap()]);
+
+    assert!(output.status.success(), "{output:?}");
+    let written = std::fs::read_to_string(&path).unwrap();
+    assert!(written.contains("dsn_env"), "{written}");
+    // Diagnostics belong on stderr; stdout stays a protocol stream.
+    assert!(output.stdout.is_empty(), "{output:?}");
+    assert!(!output.stderr.is_empty(), "{output:?}");
+
+    std::fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn init_refuses_to_overwrite_an_existing_configuration() {
+    let directory = unique_temp_dir("init-exists");
+    let path = directory.join("warden.toml");
+    std::fs::write(&path, "version = 1\n").unwrap();
+
+    let output = warden(&["init", "--config", path.to_str().unwrap()]);
+
+    assert!(!output.status.success(), "{output:?}");
+    // The operator's file is untouched: refusing is what makes `init` safe to re-run.
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "version = 1\n");
+
+    std::fs::remove_dir_all(&directory).unwrap();
+}
+
 #[test]
 fn an_unusable_configuration_fails_serve_with_a_diagnostic_and_a_silent_stdout() {
     // stdout is the MCP transport. A startup failure that printed to it would corrupt

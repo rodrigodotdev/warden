@@ -7,6 +7,7 @@
 mod audit;
 mod check;
 mod cli;
+mod onboarding;
 mod panic;
 mod startup;
 
@@ -53,6 +54,7 @@ fn main() -> ExitCode {
     match command {
         Command::Serve { config, transport } => report(block_on(run_serve(&config, transport))),
         Command::Check { config } => report(block_on(run_check(&config))),
+        Command::Init { config } => run_init(&config),
         immediate => run_immediate(immediate),
     }
 }
@@ -139,6 +141,57 @@ async fn run_check(config: &Path) -> Result<ExitCode> {
     // A warning describes a deployment an operator may have chosen; only a failed check
     // is a non-zero exit.
     Ok(ExitCode::SUCCESS)
+}
+
+/// Writes a starting configuration, refusing to touch a file that already exists.
+///
+/// `create_new` is the whole safety property: `warden init` is a command an operator
+/// may run twice, and the second run must not silently replace an edited file. The
+/// confirmation goes to stderr because stdout is reserved for MCP.
+fn run_init(config: &Path) -> ExitCode {
+    let mut stderr = io::stderr().lock();
+
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(config)
+    {
+        Ok(mut file) => match file.write_all(onboarding::config_template().as_bytes()) {
+            Ok(()) => {
+                let _ = writeln!(stderr, "warden: wrote {}", config.display());
+                let _ = writeln!(
+                    stderr,
+                    "warden: edit it, then run `warden check --config {}`",
+                    config.display()
+                );
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                let _ = writeln!(
+                    stderr,
+                    "warden: {} could not be written: {error}",
+                    config.display()
+                );
+                ExitCode::FAILURE
+            }
+        },
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let _ = writeln!(
+                stderr,
+                "warden: {} already exists and was left unchanged",
+                config.display()
+            );
+            ExitCode::FAILURE
+        }
+        Err(error) => {
+            let _ = writeln!(
+                stderr,
+                "warden: {} could not be created: {error}",
+                config.display()
+            );
+            ExitCode::FAILURE
+        }
+    }
 }
 
 /// Waits for `SIGINT` or, on Unix, `SIGTERM`.
