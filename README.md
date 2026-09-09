@@ -69,6 +69,12 @@ for both databases, so agents do not need separate MySQL and PostgreSQL tools.
 
 ### 1. Install Warden
 
+On macOS or Linux with [Homebrew](https://brew.sh):
+
+```bash
+brew install rodrigodotdev/tap/warden
+```
+
 Download the archive for your platform from the
 [latest release](https://github.com/rodrigodotdev/warden/releases/latest): Linux and
 macOS on x86_64 and arm64, Windows on x86_64. Each archive holds a single

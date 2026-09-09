@@ -23,6 +23,10 @@ implementation details before `1.0` and change without notice (`SPEC.md` section
   and configuration paths already resolved absolutely — including a `warden.toml` that
   does not exist yet — which is what an MCP client needs because it spawns servers with
   an arbitrary working directory.
+- **Homebrew tap.** `brew install rodrigodotdev/tap/warden` installs Warden on macOS
+  and Linux, on both x86_64 and arm64. Every tag renders the formula from the
+  release's own `SHA256SUMS` and pushes it, so the tap cannot describe a version that
+  was never published.
 
 ## [0.1.0] - 2026-09-08
 

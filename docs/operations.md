@@ -1195,6 +1195,21 @@ untuned, and symbols are what make an operator's panic report actionable.
 Both licenses are in every archive, and `tests/architecture.rs` fails the build if the
 staging step stops copying either (section 2.7).
 
+**A tag also updates the Homebrew tap.** `rodrigodotdev/homebrew-tap` holds one
+formula, `Formula/warden.rb`, rendered by `packaging/homebrew/render.sh` from the
+template in this repository and the release's own `SHA256SUMS`. Checksums are read from
+that published manifest rather than recomputed from a fresh download: it is what the
+release signed, and a second computation is a second chance to describe something other
+than what was published. A missing entry fails the render rather than producing a
+formula with a blank `sha256`.
+
+The formula covers the four unix archives. Homebrew installs no Windows binary, and
+`packaging/homebrew/test-render.sh` — which the gate runs on every pull request —
+asserts that the Windows asset never appears in the rendering.
+
+**Do not edit the formula in the tap.** The next tag overwrites it. Fix
+`packaging/homebrew/warden.rb.template` here and cut a tag.
+
 **Every published file carries signed build provenance.** `SHA256SUMS` is a subject
 too, so the list of hashes cannot be swapped independently of what it lists. Verifying
 a download takes both steps:
