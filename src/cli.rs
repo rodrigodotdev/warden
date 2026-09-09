@@ -11,6 +11,8 @@ use std::fmt;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
+use warden_core::dialect::Dialect;
+
 /// Exit code for command-line usage errors.
 ///
 /// Bash and GNU coreutils conventionally use 2 for incorrect usage. This is not
@@ -53,6 +55,17 @@ pub(crate) enum Command {
     Init {
         /// The path to create. Never overwritten.
         config: PathBuf,
+    },
+    /// Print the SQL that creates Warden's dedicated read-only role.
+    Role {
+        /// The engine whose grant syntax to render.
+        dialect: Dialect,
+        /// The role or user to create. A validated bare identifier.
+        user: String,
+        /// The database or catalog to grant on. A validated bare identifier.
+        database: String,
+        /// PostgreSQL's schema. Ignored on MySQL, whose schema is the database.
+        schema: String,
     },
 }
 
@@ -119,6 +132,20 @@ pub(crate) enum CliError {
     /// string, which is why the value is dropped rather than repeated into whatever
     /// collects stderr.
     UnquotableTransport,
+    /// A name that cannot be written into SQL unquoted.
+    ///
+    /// Carries the flag — Warden's own literal — and never the value, which is the
+    /// rule the whole type exists for: an identifier that fails this check is
+    /// precisely the kind of string nobody wants echoed into a log.
+    InvalidIdentifier {
+        /// The flag whose value was refused. One of Warden's own literals.
+        flag: &'static str,
+    },
+    /// `--dialect` named an engine Warden does not implement.
+    ///
+    /// The value is dropped rather than quoted: this slot takes a bare word, and a
+    /// bare word on this command line can be a password.
+    UnknownDialect,
 }
 
 impl fmt::Display for CliError {
@@ -153,6 +180,12 @@ impl fmt::Display for CliError {
                      and the HTTP transport arrives in Milestone 14"
                 )
             }
+            Self::InvalidIdentifier { flag } => write!(
+                f,
+                "{flag} must be a plain SQL name: a letter or underscore, then letters, \
+                 digits, and underscores, at most 63 characters"
+            ),
+            Self::UnknownDialect => f.write_str("--dialect must be `mysql` or `postgresql`"),
         }
     }
 }
@@ -179,6 +212,7 @@ where
         "serve" => parse_serve(args),
         "check" => parse_check(args),
         "init" => parse_init(args),
+        "role" => parse_role(args),
         // The subcommand position holds a bare word, and a bare word is as likely to be a
         // pasted secret as a typo. Only a near miss of a name Warden itself defines is
         // quoted back; anything further away is refused without being repeated.
@@ -192,7 +226,7 @@ where
 /// The flag spellings (`--version`, `-h`) are deliberately absent: they are flag-shaped,
 /// so a typo of one is already quotable through [`is_flag_shaped`] when it reaches a
 /// subcommand's flag loop, and a near miss of `-h` is one edit from most short words.
-const COMMANDS: [&str; 5] = ["serve", "check", "init", "version", "help"];
+const COMMANDS: [&str; 6] = ["serve", "check", "init", "role", "version", "help"];
 
 /// The transport names Warden itself defines, for the same near-miss reporting.
 ///
@@ -266,6 +300,56 @@ where
     Ok(Command::Init {
         config: config.unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH)),
     })
+}
+
+/// Parses `role`'s four flags.
+///
+/// `--dialect`, `--user`, and `--database` are required; `--schema` defaults to
+/// `public` and is PostgreSQL's alone. The identifier check runs here rather than in
+/// `onboarding::role_sql` so an invalid name is a usage error with an exit code,
+/// rather than something the rendering has to defend against.
+fn parse_role<I>(mut args: I) -> Result<Command, CliError>
+where
+    I: Iterator<Item = String>,
+{
+    let mut dialect = None;
+    let mut user = None;
+    let mut database = None;
+    let mut schema = None;
+
+    while let Some(argument) = args.next() {
+        let (flag, inline) = split_inline_value(&argument);
+        match flag {
+            "--dialect" => {
+                let value = value_of("--dialect", inline, &mut args)?;
+                dialect = Some(value.parse().map_err(|_| CliError::UnknownDialect)?);
+            }
+            "--user" => user = Some(identifier("--user", inline, &mut args)?),
+            "--database" => database = Some(identifier("--database", inline, &mut args)?),
+            "--schema" => schema = Some(identifier("--schema", inline, &mut args)?),
+            unknown => return Err(unknown_argument(unknown)),
+        }
+    }
+
+    Ok(Command::Role {
+        dialect: dialect.ok_or(CliError::MissingValue { flag: "--dialect" })?,
+        user: user.ok_or(CliError::MissingValue { flag: "--user" })?,
+        database: database.ok_or(CliError::MissingValue { flag: "--database" })?,
+        schema: schema.unwrap_or_else(|| "public".to_owned()),
+    })
+}
+
+/// Takes a flag's value and requires it to be a plain SQL identifier.
+fn identifier<I>(flag: &'static str, inline: Option<&str>, args: &mut I) -> Result<String, CliError>
+where
+    I: Iterator<Item = String>,
+{
+    let value = value_of(flag, inline, args)?;
+    if crate::onboarding::validate_identifier(&value) {
+        Ok(value)
+    } else {
+        Err(CliError::InvalidIdentifier { flag })
+    }
 }
 
 /// Takes a flag's value from `--flag=value` or from the argument after it.
@@ -410,6 +494,16 @@ pub(crate) fn run(command: Command, out: &mut dyn Write) -> io::Result<()> {
     match command {
         Command::Version => writeln!(out, "warden {}", env!("CARGO_PKG_VERSION")),
         Command::Help => write!(out, "{HELP}"),
+        Command::Role {
+            dialect,
+            user,
+            database,
+            schema,
+        } => write!(
+            out,
+            "{}",
+            crate::onboarding::role_sql(dialect, &user, &database, &schema)
+        ),
         Command::Serve { .. } | Command::Check { .. } | Command::Init { .. } => {
             Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -429,12 +523,17 @@ COMMANDS:
     serve      Serve the MCP tools over the selected transport
     check      Validate the configuration and probe every connection
     init       Write a starting configuration file
+    role       Print the SQL for Warden's dedicated read-only role
     version    Show the version
     help       Show this message
 
 FLAGS:
     --config <path>         Configuration file (default: warden.toml)
     --transport <name>      Transport for `serve` (default: stdio)
+    --dialect <name>        Engine for `role` (mysql or postgresql)
+    --user <name>           Role to create, for `role`
+    --database <name>       Database to grant on, for `role`
+    --schema <name>         PostgreSQL schema for `role` (default: public)
 ";
 
 #[cfg(test)]
@@ -782,6 +881,70 @@ mod tests {
                 flag: "--transport".to_owned()
             })
         );
+    }
+
+    #[test]
+    fn parses_role_with_every_flag_and_the_schema_default() {
+        assert_eq!(
+            parse(args(&[
+                "role",
+                "--dialect",
+                "postgresql",
+                "--user",
+                "warden_ro",
+                "--database",
+                "app"
+            ]))
+            .unwrap(),
+            Command::Role {
+                dialect: Dialect::PostgreSql,
+                user: "warden_ro".to_owned(),
+                database: "app".to_owned(),
+                schema: "public".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn role_requires_a_user_and_a_database() {
+        assert_eq!(
+            parse(args(&[
+                "role",
+                "--dialect",
+                "postgresql",
+                "--database",
+                "app"
+            ])),
+            Err(CliError::MissingValue { flag: "--user" })
+        );
+        assert_eq!(
+            parse(args(&[
+                "role",
+                "--dialect",
+                "postgresql",
+                "--user",
+                "warden_ro"
+            ])),
+            Err(CliError::MissingValue { flag: "--database" })
+        );
+    }
+
+    #[test]
+    fn role_refuses_an_identifier_it_cannot_write_unquoted_without_echoing_it() {
+        let refused = parse(args(&[
+            "role",
+            "--dialect",
+            "postgresql",
+            "--user",
+            "warden_ro; DROP TABLE users --",
+            "--database",
+            "app",
+        ]));
+        assert_eq!(refused, Err(CliError::InvalidIdentifier { flag: "--user" }));
+        // The rule the whole error type exists for: an operator's value is never
+        // repeated into whatever collects stderr.
+        let message = format!("{}", refused.unwrap_err());
+        assert!(!message.contains("DROP TABLE"), "{message}");
     }
 
     #[test]

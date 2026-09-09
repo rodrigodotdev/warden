@@ -302,3 +302,42 @@ path = "{}"
 fn an_unknown_subcommand_still_exits_with_the_usage_code() {
     assert_eq!(warden(&["serv"]).status.code(), Some(2));
 }
+
+#[test]
+fn role_prints_sql_on_stdout_so_it_can_be_piped_into_a_database_console() {
+    let output = warden(&[
+        "role",
+        "--dialect",
+        "postgresql",
+        "--user",
+        "warden_ro",
+        "--database",
+        "app",
+    ]);
+
+    assert!(output.status.success(), "{output:?}");
+    let sql = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        sql.contains("GRANT SELECT ON ALL TABLES IN SCHEMA public TO warden_ro;"),
+        "{sql}"
+    );
+    assert!(output.stderr.is_empty(), "stderr should be silent");
+}
+
+#[test]
+fn role_refuses_a_hostile_identifier_with_the_usage_code() {
+    let output = warden(&[
+        "role",
+        "--dialect",
+        "postgresql",
+        "--user",
+        "warden_ro; DROP TABLE users --",
+        "--database",
+        "app",
+    ]);
+
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(!stderr.contains("DROP TABLE"), "{stderr}");
+}
