@@ -58,6 +58,9 @@ jobs:
       # `-shellcheck` is named rather than left to auto-detection so this step and
       # `mise run lint:actions` run the same pinned binary over the same `run` blocks.
       - run: actionlint -shellcheck shellcheck
+      # The formula is rendered on a tag, which is the worst moment to find that the
+      # renderer is broken. Its own test needs no Homebrew and no network.
+      - run: ./packaging/homebrew/test-render.sh
       - run: cargo check --workspace --all-targets
       # A workspace build unifies features across the graph, so a crate that uses a
       # feature it never declared still compiles anyway. Checking each package alone is
