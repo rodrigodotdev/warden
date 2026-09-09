@@ -101,28 +101,13 @@ cargo build --locked --release
 
 ### 2. Create `warden.toml`
 
-Every optional setting falls back to a hardened default, so this is a complete
-configuration:
-
-```toml
-version = 1
-
-[[connections]]
-name = "orders-replica"
-dialect = "postgresql"
-environment = "development"
-database = "app"
-dsn_env = "WARDEN_ORDERS_REPLICA_DSN"
-search_path = ["app", "public"]
-policy = "default"
-
-[policies.default]
-query_timeout = "5s"
-max_rows = 200
-
-[redaction]
-columns = ["*.password_hash", "*.access_token"]
+```bash
+warden init
 ```
+
+That writes a starting configuration and refuses to touch one that already exists.
+Open it and set `name`, `dialect`, `database`, and the environment variable name in
+`dsn_env`.
 
 Warden never reads a DSN from this file. `dsn_env` names the environment variable that
 holds it; `dsn_file` names a secret file instead.
@@ -138,12 +123,25 @@ A DSN describes only the connection target: scheme, host, user, database, and op
 a port and password. It cannot contain a query string. TLS and every other behavior are
 configured explicitly by Warden.
 
-### 3. Validate the deployment
+### 3. Create the read-only database role
+
+This role, not Warden, is the write boundary. Print the statements, **read them**, set a
+real password, and run them as an administrator:
 
 ```bash
-export WARDEN_ORDERS_REPLICA_DSN='postgres://warden_ro:...@localhost:5432/app'
+warden role --dialect postgresql --user warden_ro --database app
+```
 
-target/release/warden check
+The output grants `SELECT` and nothing else, and on PostgreSQL also sets
+`default_transaction_read_only` on the role, so the session refuses a write even with
+every Warden layer removed.
+
+### 4. Validate the deployment
+
+```bash
+export WARDEN_LOCAL_DSN='postgres://warden_ro:...@localhost:5432/app'
+
+warden check
 ```
 
 `warden check` follows the same startup path as `warden serve`, without accepting MCP
@@ -154,26 +152,28 @@ agent SQL.
 The report goes to stderr because stdout is reserved for MCP. Exit code `0` means the
 deployment is ready; warnings remain warnings and do not change that exit code.
 
-### 4. Connect your MCP client
+### 5. Connect your MCP client
 
-Use the absolute path to the binary in your client's MCP configuration:
+```bash
+warden mcp-config
+```
+
+That prints the block below with the real absolute paths already filled in — copy it
+into your client's MCP configuration:
 
 ```json
 {
   "mcpServers": {
     "warden": {
-      "command": "/absolute/path/to/warden/target/release/warden",
-      "args": [
-        "serve",
-        "--transport",
-        "stdio",
-        "--config",
-        "/absolute/path/to/warden/warden.toml"
-      ]
+      "command": "/absolute/path/to/warden",
+      "args": ["serve", "--transport", "stdio", "--config", "/absolute/path/to/warden.toml"]
     }
   }
 }
 ```
+
+Both paths are absolute on purpose: a client spawns its servers with an arbitrary
+working directory, so a relative `warden.toml` will not resolve.
 
 The client process must inherit the environment variable named by `dsn_env`, or be able
 to read the file named by `dsn_file`. Do not paste a DSN into the MCP configuration.
@@ -184,7 +184,7 @@ to read the file named by `dsn_file`. Do not paste a DSN into the MCP configurat
 > authenticated remote transport required for a production deployment arrives in
 > Milestone 14 and is not available yet.
 
-### 5. Give your agent a useful first task
+### 6. Give your agent a useful first task
 
 This prompt demonstrates the intended discovery flow without encouraging the agent to
 guess schema details:

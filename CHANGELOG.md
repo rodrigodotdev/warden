@@ -11,7 +11,15 @@ implementation details before `1.0` and change without notice (`SPEC.md` section
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- **Onboarding subcommands.** `warden init` writes a starting configuration and
+  refuses to overwrite one. `warden role` prints the least-privilege `CREATE ROLE` and
+  `GRANT` statements for MySQL or PostgreSQL — the database role is the real write
+  boundary, and until now nothing helped an operator create it. `warden mcp-config`
+  prints the MCP client block with the binary and configuration paths already resolved
+  absolutely, which is what an MCP client needs because it spawns servers with an
+  arbitrary working directory.
 
 ## [0.1.0] - 2026-09-08
 

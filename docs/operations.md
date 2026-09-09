@@ -965,13 +965,27 @@ fixed, safe adapter query through `control_pool`.
 warden serve --transport stdio    # shipped in Milestone 12
 warden serve --transport http     # Milestone 14; parsed and refused by name today
 warden check                      # shipped in Milestone 12
+warden init
+warden role --dialect <mysql|postgresql> --user <name> --database <name>
+warden mcp-config
 warden version
 warden help
 ```
 
-`--config <path>` selects the configuration file for `serve` and `check`, and defaults to
-`warden.toml` in the working directory. `--transport http` is not silently ignored: it
-parses and exits with the usage code, naming the transport this build does not serve.
+`--config <path>` selects the configuration file for `serve`, `check`, and
+`mcp-config`, and defaults to `warden.toml` in the working directory; `init` takes the
+same flag to choose where it writes instead. `--transport http` is not silently
+ignored: it parses and exits with the usage code, naming the transport this build does
+not serve.
+
+- `warden init [--config <path>]` writes a starting configuration and refuses to
+  overwrite one that already exists; the confirmation goes to stderr.
+- `warden role --dialect <mysql|postgresql> --user <name> --database <name> [--schema
+  <name>]` prints the least-privilege `CREATE ROLE`/`GRANT` statements on stdout, for
+  piping into a database console. Identifiers must be plain SQL names.
+- `warden mcp-config [--name <name>] [--config <path>]` prints the MCP client
+  configuration block on stdout with the binary and configuration paths resolved
+  absolutely.
 
 `warden check` is everything `warden serve` would do, minus serving. It loads and
 validates the configuration, resolves every secret reference, opens and drops the
