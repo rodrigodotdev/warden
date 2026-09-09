@@ -43,3 +43,8 @@ export const TARGETS = [
 ];
 
 export const LAUNCHER_PACKAGE = "warden-db-mcp";
+
+// The neighbouring name, published as a working alias rather than left for someone
+// else. An MCP server that installs itself next to database credentials is a name
+// worth holding, and npm's dispute policy only protects a name that is actually used.
+export const ALIAS_PACKAGE = "warden-sql-mcp";

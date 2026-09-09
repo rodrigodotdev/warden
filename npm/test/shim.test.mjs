@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 
-import { TARGETS } from "../targets.mjs";
+import { ALIAS_PACKAGE, TARGETS } from "../targets.mjs";
 
 // The shim is CommonJS so it can use `require.resolve` to find the platform package.
 const require = createRequire(import.meta.url);
@@ -101,6 +101,46 @@ test("a unix binary is assembled executable", { skip: process.platform === "win3
   // npm preserves the mode from the tarball. A binary published 0644 cannot be run.
   const mode = fs.statSync(path.join(out, target.package, "bin", target.binary)).mode;
   assert.equal(mode & 0o111, 0o111, "the binary must be executable");
+
+  fs.rmSync(work, { recursive: true, force: true });
+});
+
+test("the alias pins the launcher exactly and carries no logic", () => {
+  const work = fs.mkdtempSync(path.join(os.tmpdir(), "warden-npm-alias-"));
+  const archives = path.join(work, "archives");
+  const out = path.join(work, "out");
+
+  for (const target of TARGETS) {
+    const staged = path.join(archives, `warden-v9.9.9-${target.rustTarget}`);
+    fs.mkdirSync(staged, { recursive: true });
+    fs.writeFileSync(path.join(staged, target.binary), "#!/bin/sh\nexit 0\n");
+    fs.writeFileSync(path.join(staged, "LICENSE"), "MIT\n");
+    fs.mkdirSync(path.join(staged, "LICENSES"), { recursive: true });
+    fs.writeFileSync(path.join(staged, "LICENSES", "notice.txt"), "notice\n");
+  }
+
+  execFileSync(process.execPath, [
+    path.join(import.meta.dirname, "..", "build.mjs"),
+    "--version", "9.9.9",
+    "--archives", archives,
+    "--out", out,
+  ]);
+
+  const alias = JSON.parse(
+    fs.readFileSync(path.join(out, ALIAS_PACKAGE, "package.json"), "utf8"),
+  );
+
+  assert.equal(alias.name, ALIAS_PACKAGE);
+  assert.equal(alias.version, "9.9.9");
+  // Exact, not a range: an alias that resolves to "whatever is newest" contradicts a
+  // repository that pins action SHAs and builds with `--locked`.
+  assert.equal(alias.dependencies["warden-db-mcp"], "9.9.9");
+  assert.equal(alias.scripts, undefined, "the alias must declare no scripts");
+  assert.equal(alias.optionalDependencies, undefined, "the launcher owns the binaries");
+  assert.equal(alias.bin.warden, "bin/warden.js");
+
+  // It carries no binary of its own — that is the whole point of an alias.
+  assert.ok(!fs.existsSync(path.join(out, ALIAS_PACKAGE, "bin", "warden")));
 
   fs.rmSync(work, { recursive: true, force: true });
 });

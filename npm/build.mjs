@@ -13,7 +13,7 @@ import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
 
-import { LAUNCHER_PACKAGE, TARGETS } from "./targets.mjs";
+import { ALIAS_PACKAGE, LAUNCHER_PACKAGE, TARGETS } from "./targets.mjs";
 
 const REPOSITORY = "https://github.com/rodrigodotdev/warden";
 
@@ -137,6 +137,40 @@ if (only === null) {
       2,
     )}\n`,
   );
+
+  // The alias. It is written from the same run as the launcher, and only from a full
+  // run, because it pins the launcher's exact version and that version must exist.
+  const aliasDestination = path.join(out, ALIAS_PACKAGE);
+  fs.mkdirSync(path.join(aliasDestination, "bin"), { recursive: true });
+  fs.copyFileSync(
+    path.join(HERE, "alias", "bin", "warden.js"),
+    path.join(aliasDestination, "bin", "warden.js"),
+  );
+  fs.chmodSync(path.join(aliasDestination, "bin", "warden.js"), 0o755);
+  fs.copyFileSync(path.join(HERE, "alias", "README.md"), path.join(aliasDestination, "README.md"));
+  copyLicenses(path.join(archives, `warden-v${version}-${TARGETS[0].rustTarget}`), aliasDestination);
+
+  fs.writeFileSync(
+    path.join(aliasDestination, "package.json"),
+    `${JSON.stringify(
+      {
+        name: ALIAS_PACKAGE,
+        version,
+        description: `Alias for ${LAUNCHER_PACKAGE}, which is the package to install.`,
+        license: "MIT",
+        repository: { type: "git", url: `git+${REPOSITORY}.git` },
+        homepage: REPOSITORY,
+        bin: { warden: "bin/warden.js" },
+        engines: { node: ">=18" },
+        files: ["bin/", "README.md", "LICENSE", "LICENSES/"],
+        dependencies: { [LAUNCHER_PACKAGE]: version },
+      },
+      null,
+      2,
+    )}\n`,
+  );
 }
 
-process.stderr.write(`build: wrote ${selected.length} platform package(s) to ${out}\n`);
+process.stderr.write(
+  `build: wrote ${selected.length} platform package(s)${only === null ? " plus the launcher and its alias" : ""} to ${out}\n`,
+);
