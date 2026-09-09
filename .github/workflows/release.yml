@@ -350,16 +350,47 @@ jobs:
       #
       # `--provenance` links each published tarball to this workflow run and this
       # commit, the npm counterpart of the build attestation on the release assets.
+      #
+      # The dist-tag is derived, never defaulted. The tag filter admits `v0.2.0-rc.1`,
+      # and npm's default tag is `latest`, so without this every `npx -y warden-db-mcp`
+      # in the world would resolve to a release candidate. A version containing `-` is
+      # a pre-release by SemVer and goes to `next`.
+      #
+      # Each publish is guarded rather than attempted blindly. `set -e` means a failure
+      # part-way through leaves the rest unpublished — which is the right order to fail
+      # in, since the launcher must never precede its platform packages — but a re-run
+      # would then abort on the first already-published name with EPUBLISHCONFLICT and
+      # never reach the launcher. Skipping what is already there makes the job
+      # idempotent, so recovering a partial publish is re-running it rather than
+      # publishing by hand.
       - name: Publish
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          VERSION: ${{ needs.verify.outputs.version }}
         run: |
           set -euo pipefail
+          case "$VERSION" in
+            *-*) npm_tag="next" ;;
+            *) npm_tag="latest" ;;
+          esac
+          echo "publishing ${VERSION} under the ${npm_tag} dist-tag"
+
+          publish() {
+            directory="$1"
+            # The build script names each directory after the package it holds.
+            name="$(basename "$directory")"
+            if npm view "${name}@${VERSION}" version > /dev/null 2>&1; then
+              echo "${name}@${VERSION} is already published; skipping"
+              return 0
+            fi
+            npm publish "$directory" --access public --provenance --tag "$npm_tag"
+          }
+
           for package in packages/warden-db-mcp-*; do
-            npm publish "$package" --access public --provenance
+            publish "$package"
           done
-          npm publish packages/warden-db-mcp --access public --provenance
-          npm publish packages/warden-sql-mcp --access public --provenance
+          publish packages/warden-db-mcp
+          publish packages/warden-sql-mcp
 
       # The alias installs and runs; the deprecation is the signpost that says which
       # name to use. Re-running it every release keeps the newest version marked too,

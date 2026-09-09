@@ -1193,11 +1193,28 @@ untuned, and symbols are what make an operator's panic report actionable.
 | `SHA256SUMS` | One line per asset, `sha256sum --check` format |
 
 **A tag also publishes seven npm packages.** Five carry one prebuilt binary each and
-declare `os` and `cpu`, so npm installs exactly one; the sixth is `warden-db-mcp`, a
-launcher that names them as optional dependencies and execs whichever one is present.
-They are assembled from the archives above rather than from a separate build, so the
-binary on npm is the one the release page serves and the attestation covers, and each
-tarball is published with `npm publish --provenance`.
+declare `os` and `cpu` — and, on Linux, `libc = ["glibc"]`, so npm skips them on Alpine
+instead of installing a binary whose loader is missing. The sixth is `warden-db-mcp`, a
+launcher that names them as optional dependencies and runs whichever one is present as
+a child process. They are assembled from the archives above rather than from a separate
+build, so the binary on npm is the one the release page serves and the attestation
+covers, and each tarball is published with `npm publish --provenance`.
+
+**The launcher is a parent process, not an exec.** It calls `spawnSync`, so node stays
+alive as the parent with its event loop blocked for the whole run. Two consequences an
+operator should know. A `SIGTERM` sent to the `npx` process cannot reach Warden's own
+drain handler (`src/main.rs`): node is blocked and forwards nothing, and the signal
+does not reach the child on its own. What does shut Warden down cleanly is the MCP
+client closing stdin — the descriptors are inherited, so the stdio transport sees EOF
+and drains exactly as it does under a direct invocation. Clients that stop a server by
+closing the pipe, which is how MCP stdio servers are stopped, are unaffected. Operators
+who need signal-driven shutdown should run the binary from the release archive rather
+than through `npx`.
+
+**The dist-tag is derived from the version, not defaulted.** The tag filter admits
+`v0.2.0-rc.1`, and `npm publish` with no `--tag` writes `latest`, which would point
+every `npx -y warden-db-mcp` at a release candidate. A version containing `-` publishes
+under `next`; everything else under `latest`.
 
 A seventh package, `warden-sql-mcp`, is an alias: no binary and no logic, depending on
 the launcher at an exact version and calling its `main` in the same process. It is
@@ -1213,6 +1230,23 @@ asserts it on every generated manifest. An install script that downloads or exec
 the pattern this distribution exists to avoid; npm's own `os`/`cpu` resolution replaces
 it. `warden-mcp` was taken on npm by an unrelated package, which is why the canonical
 name is `warden-db-mcp`.
+
+**Publishing needs one repository secret: `NPM_TOKEN`**, read by the `npm` job as
+`NODE_AUTH_TOKEN`. Make it an npm **automation** token. A classic or granular token
+belonging to an account with two-factor authentication enabled on publishes will prompt
+for an OTP, and there is nobody at the runner to answer; an automation token is the one
+kind exempt from that prompt. The token needs publish rights on all seven names. It is
+the only credential the release uses that GitHub does not mint itself — everything else
+runs on the workflow's own OIDC identity and `GITHUB_TOKEN`.
+
+**When the npm job fails, the GitHub release is already published.** The `npm` job runs
+after `publish`, so a red npm job never means a missing release page. Some of the seven
+packages may already be on the registry: each publish is skipped when that name and
+version is already there, and `npm deprecate` is idempotent too, so **the fix is to
+re-run the failed job**. It will publish only what is missing, in dependency order.
+Publishing by hand is never the answer — a hand-published tarball carries no provenance
+attestation, which is the property the whole pipeline exists to give. If the job fails
+because the token expired, replace `NPM_TOKEN` and re-run.
 
 Both licenses are in every archive, and `tests/architecture.rs` fails the build if the
 staging step stops copying either (section 2.7).

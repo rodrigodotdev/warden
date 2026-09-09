@@ -27,5 +27,9 @@
 .DS_Store
 Thumbs.db
 
-# npm packaging output, assembled from release archives
+# npm packaging. Reproducing the `npm` job of release.yml locally leaves all three
+# behind: `dist/` holds the downloaded release archives and `unpacked/` their contents,
+# both inputs, and `packages/` is the assembled output that job publishes.
 /dist/
+/unpacked/
+/packages/
