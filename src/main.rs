@@ -12,7 +12,7 @@ mod panic;
 mod startup;
 
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context as _, Result};
@@ -55,6 +55,7 @@ fn main() -> ExitCode {
         Command::Serve { config, transport } => report(block_on(run_serve(&config, transport))),
         Command::Check { config } => report(block_on(run_check(&config))),
         Command::Init { config } => run_init(&config),
+        Command::McpConfig { name, config } => run_mcp_config(&name, &config),
         immediate => run_immediate(immediate),
     }
 }
@@ -191,6 +192,29 @@ fn run_init(config: &Path) -> ExitCode {
             );
             ExitCode::FAILURE
         }
+    }
+}
+
+/// Prints the client configuration block, with both paths made absolute.
+///
+/// `current_exe` and `canonicalize` are process globals, which is why this lives here
+/// rather than in `cli` (`docs/architecture.md` section 2). Neither is required to
+/// succeed: a path that cannot be canonicalized is still printed as written, because
+/// a block an operator has to edit one line of beats no block at all.
+fn run_mcp_config(name: &str, config: &Path) -> ExitCode {
+    let binary = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("warden"));
+    let config = config
+        .canonicalize()
+        .unwrap_or_else(|_| config.to_path_buf());
+
+    let mut stdout = io::stdout().lock();
+    match writeln!(
+        stdout,
+        "{}",
+        onboarding::mcp_config_json(name, &binary, &config)
+    ) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(_broken_pipe) => ExitCode::FAILURE,
     }
 }
 

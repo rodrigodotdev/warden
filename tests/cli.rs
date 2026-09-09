@@ -2,7 +2,7 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -322,6 +322,25 @@ fn role_prints_sql_on_stdout_so_it_can_be_piped_into_a_database_console() {
         "{sql}"
     );
     assert!(output.stderr.is_empty(), "stderr should be silent");
+}
+
+#[test]
+fn mcp_config_prints_a_block_naming_the_binary_that_printed_it() {
+    let output = warden(&["mcp-config"]);
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let rendered = String::from_utf8(output.stdout).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+    let command = parsed["mcpServers"]["warden"]["command"].as_str().unwrap();
+
+    // The point of the command: an absolute path the client can spawn from any
+    // working directory.
+    assert!(Path::new(command).is_absolute(), "{rendered}");
+    assert!(
+        command.ends_with("warden") || command.ends_with("warden.exe"),
+        "{rendered}"
+    );
 }
 
 #[test]

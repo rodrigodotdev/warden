@@ -4,6 +4,8 @@
 //! this module reads the environment, opens a file, or writes to a descriptor, which
 //! is what lets each rendering be asserted exactly rather than through a process.
 
+use std::path::Path;
+
 use warden_core::dialect::Dialect;
 
 /// The configuration `warden init` writes.
@@ -118,6 +120,38 @@ GRANT SELECT ON `{database}`.* TO '{user}'@'%';
     }
 }
 
+/// The MCP client configuration block for this installation.
+///
+/// The README's quick start told an operator to write this by hand with two absolute
+/// paths in it, which is the most common way an MCP server fails to start: a client
+/// spawns its servers with an arbitrary working directory, so Warden's default
+/// relative `warden.toml` almost never resolves and the `--config` path has to be
+/// absolute. This command resolves both paths from the running process instead.
+///
+/// `serde_json` does the escaping. A path can contain a quote, and every Windows path
+/// contains backslashes.
+pub(crate) fn mcp_config_json(name: &str, binary: &Path, config: &Path) -> String {
+    let block = serde_json::json!({
+        "mcpServers": {
+            name: {
+                "command": binary.display().to_string(),
+                "args": [
+                    "serve",
+                    "--transport",
+                    "stdio",
+                    "--config",
+                    config.display().to_string(),
+                ],
+            }
+        }
+    });
+
+    // `to_string_pretty` cannot fail for a `Value` built from literals, but the
+    // fallible API is the only one there is and `expect` is denied. A compact
+    // rendering is still valid JSON and still pasteable.
+    serde_json::to_string_pretty(&block).unwrap_or_else(|_| block.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     // Keeping this exception test-local makes production uses visible in diffs.
@@ -219,5 +253,53 @@ mod tests {
             assert!(sql.contains("CHANGE_ME"), "{sql}");
             assert!(sql.contains("Replace CHANGE_ME"), "{sql}");
         }
+    }
+
+    #[test]
+    fn the_client_json_names_absolute_paths_and_the_stdio_transport() {
+        let rendered = mcp_config_json(
+            "warden",
+            Path::new("/usr/local/bin/warden"),
+            Path::new("/etc/warden/warden.toml"),
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+
+        assert_eq!(
+            parsed["mcpServers"]["warden"]["command"],
+            "/usr/local/bin/warden"
+        );
+        assert_eq!(
+            parsed["mcpServers"]["warden"]["args"],
+            serde_json::json!([
+                "serve",
+                "--transport",
+                "stdio",
+                "--config",
+                "/etc/warden/warden.toml"
+            ])
+        );
+    }
+
+    #[test]
+    fn a_path_that_needs_escaping_is_escaped_rather_than_pasted() {
+        // Every Windows path contains backslashes, and a hand-rolled renderer emits
+        // invalid JSON for them.
+        let rendered = mcp_config_json(
+            "warden",
+            Path::new(r"C:\Program Files\warden\warden.exe"),
+            Path::new(r"C:\ProgramData\warden\warden.toml"),
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(
+            parsed["mcpServers"]["warden"]["command"],
+            r"C:\Program Files\warden\warden.exe"
+        );
+    }
+
+    #[test]
+    fn the_server_name_is_the_key_the_client_will_show() {
+        let rendered = mcp_config_json("orders", Path::new("/bin/warden"), Path::new("/w.toml"));
+        let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert!(parsed["mcpServers"]["orders"].is_object(), "{rendered}");
     }
 }

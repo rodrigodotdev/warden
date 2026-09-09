@@ -67,6 +67,13 @@ pub(crate) enum Command {
         /// PostgreSQL's schema. Ignored on MySQL, whose schema is the database.
         schema: String,
     },
+    /// Print the MCP client configuration block for this installation.
+    McpConfig {
+        /// The key the client will show for this server.
+        name: String,
+        /// The configuration file the emitted block will name.
+        config: PathBuf,
+    },
 }
 
 /// The transports `warden serve` can carry MCP over.
@@ -213,6 +220,7 @@ where
         "check" => parse_check(args),
         "init" => parse_init(args),
         "role" => parse_role(args),
+        "mcp-config" => parse_mcp_config(args),
         // The subcommand position holds a bare word, and a bare word is as likely to be a
         // pasted secret as a typo. Only a near miss of a name Warden itself defines is
         // quoted back; anything further away is refused without being repeated.
@@ -226,7 +234,15 @@ where
 /// The flag spellings (`--version`, `-h`) are deliberately absent: they are flag-shaped,
 /// so a typo of one is already quotable through [`is_flag_shaped`] when it reaches a
 /// subcommand's flag loop, and a near miss of `-h` is one edit from most short words.
-const COMMANDS: [&str; 6] = ["serve", "check", "init", "role", "version", "help"];
+const COMMANDS: [&str; 7] = [
+    "serve",
+    "check",
+    "init",
+    "role",
+    "mcp-config",
+    "version",
+    "help",
+];
 
 /// The transport names Warden itself defines, for the same near-miss reporting.
 ///
@@ -336,6 +352,33 @@ where
         user: user.ok_or(CliError::MissingValue { flag: "--user" })?,
         database: database.ok_or(CliError::MissingValue { flag: "--database" })?,
         schema: schema.unwrap_or_else(|| "public".to_owned()),
+    })
+}
+
+/// Parses `mcp-config`'s `--name` and `--config`.
+///
+/// `--name` is not run through [`identifier`]: it is a JSON object key that
+/// `serde_json` escapes, not SQL, so the identifier rule would reject perfectly good
+/// names like `orders-replica` for no benefit.
+fn parse_mcp_config<I>(mut args: I) -> Result<Command, CliError>
+where
+    I: Iterator<Item = String>,
+{
+    let mut name = None;
+    let mut config = None;
+
+    while let Some(argument) = args.next() {
+        let (flag, inline) = split_inline_value(&argument);
+        match flag {
+            "--name" => name = Some(value_of("--name", inline, &mut args)?),
+            "--config" => config = Some(PathBuf::from(value_of("--config", inline, &mut args)?)),
+            unknown => return Err(unknown_argument(unknown)),
+        }
+    }
+
+    Ok(Command::McpConfig {
+        name: name.unwrap_or_else(|| "warden".to_owned()),
+        config: config.unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH)),
     })
 }
 
@@ -504,12 +547,13 @@ pub(crate) fn run(command: Command, out: &mut dyn Write) -> io::Result<()> {
             "{}",
             crate::onboarding::role_sql(dialect, &user, &database, &schema)
         ),
-        Command::Serve { .. } | Command::Check { .. } | Command::Init { .. } => {
-            Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "`serve`, `check`, and `init` are executed by `main`",
-            ))
-        }
+        Command::Serve { .. }
+        | Command::Check { .. }
+        | Command::Init { .. }
+        | Command::McpConfig { .. } => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "`serve`, `check`, `init`, and `mcp-config` are executed by `main`",
+        )),
     }
 }
 
@@ -524,6 +568,7 @@ COMMANDS:
     check      Validate the configuration and probe every connection
     init       Write a starting configuration file
     role       Print the SQL for Warden's dedicated read-only role
+    mcp-config Print the MCP client configuration for this installation
     version    Show the version
     help       Show this message
 
@@ -534,6 +579,7 @@ FLAGS:
     --user <name>           Role to create, for `role`
     --database <name>       Database to grant on, for `role`
     --schema <name>         PostgreSQL schema for `role` (default: public)
+    --name <name>           Server key for `mcp-config` (default: warden)
 ";
 
 #[cfg(test)]
@@ -945,6 +991,31 @@ mod tests {
         // repeated into whatever collects stderr.
         let message = format!("{}", refused.unwrap_err());
         assert!(!message.contains("DROP TABLE"), "{message}");
+    }
+
+    #[test]
+    fn parses_mcp_config_with_its_defaults() {
+        assert_eq!(
+            parse(args(&["mcp-config"])).unwrap(),
+            Command::McpConfig {
+                name: "warden".to_owned(),
+                config: PathBuf::from(DEFAULT_CONFIG_PATH),
+            }
+        );
+        assert_eq!(
+            parse(args(&[
+                "mcp-config",
+                "--name",
+                "orders",
+                "--config",
+                "/etc/w.toml"
+            ]))
+            .unwrap(),
+            Command::McpConfig {
+                name: "orders".to_owned(),
+                config: PathBuf::from("/etc/w.toml"),
+            }
+        );
     }
 
     #[test]
