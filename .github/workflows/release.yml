@@ -234,3 +234,58 @@ jobs:
             --notes-file NOTES.md \
             --verify-tag \
             dist/*
+
+  homebrew:
+    name: update the Homebrew tap
+    needs: [verify, publish]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The published manifest, not a recomputed one. `publish` has already uploaded
+      # it, and it is what the build attestation covers.
+      - name: Download the release checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern SHA256SUMS \
+            --dir .
+          cat SHA256SUMS
+
+      - name: Render the formula
+        run: |
+          set -euo pipefail
+          ./packaging/homebrew/render.sh "${{ needs.verify.outputs.version }}" SHA256SUMS > warden.rb
+          cat warden.rb
+
+      # A fine-grained token scoped to the tap alone: GITHUB_TOKEN cannot push to
+      # another repository, and a broader token would put this one at risk for a
+      # formula bump.
+      - name: Commit it to the tap
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 \
+            "https://x-access-token:${GH_TOKEN}@github.com/rodrigodotdev/homebrew-tap.git" tap
+          mkdir -p tap/Formula
+          cp warden.rb tap/Formula/warden.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/warden.rb
+          if git diff --cached --quiet -- Formula/warden.rb; then
+            echo "the formula already describes ${VERSION}; nothing to push"
+            exit 0
+          fi
+          git commit -m "warden ${VERSION}"
+          git push
