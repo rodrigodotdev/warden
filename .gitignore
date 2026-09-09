@@ -26,3 +26,6 @@
 # Operating systems
 .DS_Store
 Thumbs.db
+
+# npm packaging output, assembled from release archives
+/dist/

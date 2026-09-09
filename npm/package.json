@@ -2,6 +2,7 @@
   "name": "warden-npm-workspace",
   "private": true,
   "scripts": {
-    "test": "node --test test/"
+    "test": "node --test test/",
+    "build": "node build.mjs"
   }
 }
