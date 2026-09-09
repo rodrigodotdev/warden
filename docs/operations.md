@@ -982,10 +982,15 @@ not serve.
   overwrite one that already exists; the confirmation goes to stderr.
 - `warden role --dialect <mysql|postgresql> --user <name> --database <name> [--schema
   <name>]` prints the least-privilege `CREATE ROLE`/`GRANT` statements on stdout, for
-  piping into a database console. Identifiers must be plain SQL names.
+  piping into a database console. Identifiers must be plain SQL names, and `--user` and
+  `--database` also refuse the words SQL reads as existing grantees (`public`,
+  `current_user`, `session_user`, `current_role`, `none`); `--schema public` stays legal,
+  because a schema name is never a grantee.
 - `warden mcp-config [--name <name>] [--config <path>]` prints the MCP client
   configuration block on stdout with the binary and configuration paths resolved
-  absolutely.
+  absolutely, including a configuration file that does not exist yet — a client spawns
+  its servers with an arbitrary working directory, so a relative path there is the
+  failure this command exists to prevent. It notes the missing file on stderr.
 
 `warden check` is everything `warden serve` would do, minus serving. It loads and
 validates the configuration, resolves every secret reference, opens and drops the
@@ -1010,7 +1015,10 @@ exit code stays 0 and the last line says so.
 **The report goes to stderr, not stdout.** `warden check`'s answer is its exit code and
 the lines explain it; stdout carries MCP and nothing else (`docs/mcp.md` section 5.1), and
 a command whose output habit differs from `serve`'s is a command that eventually prints
-into a protocol stream. `version` and `help`, which serve nothing, write to stdout.
+into a protocol stream. Four commands write to stdout: `version` and `help`, which serve
+nothing, and `role` and `mcp-config`, whose output is a payload meant to be piped — a SQL
+script into a database console, a JSON block into a client's configuration. Their
+diagnostics still go to stderr, so a pipe carries the payload alone.
 
 Avoid a heavyweight CLI framework until argument complexity justifies one.
 

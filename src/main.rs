@@ -168,6 +168,12 @@ fn run_init(config: &Path) -> ExitCode {
                 ExitCode::SUCCESS
             }
             Err(error) => {
+                // `create_new` already made the file, so what a failed write leaves
+                // behind is Warden's own truncated template — and the next run would
+                // report it as a file that "already exists and was left unchanged",
+                // which is the one thing it is not. Best effort: if the removal fails
+                // too, the message above is still the accurate one.
+                let _ = std::fs::remove_file(config);
                 let _ = writeln!(
                     stderr,
                     "warden: {} could not be written: {error}",
@@ -197,21 +203,42 @@ fn run_init(config: &Path) -> ExitCode {
 
 /// Prints the client configuration block, with both paths made absolute.
 ///
-/// `current_exe` and `canonicalize` are process globals, which is why this lives here
-/// rather than in `cli` (`docs/architecture.md` section 2). Neither is required to
-/// succeed: a path that cannot be canonicalized is still printed as written, because
-/// a block an operator has to edit one line of beats no block at all.
+/// `current_exe`, `canonicalize`, and the working directory `absolute` reads are
+/// process globals, which is why this lives here rather than in `cli`
+/// (`docs/architecture.md` section 2).
+///
+/// The absolute `--config` path is the entire point of the command, so it is resolved
+/// twice over. `canonicalize` needs the file to exist, and an operator who runs
+/// `mcp-config` before `init` would otherwise get the relative default back — a block
+/// the client accepts and then fails to spawn, which is precisely the failure this
+/// command exists to prevent. `std::path::absolute` makes a path absolute without
+/// requiring the file, so print-as-written is left for the case where even that fails.
 fn run_mcp_config(name: &str, config: &Path) -> ExitCode {
     let binary = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("warden"));
-    let config = config
+    // Canonical first: it resolves symlinks and `..`, and a client spawns this from
+    // some other directory. `absolute` is the fallback the missing file needs.
+    let resolved = config
         .canonicalize()
+        .or_else(|_missing| std::path::absolute(config))
         .unwrap_or_else(|_| config.to_path_buf());
+
+    // A note, not a failure: the block is still correct for the file `warden init`
+    // will write there, and it goes to stderr so the JSON stays pipeable.
+    if !config.exists() {
+        let mut stderr = io::stderr().lock();
+        let _ = writeln!(
+            stderr,
+            "warden: {} does not exist yet; run `warden init --config {}` before serving",
+            resolved.display(),
+            resolved.display()
+        );
+    }
 
     let mut stdout = io::stdout().lock();
     match writeln!(
         stdout,
         "{}",
-        onboarding::mcp_config_json(name, &binary, &config)
+        onboarding::mcp_config_json(name, &binary, &resolved)
     ) {
         Ok(()) => ExitCode::SUCCESS,
         Err(_broken_pipe) => ExitCode::FAILURE,

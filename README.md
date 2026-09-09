@@ -152,6 +152,10 @@ agent SQL.
 The report goes to stderr because stdout is reserved for MCP. Exit code `0` means the
 deployment is ready; warnings remain warnings and do not change that exit code.
 
+TLS is `verify-identity` unless the configuration says otherwise, so a local server with
+SSL off fails here. The generated file carries the two commented lines that relax it for
+a development machine; a real database keeps the default.
+
 ### 5. Connect your MCP client
 
 ```bash
@@ -165,15 +169,24 @@ into your client's MCP configuration:
 {
   "mcpServers": {
     "warden": {
-      "command": "/absolute/path/to/warden",
-      "args": ["serve", "--transport", "stdio", "--config", "/absolute/path/to/warden.toml"]
+      "args": [
+        "serve",
+        "--transport",
+        "stdio",
+        "--config",
+        "/absolute/path/to/warden.toml"
+      ],
+      "command": "/absolute/path/to/warden"
     }
   }
 }
 ```
 
 Both paths are absolute on purpose: a client spawns its servers with an arbitrary
-working directory, so a relative `warden.toml` will not resolve.
+working directory, so a relative `warden.toml` will not resolve — the `--config` path is
+made absolute even when that file does not exist yet, and the missing file is noted on
+stderr. The keys come back in that order because the block is serialized sorted; the
+order does not matter to a client.
 
 The client process must inherit the environment variable named by `dsn_env`, or be able
 to read the file named by `dsn_file`. Do not paste a DSN into the MCP configuration.

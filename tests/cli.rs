@@ -19,6 +19,20 @@ fn warden(args: &[&str]) -> std::process::Output {
         .expect("failed to execute the warden binary")
 }
 
+/// Runs the binary from `directory`, for the commands whose answer depends on one.
+///
+/// `mcp-config` resolves a relative `--config` against the working directory, so the
+/// only way to assert what it emits is to choose that directory rather than inherit
+/// the crate root the test harness happens to run in.
+fn warden_in(directory: &Path, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_warden"))
+        .env_remove("RUST_LOG")
+        .current_dir(directory)
+        .args(args)
+        .output()
+        .expect("failed to execute the warden binary")
+}
+
 /// Runs the binary with `RUST_LOG` set, so the tracing subscriber actually emits.
 fn warden_logging(args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_warden"))
@@ -142,6 +156,23 @@ fn unique_temp_dir(label: &str) -> PathBuf {
     ));
     std::fs::create_dir_all(&directory).expect("failed to create the temporary directory");
     directory
+}
+
+/// The `--config` value from a rendered `mcp-config` block.
+///
+/// The path is positional inside `args`, so reading it by index would pass just as
+/// happily if the flag before it changed; this finds the flag and takes what follows.
+fn config_argument(parsed: &serde_json::Value) -> &str {
+    let args = parsed["mcpServers"]["warden"]["args"]
+        .as_array()
+        .expect("the block has an args array");
+    let flag = args
+        .iter()
+        .position(|argument| argument == "--config")
+        .expect("the block passes --config");
+    args.get(flag + 1)
+        .and_then(serde_json::Value::as_str)
+        .expect("--config is followed by a path")
 }
 
 #[test]
@@ -326,7 +357,10 @@ fn role_prints_sql_on_stdout_so_it_can_be_piped_into_a_database_console() {
 
 #[test]
 fn mcp_config_prints_a_block_naming_the_binary_that_printed_it() {
-    let output = warden(&["mcp-config"]);
+    let directory = unique_temp_dir("mcp-config");
+    std::fs::write(directory.join("warden.toml"), "version = 1\n").unwrap();
+
+    let output = warden_in(&directory, &["mcp-config"]);
 
     assert!(output.status.success(), "{output:?}");
     assert!(output.stderr.is_empty(), "{output:?}");
@@ -341,6 +375,62 @@ fn mcp_config_prints_a_block_naming_the_binary_that_printed_it() {
         command.ends_with("warden") || command.ends_with("warden.exe"),
         "{rendered}"
     );
+    // And the half the command exists for. A client resolves `--config` against a
+    // working directory nobody chose, so a relative path here is the failure this
+    // block is meant to prevent — asserting only the command path passes in exactly
+    // that degraded state.
+    assert!(
+        Path::new(config_argument(&parsed)).is_absolute(),
+        "{rendered}"
+    );
+
+    std::fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn mcp_config_is_absolute_even_where_the_configuration_does_not_exist_yet() {
+    // An operator who runs this before `init`, or from anywhere but the directory
+    // holding the file, still gets a block a client can spawn: `canonicalize` cannot
+    // resolve a file that is not there, and the relative default it would fall back to
+    // fails at spawn time with nothing to explain it.
+    let directory = unique_temp_dir("mcp-config-missing");
+
+    let output = warden_in(&directory, &["mcp-config"]);
+
+    assert!(output.status.success(), "{output:?}");
+    let rendered = String::from_utf8(output.stdout).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+    let config = config_argument(&parsed);
+    assert!(Path::new(config).is_absolute(), "{rendered}");
+    assert!(config.ends_with("warden.toml"), "{rendered}");
+
+    // The missing file is worth a word, and that word belongs on stderr: stdout is the
+    // block an operator pipes into a client's configuration.
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("does not exist yet"), "{stderr}");
+
+    std::fs::remove_dir_all(&directory).unwrap();
+}
+
+#[test]
+fn role_refuses_public_as_a_user_before_it_can_emit_a_grant_to_everyone() {
+    // The whole script matters here, not just the exit code: `CREATE ROLE PUBLIC` fails
+    // and psql continues without `ON_ERROR_STOP=1`, so a `GRANT … TO PUBLIC` reaching
+    // stdout would hand `SELECT` on the whole schema to every role in the database.
+    for user in ["public", "PUBLIC"] {
+        let output = warden(&[
+            "role",
+            "--dialect",
+            "postgresql",
+            "--user",
+            user,
+            "--database",
+            "app",
+        ]);
+
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+    }
 }
 
 #[test]

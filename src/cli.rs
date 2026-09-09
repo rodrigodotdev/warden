@@ -148,6 +148,16 @@ pub(crate) enum CliError {
         /// The flag whose value was refused. One of Warden's own literals.
         flag: &'static str,
     },
+    /// A name shaped like an identifier that SQL reads as a grantee that already exists.
+    ///
+    /// Separate from [`Self::InvalidIdentifier`] because the shape rule's message would
+    /// send an operator who typed `--user public` looking for punctuation that is not
+    /// there. Carries the flag alone, on the same rule: the refused words are Warden's
+    /// own list, but nothing the operator typed is repeated back.
+    ReservedGrantee {
+        /// The flag whose value was refused. One of Warden's own literals.
+        flag: &'static str,
+    },
     /// `--dialect` named an engine Warden does not implement.
     ///
     /// The value is dropped rather than quoted: this slot takes a bare word, and a
@@ -191,6 +201,12 @@ impl fmt::Display for CliError {
                 f,
                 "{flag} must be a plain SQL name: a letter or underscore, then letters, \
                  digits, and underscores, at most 63 characters"
+            ),
+            Self::ReservedGrantee { flag } => write!(
+                f,
+                "{flag} must not be `public`, `current_user`, `session_user`, \
+                 `current_role`, or `none`: SQL reads each of those as a grantee that \
+                 already exists, so the grant would land on it instead of on a new role"
             ),
             Self::UnknownDialect => f.write_str("--dialect must be `mysql` or `postgresql`"),
         }
@@ -342,7 +358,7 @@ where
             }
             "--user" => user = Some(identifier("--user", inline, &mut args)?),
             "--database" => database = Some(identifier("--database", inline, &mut args)?),
-            "--schema" => schema = Some(identifier("--schema", inline, &mut args)?),
+            "--schema" => schema = Some(schema_name("--schema", inline, &mut args)?),
             unknown => return Err(unknown_argument(unknown)),
         }
     }
@@ -383,12 +399,42 @@ where
 }
 
 /// Takes a flag's value and requires it to be a plain SQL identifier.
+///
+/// The strict rule, and the one every identifier flag but `--schema` takes: a name
+/// SQL reads as an existing grantee — `public` above all — is refused here, because
+/// `warden role --user public` renders `GRANT … TO PUBLIC` and psql runs past the
+/// `CREATE ROLE PUBLIC` that fails before it.
 fn identifier<I>(flag: &'static str, inline: Option<&str>, args: &mut I) -> Result<String, CliError>
 where
     I: Iterator<Item = String>,
 {
     let value = value_of(flag, inline, args)?;
     if crate::onboarding::validate_identifier(&value) {
+        Ok(value)
+    } else if crate::onboarding::is_reserved_grantee(&value) {
+        // Only the diagnostic branches here; the refusal above is the single gate.
+        Err(CliError::ReservedGrantee { flag })
+    } else {
+        Err(CliError::InvalidIdentifier { flag })
+    }
+}
+
+/// Takes `--schema`'s value, the one identifier position a reserved grantee word fits.
+///
+/// `public` is PostgreSQL's default schema, this flag's own default, and what the
+/// emitted `GRANT USAGE ON SCHEMA public` is supposed to say. A schema name is never
+/// written into a grantee position, so it takes the shape rule alone — and it says so
+/// by calling a different function rather than by weakening [`identifier`].
+fn schema_name<I>(
+    flag: &'static str,
+    inline: Option<&str>,
+    args: &mut I,
+) -> Result<String, CliError>
+where
+    I: Iterator<Item = String>,
+{
+    let value = value_of(flag, inline, args)?;
+    if crate::onboarding::validate_schema_name(&value) {
         Ok(value)
     } else {
         Err(CliError::InvalidIdentifier { flag })
@@ -530,9 +576,11 @@ impl std::str::FromStr for Transport {
 
 /// Executes the subcommands that need neither a runtime nor a database, writing to `out`.
 ///
-/// `serve` and `check` are async and are dispatched by `main`, which owns the Tokio
-/// runtime and the process's real descriptors; reaching them here means that dispatch is
-/// broken, so this reports it rather than succeeding silently.
+/// `serve`, `check`, `init`, and `mcp-config` are dispatched by `main` instead: the
+/// first two are async and need the Tokio runtime, and the other two resolve process
+/// globals — a file on disk, `current_exe` — that this module deliberately cannot see.
+/// Reaching them here means that dispatch is broken, so this reports it rather than
+/// succeeding silently.
 pub(crate) fn run(command: Command, out: &mut dyn Write) -> io::Result<()> {
     match command {
         Command::Version => writeln!(out, "warden {}", env!("CARGO_PKG_VERSION")),
@@ -891,13 +939,22 @@ mod tests {
         let mut out = Vec::new();
         run(Command::Help, &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
+        // The command half is driven from `COMMANDS`, so the next subcommand added to
+        // the parser is covered here without anyone remembering to extend this list.
+        for expected in COMMANDS {
+            assert!(text.contains(expected), "help omits {expected}:\n{text}");
+        }
+        // The flags have no such constant: every one a subcommand parses is named here
+        // by hand, which is what makes this the guard against a flag that ships
+        // undocumented.
         for expected in [
-            "serve",
-            "check",
-            "version",
-            "help",
             "--config",
             "--transport",
+            "--dialect",
+            "--user",
+            "--database",
+            "--schema",
+            "--name",
         ] {
             assert!(text.contains(expected), "help omits {expected}:\n{text}");
         }
@@ -991,6 +1048,83 @@ mod tests {
         // repeated into whatever collects stderr.
         let message = format!("{}", refused.unwrap_err());
         assert!(!message.contains("DROP TABLE"), "{message}");
+    }
+
+    #[test]
+    fn every_identifier_flag_refuses_a_hostile_value_without_echoing_it() {
+        // `--user`, `--database`, and `--schema` all reach a rendered SQL statement, and
+        // all three share one helper; a test for only the first would not notice one of
+        // the other two being wired to something laxer.
+        for flag in ["--user", "--database", "--schema"] {
+            let refused = parse(args(&[
+                "role",
+                "--dialect",
+                "postgresql",
+                "--user",
+                "warden_ro",
+                "--database",
+                "app",
+                flag,
+                "x'; DROP TABLE users --",
+            ]));
+            assert_eq!(refused, Err(CliError::InvalidIdentifier { flag }), "{flag}");
+            let message = format!("{}", refused.unwrap_err());
+            assert!(!message.contains("DROP TABLE"), "{message}");
+        }
+    }
+
+    #[test]
+    fn role_refuses_a_user_sql_reads_as_an_existing_grantee() {
+        // `CREATE ROLE PUBLIC` fails, psql runs past it without `ON_ERROR_STOP=1`, and
+        // the `GRANT … TO PUBLIC` statements after it succeed: the least-privilege
+        // command would grant SELECT on the whole schema to every role there is.
+        for (dialect, user) in [
+            ("postgresql", "public"),
+            ("postgresql", "PUBLIC"),
+            ("mysql", "public"),
+            ("mysql", "PUBLIC"),
+        ] {
+            let refused = parse(args(&[
+                "role",
+                "--dialect",
+                dialect,
+                "--user",
+                user,
+                "--database",
+                "app",
+            ]));
+            assert_eq!(
+                refused,
+                Err(CliError::ReservedGrantee { flag: "--user" }),
+                "{dialect} {user}"
+            );
+        }
+    }
+
+    #[test]
+    fn role_still_takes_public_as_the_schema_it_is() {
+        // `public` is PostgreSQL's default schema and this flag's own default; the
+        // reserved-word rule is about the grantee position and must not reach here.
+        assert_eq!(
+            parse(args(&[
+                "role",
+                "--dialect",
+                "postgresql",
+                "--user",
+                "warden_ro",
+                "--database",
+                "app",
+                "--schema",
+                "public",
+            ]))
+            .unwrap(),
+            Command::Role {
+                dialect: Dialect::PostgreSql,
+                user: "warden_ro".to_owned(),
+                database: "app".to_owned(),
+                schema: "public".to_owned(),
+            }
+        );
     }
 
     #[test]
