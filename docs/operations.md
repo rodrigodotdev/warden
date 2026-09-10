@@ -990,7 +990,10 @@ not serve.
   configuration block on stdout with the binary and configuration paths resolved
   absolutely, including a configuration file that does not exist yet — a client spawns
   its servers with an arbitrary working directory, so a relative path there is the
-  failure this command exists to prevent. It notes the missing file on stderr.
+  failure this command exists to prevent. It notes the missing file on stderr. The
+  binary it names is the running executable, so run it from an installed binary rather
+  than through `npx`: there the executable lives in a cache npm is free to evict, and
+  the npm launcher's own `"command": "npx"` block (section 12.7) is the stable form.
 
 `warden check` is everything `warden serve` would do, minus serving. It loads and
 validates the configuration, resolves every secret reference, opens and drops the
@@ -1126,7 +1129,7 @@ per-task panic containment (`docs/security.md` section 14) depends on unwinding.
 ### 12.4 Targets
 
 Linux x86_64, Linux aarch64, macOS x86_64, macOS aarch64, and Windows x86_64 all
-ship as of v0.1.0. An OCI image does not yet. The selected SQL stack requires neither
+ship as of v0.2.0. An OCI image does not yet. The selected SQL stack requires neither
 `libmysqlclient` nor `libpq`, which is what makes each of these a single self-contained
 executable.
 
@@ -1136,8 +1139,9 @@ not an omission.
 
 ### 12.5 Container
 
-**Warden ships no `Dockerfile` or `Containerfile`.** As of v0.1.0 the distributable
-artifacts are the release archives of section 12.7 and the source repository. This
+**Warden ships no `Dockerfile` or `Containerfile`.** As of v0.2.0 the distributable
+artifacts are the release archives of section 12.7, the npm packages and the Homebrew
+formula they feed, and the source repository. This
 section is therefore a checklist for the day a container image appears, not a
 description of one that exists; read every requirement below as binding on that future
 image.
@@ -1191,6 +1195,24 @@ untuned, and symbols are what make an operator's panic report actionable.
 | `warden-v<version>-<target>.tar.gz` | Linux and macOS: `warden`, `README.md`, `LICENSE`, `LICENSES/` |
 | `warden-v<version>-<target>.zip` | Windows: the same, with `warden.exe` |
 | `SHA256SUMS` | One line per asset, `sha256sum --check` format |
+
+Both licenses are in every archive, and `tests/architecture.rs` fails the build if the
+staging step stops copying either (section 2.7).
+
+**A tag also updates the Homebrew tap.** `rodrigodotdev/homebrew-tap` holds one
+formula, `Formula/warden.rb`, rendered by `packaging/homebrew/render.sh` from the
+template in this repository and the release's own `SHA256SUMS`. Checksums are read from
+that published manifest rather than recomputed from a fresh download: it is what the
+release signed, and a second computation is a second chance to describe something other
+than what was published. A missing entry fails the render rather than producing a
+formula with a blank `sha256`.
+
+The formula covers the four unix archives. Homebrew installs no Windows binary, and
+`packaging/homebrew/test-render.sh` — which the gate runs on every pull request —
+asserts that the Windows asset never appears in the rendering.
+
+**Do not edit the formula in the tap.** The next tag overwrites it. Fix
+`packaging/homebrew/warden.rb.template` here and cut a tag.
 
 **A tag also publishes seven npm packages.** Five carry one prebuilt binary each and
 declare `os` and `cpu` — and, on Linux, `libc = ["glibc"]`, so npm skips them on Alpine
@@ -1248,31 +1270,13 @@ Publishing by hand is never the answer — a hand-published tarball carries no p
 attestation, which is the property the whole pipeline exists to give. If the job fails
 because the token expired, replace `NPM_TOKEN` and re-run.
 
-Both licenses are in every archive, and `tests/architecture.rs` fails the build if the
-staging step stops copying either (section 2.7).
-
-**A tag also updates the Homebrew tap.** `rodrigodotdev/homebrew-tap` holds one
-formula, `Formula/warden.rb`, rendered by `packaging/homebrew/render.sh` from the
-template in this repository and the release's own `SHA256SUMS`. Checksums are read from
-that published manifest rather than recomputed from a fresh download: it is what the
-release signed, and a second computation is a second chance to describe something other
-than what was published. A missing entry fails the render rather than producing a
-formula with a blank `sha256`.
-
-The formula covers the four unix archives. Homebrew installs no Windows binary, and
-`packaging/homebrew/test-render.sh` — which the gate runs on every pull request —
-asserts that the Windows asset never appears in the rendering.
-
-**Do not edit the formula in the tap.** The next tag overwrites it. Fix
-`packaging/homebrew/warden.rb.template` here and cut a tag.
-
 **Every published file carries signed build provenance.** `SHA256SUMS` is a subject
 too, so the list of hashes cannot be swapped independently of what it lists. Verifying
 a download takes both steps:
 
 ```bash
 sha256sum --check --ignore-missing SHA256SUMS
-gh attestation verify warden-v0.1.0-x86_64-unknown-linux-gnu.tar.gz \
+gh attestation verify warden-v0.2.0-x86_64-unknown-linux-gnu.tar.gz \
   --repo rodrigodotdev/warden
 ```
 

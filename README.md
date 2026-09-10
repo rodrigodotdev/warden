@@ -80,6 +80,12 @@ Windows on x64 — and nothing else. The package declares **no install script**:
 the platform package through its `os` and `cpu` fields, so nothing is downloaded or
 executed while installing.
 
+On macOS or Linux, Homebrew installs the same binary onto your `PATH`:
+
+```bash
+brew install rodrigodotdev/tap/warden
+```
+
 <details>
 <summary>Or download the release archive</summary>
 
@@ -92,9 +98,9 @@ Verify it before you run it — every published file carries signed build proven
 
 ```bash
 sha256sum --check --ignore-missing SHA256SUMS
-gh attestation verify warden-v0.1.0-x86_64-unknown-linux-gnu.tar.gz \
+gh attestation verify warden-v0.2.0-x86_64-unknown-linux-gnu.tar.gz \
   --repo rodrigodotdev/warden
-tar -xzf warden-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
+tar -xzf warden-v0.2.0-x86_64-unknown-linux-gnu.tar.gz
 ```
 
 </details>
@@ -114,6 +120,10 @@ cargo build --locked --release
 
 The Linux builds link glibc. On Alpine or another musl distribution, build from source.
 There is no container image yet.
+
+The steps below write `warden`, which is what Homebrew, the archive, and a source build
+put on your `PATH`. Through npm the same commands are `npx -y warden-db-mcp <command>` —
+`npx -y warden-db-mcp init`, and so on.
 
 ### 2. Create `warden.toml`
 
@@ -198,7 +208,8 @@ write the block instead of typing two absolute paths:
 warden mcp-config
 ```
 
-It prints the following with the real paths already resolved:
+It prints the following with the real paths already resolved, including a `warden.toml`
+that does not exist yet:
 
 ```json
 {
@@ -217,11 +228,15 @@ It prints the following with the real paths already resolved:
 }
 ```
 
-Both paths are absolute on purpose: a client spawns its servers with an arbitrary
-working directory, so a relative `warden.toml` will not resolve — the `--config` path is
-made absolute even when that file does not exist yet, and the missing file is noted on
-stderr. The keys come back in that order because the block is serialized sorted; the
-order does not matter to a client.
+`--name` renames the server key, and `--config` names a configuration path other than
+the default. Both paths come out absolute for the reason above, including a
+`warden.toml` that does not exist yet — that one is noted on stderr, so the JSON on
+stdout stays pipeable. The keys come back in that order because the block is serialized
+sorted; the order does not matter to a client.
+
+Run `mcp-config` from a binary on your `PATH` rather than through `npx`: it resolves the
+path of the running executable, and under `npx` that is a file inside a cache directory
+npm is free to evict. Through npm, the `"command": "npx"` block above is the stable one.
 
 The client process must inherit the environment variable named by `dsn_env`, or be able
 to read the file named by `dsn_file`. Do not paste a DSN into the MCP configuration.
@@ -350,9 +365,10 @@ a failing attempt takes neither permit nor executor; the documented tracing tree
 payload-free panic reporting give operators safe diagnostics. `/dev/full` is rejected at
 open time as a special-file destination rather than used as the write-failure fixture.
 
-v0.1.0 is the first tagged release: MIT-licensed, with signed, checksummed binaries
-for Linux, macOS, and Windows. [`CHANGELOG.md`](CHANGELOG.md) records what it contains
-and what it deliberately does not.
+v0.1.0 was the first tagged release: MIT-licensed, with signed, checksummed binaries
+for Linux, macOS, and Windows. v0.2.0 adds the onboarding subcommands and publishes the
+same binaries through npm and Homebrew. [`CHANGELOG.md`](CHANGELOG.md) records what each
+release contains and what it deliberately does not.
 
 Streamable HTTP and its authorization model are planned for Milestone 14. Until then,
 remote production deployment is not supported, and there is no container image. Follow
