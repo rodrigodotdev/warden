@@ -21,11 +21,11 @@ const path = require("node:path");
 // Kept in sync with `npm/targets.mjs` by a test, because the two files cannot import
 // each other: this one is CommonJS so `require.resolve` is available.
 const SUPPORTED = [
-  { platform: "linux", arch: "x64", package: "warden-db-mcp-linux-x64", binary: "warden" },
-  { platform: "linux", arch: "arm64", package: "warden-db-mcp-linux-arm64", binary: "warden" },
-  { platform: "darwin", arch: "x64", package: "warden-db-mcp-darwin-x64", binary: "warden" },
-  { platform: "darwin", arch: "arm64", package: "warden-db-mcp-darwin-arm64", binary: "warden" },
-  { platform: "win32", arch: "x64", package: "warden-db-mcp-win32-x64", binary: "warden.exe" },
+  { platform: "linux", arch: "x64", package: "@rodrigodotdev/warden-db-mcp-linux-x64", binary: "warden" },
+  { platform: "linux", arch: "arm64", package: "@rodrigodotdev/warden-db-mcp-linux-arm64", binary: "warden" },
+  { platform: "darwin", arch: "x64", package: "@rodrigodotdev/warden-db-mcp-darwin-x64", binary: "warden" },
+  { platform: "darwin", arch: "arm64", package: "@rodrigodotdev/warden-db-mcp-darwin-arm64", binary: "warden" },
+  { platform: "win32", arch: "x64", package: "@rodrigodotdev/warden-db-mcp-win32-x64", binary: "warden.exe" },
 ];
 
 /** The platform package for a `process.platform`/`process.arch` pair, or null. */

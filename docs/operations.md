@@ -1222,6 +1222,24 @@ a child process. They are assembled from the archives above rather than from a s
 build, so the binary on npm is the one the release page serves and the attestation
 covers, and each tarball is published with `npm publish --provenance`.
 
+**The five platform packages are scoped, `@rodrigodotdev/warden-db-mcp-<platform>-<arch>`;
+the launcher and the alias are not.** Publishing five unscoped names differing only by
+suffix is what npm's anti-squatting heuristic exists to catch, and it caught them: the
+first release attempt published four and was refused on `warden-db-mcp-win32-x64` with
+"Package name triggered spam detection". Under a scope the namespace already belongs to
+the publisher, so the heuristic has nothing to decide. Nobody types these names —
+`optionalDependencies` and the launcher's `require.resolve` are the only readers — so
+the scope costs nothing. The launcher stays unscoped because `npx -y warden-db-mcp` is
+the interface, and the alias stays unscoped because a scoped name holds no unscoped
+one. `npm/test/shim.test.mjs` asserts all three.
+
+The build script writes each package to a directory named without the scope, because a
+scoped name carries a `/` and that is a path separator. The publish step therefore reads
+each name from its own `package.json` rather than from the directory name; `basename`
+would check the wrong name and the already-published guard would never fire. Every
+`npm publish` argument also begins with `./`: npm parses a bare `a/b` as a GitHub
+`owner/repo` shorthand before it looks at the filesystem, which cost one tag to learn.
+
 **The launcher is a parent process, not an exec.** It calls `spawnSync`, so node stays
 alive as the parent with its event loop blocked for the whole run. Two consequences an
 operator should know. A `SIGTERM` sent to the `npx` process cannot reach Warden's own

@@ -109,6 +109,25 @@ test("the release workflow builds exactly the targets the map declares", () => {
   assert.deepEqual(matrix.sort(), TARGETS.map((target) => target.rustTarget).sort());
 });
 
+test("the platform packages are scoped and the two public names are not", () => {
+  // Five unscoped names differing only by suffix are what npm's anti-squatting
+  // heuristic exists to catch, and it caught them: the fifth was refused with
+  // "Package name triggered spam detection" after four siblings published. Under a
+  // scope the namespace is already the publisher's and there is nothing to decide.
+  for (const target of TARGETS) {
+    assert.ok(
+      target.package.startsWith("@"),
+      `${target.package} is unscoped; five sibling names trip npm spam detection`,
+    );
+    assert.ok(!target.directory.includes("/"), "a directory name cannot carry a scope");
+  }
+
+  // The launcher is what a human types and an MCP client spawns, and the alias only
+  // holds the neighbouring name if it occupies it. Neither may grow a scope.
+  assert.ok(!LAUNCHER_PACKAGE.startsWith("@"), "npx -y warden-db-mcp is the whole point");
+  assert.ok(!ALIAS_PACKAGE.startsWith("@"), "a scoped alias holds no unscoped name");
+});
+
 test("every npm publish in the release workflow names a directory, not a repo", () => {
   // npm parses a bare `a/b` argument as a GitHub `owner/repo` shorthand before it
   // looks at the filesystem, so `npm publish packages/warden-db-mcp-darwin-arm64`
@@ -163,9 +182,16 @@ test("the assembled alias finds and runs the assembled platform binary", { skip:
     stageArchives(archives, { script: '#!/bin/sh\necho "ran $*" >&2\nexit 0\n' });
     assemble(archives, out);
 
+    // node_modules is laid out by npm name, so the scoped platform package lands
+    // under its scope directory — which is exactly what `require.resolve` walks.
+    // The build output it comes from is addressed by directory instead.
     const modules = path.join(work, "node_modules");
-    for (const name of [LAUNCHER_PACKAGE, ALIAS_PACKAGE, target.package]) {
-      fs.cpSync(path.join(out, name), path.join(modules, name), { recursive: true });
+    for (const [from, to] of [
+      [LAUNCHER_PACKAGE, LAUNCHER_PACKAGE],
+      [ALIAS_PACKAGE, ALIAS_PACKAGE],
+      [target.directory, target.package],
+    ]) {
+      fs.cpSync(path.join(out, from), path.join(modules, to), { recursive: true });
     }
 
     const result = spawnSync(
@@ -211,7 +237,7 @@ test("the build assembles one launcher and one package per target", () => {
       assert.equal(launcher.optionalDependencies[target.package], "9.9.9");
 
       const platform = JSON.parse(
-        fs.readFileSync(path.join(out, target.package, "package.json"), "utf8"),
+        fs.readFileSync(path.join(out, target.directory, "package.json"), "utf8"),
       );
       assert.deepEqual(platform.os, [target.platform]);
       assert.deepEqual(platform.cpu, [target.arch]);
@@ -227,12 +253,12 @@ test("the build assembles one launcher and one package per target", () => {
       // Five blank pages on npmjs.com for a security product is a bad first look.
       assert.equal(platform.homepage, launcher.homepage);
       assert.deepEqual(platform.bugs, launcher.bugs);
-      assert.ok(fs.existsSync(path.join(out, target.package, "README.md")));
-      assert.ok(fs.existsSync(path.join(out, target.package, "bin", target.binary)));
+      assert.ok(fs.existsSync(path.join(out, target.directory, "README.md")));
+      assert.ok(fs.existsSync(path.join(out, target.directory, "bin", target.binary)));
       // MIT requires the notice to travel with the software, and CDLA-Permissive-2.0
       // requires the webpki-roots notice to accompany the redistributed root data.
-      assert.ok(fs.existsSync(path.join(out, target.package, "LICENSE")));
-      assert.ok(fs.existsSync(path.join(out, target.package, "LICENSES", "notice.txt")));
+      assert.ok(fs.existsSync(path.join(out, target.directory, "LICENSE")));
+      assert.ok(fs.existsSync(path.join(out, target.directory, "LICENSES", "notice.txt")));
     }
   });
 });
@@ -244,7 +270,7 @@ test("a unix binary is assembled executable", { skip: process.platform === "win3
     assemble(archives, out, target.rustTarget);
 
     // npm preserves the mode from the tarball. A binary published 0644 cannot be run.
-    const mode = fs.statSync(path.join(out, target.package, "bin", target.binary)).mode;
+    const mode = fs.statSync(path.join(out, target.directory, "bin", target.binary)).mode;
     assert.equal(mode & 0o111, 0o111, "the binary must be executable");
   });
 });

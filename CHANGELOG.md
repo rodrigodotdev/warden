@@ -25,9 +25,11 @@ changed, so a 0.1.0 deployment upgrades in place.
 - **npm distribution.** `npx -y warden-db-mcp` installs one prebuilt binary for the
   platform and runs it, so an MCP client configuration needs no path to a downloaded
   file. No package in the set declares an install script; npm resolves the platform
-  through `os` and `cpu` fields. Every tarball is published with npm provenance from
-  the same tag that publishes the release archives. `warden-sql-mcp` is published as a
-  deprecated alias of the same server, so the neighbouring name resolves to Warden.
+  through `os` and `cpu` fields. The five platform packages are scoped under
+  `@rodrigodotdev`; the launcher you install is not, so `npx -y warden-db-mcp` is the
+  whole interface. Every tarball is published with npm provenance from the same tag
+  that publishes the release archives. `warden-sql-mcp` is published as a deprecated
+  alias of the same server, so the neighbouring name resolves to Warden.
 - **Homebrew tap.** `brew install rodrigodotdev/tap/warden` installs Warden on macOS
   and Linux, on both x86_64 and arm64. Every tag renders the formula from the
   release's own `SHA256SUMS` and pushes it, so the tap cannot describe a version that
