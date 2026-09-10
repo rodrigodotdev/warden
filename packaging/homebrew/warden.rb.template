@@ -4,7 +4,7 @@
 # Rendered by packaging/homebrew/render.sh from the assets of one release. Do not edit
 # this file in the tap: the next tag overwrites it.
 class Warden < Formula
-  desc "Safe, read-only MCP gateway for AI agents to explore MySQL and PostgreSQL"
+  desc "Safe, read-only MCP gateway to explore MySQL and PostgreSQL"
   homepage "https://github.com/rodrigodotdev/warden"
   version "{{VERSION}}"
   license "MIT"
