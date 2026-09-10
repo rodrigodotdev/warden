@@ -375,6 +375,11 @@ jobs:
           esac
           echo "publishing ${VERSION} under the ${npm_tag} dist-tag"
 
+          # The `./` is load-bearing. npm parses a bare `a/b` argument as a GitHub
+          # `owner/repo` shorthand before it ever looks at the filesystem, so
+          # `npm publish packages/warden-db-mcp-darwin-arm64` tries to clone
+          # github.com/packages/warden-db-mcp-darwin-arm64 over SSH and dies with
+          # exit 128. A leading `./` is what makes it a directory.
           publish() {
             directory="$1"
             # The build script names each directory after the package it holds.
@@ -383,7 +388,7 @@ jobs:
               echo "${name}@${VERSION} is already published; skipping"
               return 0
             fi
-            npm publish "$directory" --access public --provenance --tag "$npm_tag"
+            npm publish "./${directory}" --access public --provenance --tag "$npm_tag"
           }
 
           for package in packages/warden-db-mcp-*; do
