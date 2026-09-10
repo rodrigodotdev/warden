@@ -11,6 +11,8 @@ use std::fmt;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
+use warden_core::dialect::Dialect;
+
 /// Exit code for command-line usage errors.
 ///
 /// Bash and GNU coreutils conventionally use 2 for incorrect usage. This is not
@@ -47,6 +49,29 @@ pub(crate) enum Command {
     /// Validate the configuration and probe every configured connection.
     Check {
         /// The configuration file to read.
+        config: PathBuf,
+    },
+    /// Write a starting configuration file.
+    Init {
+        /// The path to create. Never overwritten.
+        config: PathBuf,
+    },
+    /// Print the SQL that creates Warden's dedicated read-only role.
+    Role {
+        /// The engine whose grant syntax to render.
+        dialect: Dialect,
+        /// The role or user to create. A validated bare identifier.
+        user: String,
+        /// The database or catalog to grant on. A validated bare identifier.
+        database: String,
+        /// PostgreSQL's schema. Ignored on MySQL, whose schema is the database.
+        schema: String,
+    },
+    /// Print the MCP client configuration block for this installation.
+    McpConfig {
+        /// The key the client will show for this server.
+        name: String,
+        /// The configuration file the emitted block will name.
         config: PathBuf,
     },
 }
@@ -114,6 +139,30 @@ pub(crate) enum CliError {
     /// string, which is why the value is dropped rather than repeated into whatever
     /// collects stderr.
     UnquotableTransport,
+    /// A name that cannot be written into SQL unquoted.
+    ///
+    /// Carries the flag — Warden's own literal — and never the value, which is the
+    /// rule the whole type exists for: an identifier that fails this check is
+    /// precisely the kind of string nobody wants echoed into a log.
+    InvalidIdentifier {
+        /// The flag whose value was refused. One of Warden's own literals.
+        flag: &'static str,
+    },
+    /// A name shaped like an identifier that SQL reads as a grantee that already exists.
+    ///
+    /// Separate from [`Self::InvalidIdentifier`] because the shape rule's message would
+    /// send an operator who typed `--user public` looking for punctuation that is not
+    /// there. Carries the flag alone, on the same rule: the refused words are Warden's
+    /// own list, but nothing the operator typed is repeated back.
+    ReservedGrantee {
+        /// The flag whose value was refused. One of Warden's own literals.
+        flag: &'static str,
+    },
+    /// `--dialect` named an engine Warden does not implement.
+    ///
+    /// The value is dropped rather than quoted: this slot takes a bare word, and a
+    /// bare word on this command line can be a password.
+    UnknownDialect,
 }
 
 impl fmt::Display for CliError {
@@ -148,6 +197,18 @@ impl fmt::Display for CliError {
                      and the HTTP transport arrives in Milestone 14"
                 )
             }
+            Self::InvalidIdentifier { flag } => write!(
+                f,
+                "{flag} must be a plain SQL name: a letter or underscore, then letters, \
+                 digits, and underscores, at most 63 characters"
+            ),
+            Self::ReservedGrantee { flag } => write!(
+                f,
+                "{flag} must not be `public`, `current_user`, `session_user`, \
+                 `current_role`, or `none`: SQL reads each of those as a grantee that \
+                 already exists, so the grant would land on it instead of on a new role"
+            ),
+            Self::UnknownDialect => f.write_str("--dialect must be `mysql` or `postgresql`"),
         }
     }
 }
@@ -173,6 +234,9 @@ where
         "help" | "--help" | "-h" => Ok(Command::Help),
         "serve" => parse_serve(args),
         "check" => parse_check(args),
+        "init" => parse_init(args),
+        "role" => parse_role(args),
+        "mcp-config" => parse_mcp_config(args),
         // The subcommand position holds a bare word, and a bare word is as likely to be a
         // pasted secret as a typo. Only a near miss of a name Warden itself defines is
         // quoted back; anything further away is refused without being repeated.
@@ -186,7 +250,15 @@ where
 /// The flag spellings (`--version`, `-h`) are deliberately absent: they are flag-shaped,
 /// so a typo of one is already quotable through [`is_flag_shaped`] when it reaches a
 /// subcommand's flag loop, and a near miss of `-h` is one edit from most short words.
-const COMMANDS: [&str; 4] = ["serve", "check", "version", "help"];
+const COMMANDS: [&str; 7] = [
+    "serve",
+    "check",
+    "init",
+    "role",
+    "mcp-config",
+    "version",
+    "help",
+];
 
 /// The transport names Warden itself defines, for the same near-miss reporting.
 ///
@@ -236,6 +308,137 @@ where
     Ok(Command::Check {
         config: config.unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH)),
     })
+}
+
+/// Parses `init`'s `--config`.
+///
+/// The same flag `serve` and `check` read, so the three commands name one file the
+/// same way: `warden init --config /etc/warden.toml` then
+/// `warden check --config /etc/warden.toml`.
+fn parse_init<I>(mut args: I) -> Result<Command, CliError>
+where
+    I: Iterator<Item = String>,
+{
+    let mut config = None;
+
+    while let Some(argument) = args.next() {
+        let (flag, inline) = split_inline_value(&argument);
+        match flag {
+            "--config" => config = Some(PathBuf::from(value_of("--config", inline, &mut args)?)),
+            unknown => return Err(unknown_argument(unknown)),
+        }
+    }
+
+    Ok(Command::Init {
+        config: config.unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH)),
+    })
+}
+
+/// Parses `role`'s four flags.
+///
+/// `--dialect`, `--user`, and `--database` are required; `--schema` defaults to
+/// `public` and is PostgreSQL's alone. The identifier check runs here rather than in
+/// `onboarding::role_sql` so an invalid name is a usage error with an exit code,
+/// rather than something the rendering has to defend against.
+fn parse_role<I>(mut args: I) -> Result<Command, CliError>
+where
+    I: Iterator<Item = String>,
+{
+    let mut dialect = None;
+    let mut user = None;
+    let mut database = None;
+    let mut schema = None;
+
+    while let Some(argument) = args.next() {
+        let (flag, inline) = split_inline_value(&argument);
+        match flag {
+            "--dialect" => {
+                let value = value_of("--dialect", inline, &mut args)?;
+                dialect = Some(value.parse().map_err(|_| CliError::UnknownDialect)?);
+            }
+            "--user" => user = Some(identifier("--user", inline, &mut args)?),
+            "--database" => database = Some(identifier("--database", inline, &mut args)?),
+            "--schema" => schema = Some(schema_name("--schema", inline, &mut args)?),
+            unknown => return Err(unknown_argument(unknown)),
+        }
+    }
+
+    Ok(Command::Role {
+        dialect: dialect.ok_or(CliError::MissingValue { flag: "--dialect" })?,
+        user: user.ok_or(CliError::MissingValue { flag: "--user" })?,
+        database: database.ok_or(CliError::MissingValue { flag: "--database" })?,
+        schema: schema.unwrap_or_else(|| "public".to_owned()),
+    })
+}
+
+/// Parses `mcp-config`'s `--name` and `--config`.
+///
+/// `--name` is not run through [`identifier`]: it is a JSON object key that
+/// `serde_json` escapes, not SQL, so the identifier rule would reject perfectly good
+/// names like `orders-replica` for no benefit.
+fn parse_mcp_config<I>(mut args: I) -> Result<Command, CliError>
+where
+    I: Iterator<Item = String>,
+{
+    let mut name = None;
+    let mut config = None;
+
+    while let Some(argument) = args.next() {
+        let (flag, inline) = split_inline_value(&argument);
+        match flag {
+            "--name" => name = Some(value_of("--name", inline, &mut args)?),
+            "--config" => config = Some(PathBuf::from(value_of("--config", inline, &mut args)?)),
+            unknown => return Err(unknown_argument(unknown)),
+        }
+    }
+
+    Ok(Command::McpConfig {
+        name: name.unwrap_or_else(|| "warden".to_owned()),
+        config: config.unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH)),
+    })
+}
+
+/// Takes a flag's value and requires it to be a plain SQL identifier.
+///
+/// The strict rule, and the one every identifier flag but `--schema` takes: a name
+/// SQL reads as an existing grantee — `public` above all — is refused here, because
+/// `warden role --user public` renders `GRANT … TO PUBLIC` and psql runs past the
+/// `CREATE ROLE PUBLIC` that fails before it.
+fn identifier<I>(flag: &'static str, inline: Option<&str>, args: &mut I) -> Result<String, CliError>
+where
+    I: Iterator<Item = String>,
+{
+    let value = value_of(flag, inline, args)?;
+    if crate::onboarding::validate_identifier(&value) {
+        Ok(value)
+    } else if crate::onboarding::is_reserved_grantee(&value) {
+        // Only the diagnostic branches here; the refusal above is the single gate.
+        Err(CliError::ReservedGrantee { flag })
+    } else {
+        Err(CliError::InvalidIdentifier { flag })
+    }
+}
+
+/// Takes `--schema`'s value, the one identifier position a reserved grantee word fits.
+///
+/// `public` is PostgreSQL's default schema, this flag's own default, and what the
+/// emitted `GRANT USAGE ON SCHEMA public` is supposed to say. A schema name is never
+/// written into a grantee position, so it takes the shape rule alone — and it says so
+/// by calling a different function rather than by weakening [`identifier`].
+fn schema_name<I>(
+    flag: &'static str,
+    inline: Option<&str>,
+    args: &mut I,
+) -> Result<String, CliError>
+where
+    I: Iterator<Item = String>,
+{
+    let value = value_of(flag, inline, args)?;
+    if crate::onboarding::validate_schema_name(&value) {
+        Ok(value)
+    } else {
+        Err(CliError::InvalidIdentifier { flag })
+    }
 }
 
 /// Takes a flag's value from `--flag=value` or from the argument after it.
@@ -373,16 +576,31 @@ impl std::str::FromStr for Transport {
 
 /// Executes the subcommands that need neither a runtime nor a database, writing to `out`.
 ///
-/// `serve` and `check` are async and are dispatched by `main`, which owns the Tokio
-/// runtime and the process's real descriptors; reaching them here means that dispatch is
-/// broken, so this reports it rather than succeeding silently.
+/// `serve`, `check`, `init`, and `mcp-config` are dispatched by `main` instead: the
+/// first two are async and need the Tokio runtime, and the other two resolve process
+/// globals — a file on disk, `current_exe` — that this module deliberately cannot see.
+/// Reaching them here means that dispatch is broken, so this reports it rather than
+/// succeeding silently.
 pub(crate) fn run(command: Command, out: &mut dyn Write) -> io::Result<()> {
     match command {
         Command::Version => writeln!(out, "warden {}", env!("CARGO_PKG_VERSION")),
         Command::Help => write!(out, "{HELP}"),
-        Command::Serve { .. } | Command::Check { .. } => Err(io::Error::new(
+        Command::Role {
+            dialect,
+            user,
+            database,
+            schema,
+        } => write!(
+            out,
+            "{}",
+            crate::onboarding::role_sql(dialect, &user, &database, &schema)
+        ),
+        Command::Serve { .. }
+        | Command::Check { .. }
+        | Command::Init { .. }
+        | Command::McpConfig { .. } => Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "`serve` and `check` require the runtime that `main` owns",
+            "`serve`, `check`, `init`, and `mcp-config` are executed by `main`",
         )),
     }
 }
@@ -396,12 +614,20 @@ USAGE:
 COMMANDS:
     serve      Serve the MCP tools over the selected transport
     check      Validate the configuration and probe every connection
+    init       Write a starting configuration file
+    role       Print the SQL for Warden's dedicated read-only role
+    mcp-config Print the MCP client configuration for this installation
     version    Show the version
     help       Show this message
 
 FLAGS:
     --config <path>         Configuration file (default: warden.toml)
     --transport <name>      Transport for `serve` (default: stdio)
+    --dialect <name>        Engine for `role` (mysql or postgresql)
+    --user <name>           Role to create, for `role`
+    --database <name>       Database to grant on, for `role`
+    --schema <name>         PostgreSQL schema for `role` (default: public)
+    --name <name>           Server key for `mcp-config` (default: warden)
 ";
 
 #[cfg(test)]
@@ -713,16 +939,217 @@ mod tests {
         let mut out = Vec::new();
         run(Command::Help, &mut out).unwrap();
         let text = String::from_utf8(out).unwrap();
+        // The command half is driven from `COMMANDS`, so the next subcommand added to
+        // the parser is covered here without anyone remembering to extend this list.
+        for expected in COMMANDS {
+            assert!(text.contains(expected), "help omits {expected}:\n{text}");
+        }
+        // The flags have no such constant: every one a subcommand parses is named here
+        // by hand, which is what makes this the guard against a flag that ships
+        // undocumented.
         for expected in [
-            "serve",
-            "check",
-            "version",
-            "help",
             "--config",
             "--transport",
+            "--dialect",
+            "--user",
+            "--database",
+            "--schema",
+            "--name",
         ] {
             assert!(text.contains(expected), "help omits {expected}:\n{text}");
         }
+    }
+
+    #[test]
+    fn parses_init_with_and_without_a_config_path() {
+        assert_eq!(
+            parse(args(&["init"])).unwrap(),
+            Command::Init {
+                config: PathBuf::from(DEFAULT_CONFIG_PATH)
+            }
+        );
+        assert_eq!(
+            parse(args(&["init", "--config", "/etc/warden.toml"])).unwrap(),
+            Command::Init {
+                config: PathBuf::from("/etc/warden.toml")
+            }
+        );
+    }
+
+    #[test]
+    fn init_refuses_a_flag_it_does_not_define() {
+        assert_eq!(
+            parse(args(&["init", "--transport", "stdio"])),
+            Err(CliError::UnknownFlag {
+                flag: "--transport".to_owned()
+            })
+        );
+    }
+
+    #[test]
+    fn parses_role_with_every_flag_and_the_schema_default() {
+        assert_eq!(
+            parse(args(&[
+                "role",
+                "--dialect",
+                "postgresql",
+                "--user",
+                "warden_ro",
+                "--database",
+                "app"
+            ]))
+            .unwrap(),
+            Command::Role {
+                dialect: Dialect::PostgreSql,
+                user: "warden_ro".to_owned(),
+                database: "app".to_owned(),
+                schema: "public".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn role_requires_a_user_and_a_database() {
+        assert_eq!(
+            parse(args(&[
+                "role",
+                "--dialect",
+                "postgresql",
+                "--database",
+                "app"
+            ])),
+            Err(CliError::MissingValue { flag: "--user" })
+        );
+        assert_eq!(
+            parse(args(&[
+                "role",
+                "--dialect",
+                "postgresql",
+                "--user",
+                "warden_ro"
+            ])),
+            Err(CliError::MissingValue { flag: "--database" })
+        );
+    }
+
+    #[test]
+    fn role_refuses_an_identifier_it_cannot_write_unquoted_without_echoing_it() {
+        let refused = parse(args(&[
+            "role",
+            "--dialect",
+            "postgresql",
+            "--user",
+            "warden_ro; DROP TABLE users --",
+            "--database",
+            "app",
+        ]));
+        assert_eq!(refused, Err(CliError::InvalidIdentifier { flag: "--user" }));
+        // The rule the whole error type exists for: an operator's value is never
+        // repeated into whatever collects stderr.
+        let message = format!("{}", refused.unwrap_err());
+        assert!(!message.contains("DROP TABLE"), "{message}");
+    }
+
+    #[test]
+    fn every_identifier_flag_refuses_a_hostile_value_without_echoing_it() {
+        // `--user`, `--database`, and `--schema` all reach a rendered SQL statement, and
+        // all three share one helper; a test for only the first would not notice one of
+        // the other two being wired to something laxer.
+        for flag in ["--user", "--database", "--schema"] {
+            let refused = parse(args(&[
+                "role",
+                "--dialect",
+                "postgresql",
+                "--user",
+                "warden_ro",
+                "--database",
+                "app",
+                flag,
+                "x'; DROP TABLE users --",
+            ]));
+            assert_eq!(refused, Err(CliError::InvalidIdentifier { flag }), "{flag}");
+            let message = format!("{}", refused.unwrap_err());
+            assert!(!message.contains("DROP TABLE"), "{message}");
+        }
+    }
+
+    #[test]
+    fn role_refuses_a_user_sql_reads_as_an_existing_grantee() {
+        // `CREATE ROLE PUBLIC` fails, psql runs past it without `ON_ERROR_STOP=1`, and
+        // the `GRANT … TO PUBLIC` statements after it succeed: the least-privilege
+        // command would grant SELECT on the whole schema to every role there is.
+        for (dialect, user) in [
+            ("postgresql", "public"),
+            ("postgresql", "PUBLIC"),
+            ("mysql", "public"),
+            ("mysql", "PUBLIC"),
+        ] {
+            let refused = parse(args(&[
+                "role",
+                "--dialect",
+                dialect,
+                "--user",
+                user,
+                "--database",
+                "app",
+            ]));
+            assert_eq!(
+                refused,
+                Err(CliError::ReservedGrantee { flag: "--user" }),
+                "{dialect} {user}"
+            );
+        }
+    }
+
+    #[test]
+    fn role_still_takes_public_as_the_schema_it_is() {
+        // `public` is PostgreSQL's default schema and this flag's own default; the
+        // reserved-word rule is about the grantee position and must not reach here.
+        assert_eq!(
+            parse(args(&[
+                "role",
+                "--dialect",
+                "postgresql",
+                "--user",
+                "warden_ro",
+                "--database",
+                "app",
+                "--schema",
+                "public",
+            ]))
+            .unwrap(),
+            Command::Role {
+                dialect: Dialect::PostgreSql,
+                user: "warden_ro".to_owned(),
+                database: "app".to_owned(),
+                schema: "public".to_owned(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_mcp_config_with_its_defaults() {
+        assert_eq!(
+            parse(args(&["mcp-config"])).unwrap(),
+            Command::McpConfig {
+                name: "warden".to_owned(),
+                config: PathBuf::from(DEFAULT_CONFIG_PATH),
+            }
+        );
+        assert_eq!(
+            parse(args(&[
+                "mcp-config",
+                "--name",
+                "orders",
+                "--config",
+                "/etc/w.toml"
+            ]))
+            .unwrap(),
+            Command::McpConfig {
+                name: "orders".to_owned(),
+                config: PathBuf::from("/etc/w.toml"),
+            }
+        );
     }
 
     #[test]

@@ -164,7 +164,7 @@ disallowed_methods = "deny"
 
 [package]
 name = "warden"
-version = "0.1.0"
+version = "0.2.0"
 description = "A secure, read-only MCP gateway for AI agents to explore MySQL and PostgreSQL"
 edition.workspace = true
 rust-version.workspace = true
@@ -206,6 +206,12 @@ tokio-util = { workspace = true }
 tracing = { workspace = true }
 # stderr only: stdout carries MCP (`docs/mcp.md` section 5.1).
 tracing-subscriber = { workspace = true }
+# `mcp-config` renders client JSON, and a path can contain a quote or a backslash —
+# every Windows path contains backslashes. Hand-rolling that escaping is the kind of
+# detail that is wrong once and wrong forever, so the binary serializes again. It was
+# a dev-dependency between ADR-0048, which moved the audit sinks out to
+# `warden-audit`, and this command.
+serde_json = { workspace = true }
 
 
 [features]
@@ -216,10 +222,6 @@ docker = []
 
 [dev-dependencies]
 proc-macro2 = { workspace = true }
-# `tests/architecture.rs` parses `cargo metadata` output to walk the dependency graph.
-# A dev-dependency since the audit sinks moved to `warden-audit` (ADR-0048): the binary
-# itself no longer serializes anything.
-serde_json = { workspace = true }
 # `tests/architecture.rs` reads the workspace's own AST (ADR-0046).
 warden-guards = { workspace = true }
 sha2 = { workspace = true }

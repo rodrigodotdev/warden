@@ -965,13 +965,35 @@ fixed, safe adapter query through `control_pool`.
 warden serve --transport stdio    # shipped in Milestone 12
 warden serve --transport http     # Milestone 14; parsed and refused by name today
 warden check                      # shipped in Milestone 12
+warden init
+warden role --dialect <mysql|postgresql> --user <name> --database <name>
+warden mcp-config
 warden version
 warden help
 ```
 
-`--config <path>` selects the configuration file for `serve` and `check`, and defaults to
-`warden.toml` in the working directory. `--transport http` is not silently ignored: it
-parses and exits with the usage code, naming the transport this build does not serve.
+`--config <path>` selects the configuration file for `serve`, `check`, and
+`mcp-config`, and defaults to `warden.toml` in the working directory; `init` takes the
+same flag to choose where it writes instead. `--transport http` is not silently
+ignored: it parses and exits with the usage code, naming the transport this build does
+not serve.
+
+- `warden init [--config <path>]` writes a starting configuration and refuses to
+  overwrite one that already exists; the confirmation goes to stderr.
+- `warden role --dialect <mysql|postgresql> --user <name> --database <name> [--schema
+  <name>]` prints the least-privilege `CREATE ROLE`/`GRANT` statements on stdout, for
+  piping into a database console. Identifiers must be plain SQL names, and `--user` and
+  `--database` also refuse the words SQL reads as existing grantees (`public`,
+  `current_user`, `session_user`, `current_role`, `none`); `--schema public` stays legal,
+  because a schema name is never a grantee.
+- `warden mcp-config [--name <name>] [--config <path>]` prints the MCP client
+  configuration block on stdout with the binary and configuration paths resolved
+  absolutely, including a configuration file that does not exist yet — a client spawns
+  its servers with an arbitrary working directory, so a relative path there is the
+  failure this command exists to prevent. It notes the missing file on stderr. The
+  binary it names is the running executable, so run it from an installed binary rather
+  than through `npx`: there the executable lives in a cache npm is free to evict, and
+  the npm launcher's own `"command": "npx"` block (section 12.7) is the stable form.
 
 `warden check` is everything `warden serve` would do, minus serving. It loads and
 validates the configuration, resolves every secret reference, opens and drops the
@@ -996,7 +1018,10 @@ exit code stays 0 and the last line says so.
 **The report goes to stderr, not stdout.** `warden check`'s answer is its exit code and
 the lines explain it; stdout carries MCP and nothing else (`docs/mcp.md` section 5.1), and
 a command whose output habit differs from `serve`'s is a command that eventually prints
-into a protocol stream. `version` and `help`, which serve nothing, write to stdout.
+into a protocol stream. Four commands write to stdout: `version` and `help`, which serve
+nothing, and `role` and `mcp-config`, whose output is a payload meant to be piped — a SQL
+script into a database console, a JSON block into a client's configuration. Their
+diagnostics still go to stderr, so a pipe carries the payload alone.
 
 Avoid a heavyweight CLI framework until argument complexity justifies one.
 
@@ -1104,7 +1129,7 @@ per-task panic containment (`docs/security.md` section 14) depends on unwinding.
 ### 12.4 Targets
 
 Linux x86_64, Linux aarch64, macOS x86_64, macOS aarch64, and Windows x86_64 all
-ship as of v0.1.0. An OCI image does not yet. The selected SQL stack requires neither
+ship as of v0.2.0. An OCI image does not yet. The selected SQL stack requires neither
 `libmysqlclient` nor `libpq`, which is what makes each of these a single self-contained
 executable.
 
@@ -1114,8 +1139,9 @@ not an omission.
 
 ### 12.5 Container
 
-**Warden ships no `Dockerfile` or `Containerfile`.** As of v0.1.0 the distributable
-artifacts are the release archives of section 12.7 and the source repository. This
+**Warden ships no `Dockerfile` or `Containerfile`.** As of v0.2.0 the distributable
+artifacts are the release archives of section 12.7, the npm packages and the Homebrew
+formula they feed, and the source repository. This
 section is therefore a checklist for the day a container image appears, not a
 description of one that exists; read every requirement below as binding on that future
 image.
@@ -1173,13 +1199,84 @@ untuned, and symbols are what make an operator's panic report actionable.
 Both licenses are in every archive, and `tests/architecture.rs` fails the build if the
 staging step stops copying either (section 2.7).
 
+**A tag also updates the Homebrew tap.** `rodrigodotdev/homebrew-tap` holds one
+formula, `Formula/warden.rb`, rendered by `packaging/homebrew/render.sh` from the
+template in this repository and the release's own `SHA256SUMS`. Checksums are read from
+that published manifest rather than recomputed from a fresh download: it is what the
+release signed, and a second computation is a second chance to describe something other
+than what was published. A missing entry fails the render rather than producing a
+formula with a blank `sha256`.
+
+The formula covers the four unix archives. Homebrew installs no Windows binary, and
+`packaging/homebrew/test-render.sh` — which the gate runs on every pull request —
+asserts that the Windows asset never appears in the rendering.
+
+**Do not edit the formula in the tap.** The next tag overwrites it. Fix
+`packaging/homebrew/warden.rb.template` here and cut a tag.
+
+**A tag also publishes seven npm packages.** Five carry one prebuilt binary each and
+declare `os` and `cpu` — and, on Linux, `libc = ["glibc"]`, so npm skips them on Alpine
+instead of installing a binary whose loader is missing. The sixth is `warden-db-mcp`, a
+launcher that names them as optional dependencies and runs whichever one is present as
+a child process. They are assembled from the archives above rather than from a separate
+build, so the binary on npm is the one the release page serves and the attestation
+covers, and each tarball is published with `npm publish --provenance`.
+
+**The launcher is a parent process, not an exec.** It calls `spawnSync`, so node stays
+alive as the parent with its event loop blocked for the whole run. Two consequences an
+operator should know. A `SIGTERM` sent to the `npx` process cannot reach Warden's own
+drain handler (`src/main.rs`): node is blocked and forwards nothing, and the signal
+does not reach the child on its own. What does shut Warden down cleanly is the MCP
+client closing stdin — the descriptors are inherited, so the stdio transport sees EOF
+and drains exactly as it does under a direct invocation. Clients that stop a server by
+closing the pipe, which is how MCP stdio servers are stopped, are unaffected. Operators
+who need signal-driven shutdown should run the binary from the release archive rather
+than through `npx`.
+
+**The dist-tag is derived from the version, not defaulted.** The tag filter admits
+`v0.2.0-rc.1`, and `npm publish` with no `--tag` writes `latest`, which would point
+every `npx -y warden-db-mcp` at a release candidate. A version containing `-` publishes
+under `next`; everything else under `latest`.
+
+A seventh package, `warden-sql-mcp`, is an alias: no binary and no logic, depending on
+the launcher at an exact version and calling its `main` in the same process. It is
+published and then deprecated with a message naming the canonical package, so it
+installs and runs while telling anyone who used it which name to prefer. It exists
+because that name in someone else's hands would be an MCP server installing itself next
+to database credentials, and npm's name-dispute policy protects a name that is used
+rather than one merely held. **Never give the launcher an `exports` field**: the alias
+reaches it through a deep path that an `exports` map would make unresolvable.
+
+**No package in that set declares a lifecycle script**, and `npm/test/shim.test.mjs`
+asserts it on every generated manifest. An install script that downloads or executes is
+the pattern this distribution exists to avoid; npm's own `os`/`cpu` resolution replaces
+it. `warden-mcp` was taken on npm by an unrelated package, which is why the canonical
+name is `warden-db-mcp`.
+
+**Publishing needs one repository secret: `NPM_TOKEN`**, read by the `npm` job as
+`NODE_AUTH_TOKEN`. Make it an npm **automation** token. A classic or granular token
+belonging to an account with two-factor authentication enabled on publishes will prompt
+for an OTP, and there is nobody at the runner to answer; an automation token is the one
+kind exempt from that prompt. The token needs publish rights on all seven names. It is
+the only credential the release uses that GitHub does not mint itself — everything else
+runs on the workflow's own OIDC identity and `GITHUB_TOKEN`.
+
+**When the npm job fails, the GitHub release is already published.** The `npm` job runs
+after `publish`, so a red npm job never means a missing release page. Some of the seven
+packages may already be on the registry: each publish is skipped when that name and
+version is already there, and `npm deprecate` is idempotent too, so **the fix is to
+re-run the failed job**. It will publish only what is missing, in dependency order.
+Publishing by hand is never the answer — a hand-published tarball carries no provenance
+attestation, which is the property the whole pipeline exists to give. If the job fails
+because the token expired, replace `NPM_TOKEN` and re-run.
+
 **Every published file carries signed build provenance.** `SHA256SUMS` is a subject
 too, so the list of hashes cannot be swapped independently of what it lists. Verifying
 a download takes both steps:
 
 ```bash
 sha256sum --check --ignore-missing SHA256SUMS
-gh attestation verify warden-v0.1.0-x86_64-unknown-linux-gnu.tar.gz \
+gh attestation verify warden-v0.2.0-x86_64-unknown-linux-gnu.tar.gz \
   --repo rodrigodotdev/warden
 ```
 

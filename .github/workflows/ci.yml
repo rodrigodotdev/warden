@@ -58,6 +58,15 @@ jobs:
       # `-shellcheck` is named rather than left to auto-detection so this step and
       # `mise run lint:actions` run the same pinned binary over the same `run` blocks.
       - run: actionlint -shellcheck shellcheck
+      # The formula is rendered on a tag, which is the worst moment to find that the
+      # renderer is broken. Its own test needs no Homebrew and no network.
+      - run: ./packaging/homebrew/test-render.sh
+      # The npm launcher is product code: it is what an MCP client actually executes.
+      # `node --test` needs no dependencies, so there is nothing to install first.
+      # The files are named rather than the directory: on the runner's Node 22 a
+      # directory argument is loaded as a module and fails with MODULE_NOT_FOUND.
+      - name: npm launcher tests
+        run: node --test npm/test/*.test.mjs
       - run: cargo check --workspace --all-targets
       # A workspace build unifies features across the graph, so a crate that uses a
       # feature it never declared still compiles anyway. Checking each package alone is

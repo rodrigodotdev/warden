@@ -234,3 +234,172 @@ jobs:
             --notes-file NOTES.md \
             --verify-tag \
             dist/*
+
+  homebrew:
+    name: update the Homebrew tap
+    needs: [verify, publish]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The published manifest, not a recomputed one. `publish` has already uploaded
+      # it, and it is what the build attestation covers.
+      - name: Download the release checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release download "${GITHUB_REF_NAME}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern SHA256SUMS \
+            --dir .
+          cat SHA256SUMS
+
+      - name: Render the formula
+        run: |
+          set -euo pipefail
+          ./packaging/homebrew/render.sh "${{ needs.verify.outputs.version }}" SHA256SUMS > warden.rb
+          cat warden.rb
+
+      # A fine-grained token scoped to the tap alone: GITHUB_TOKEN cannot push to
+      # another repository, and a broader token would put this one at risk for a
+      # formula bump.
+      #
+      # The clone stays anonymous — the tap is public — and the token is supplied
+      # only on the `git push` command line, never on `git clone`. A tokenized
+      # clone URL is written verbatim into tap/.git/config, leaving the PAT in
+      # plaintext on disk for the rest of the job.
+      - name: Commit it to the tap
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/rodrigodotdev/homebrew-tap.git tap
+          mkdir -p tap/Formula
+          cp warden.rb tap/Formula/warden.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Formula/warden.rb
+          if git diff --cached --quiet -- Formula/warden.rb; then
+            echo "the formula already describes ${VERSION}; nothing to push"
+            exit 0
+          fi
+          git commit -m "warden ${VERSION}"
+          branch="$(git rev-parse --abbrev-ref HEAD)"
+          git push "https://x-access-token:${GH_TOKEN}@github.com/rodrigodotdev/homebrew-tap.git" \
+            "HEAD:refs/heads/${branch}"
+
+  npm:
+    name: publish to npm
+    needs: [verify, build, publish]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      # npm provenance is signed with a short-lived OIDC identity, the same mechanism
+      # the build attestation uses.
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: dist
+          merge-multiple: true
+
+      # The archives are the published artifacts, unchanged: the npm packages carry the
+      # same binaries the release page serves and the attestation covers.
+      - name: Unpack every archive
+        run: |
+          set -euo pipefail
+          mkdir -p unpacked
+          cd dist
+          for archive in *.tar.gz; do
+            tar -xzf "$archive" -C ../unpacked
+          done
+          for archive in *.zip; do
+            unzip -q "$archive" -d ../unpacked
+          done
+          ls -1 ../unpacked
+
+      - name: Assemble the packages
+        run: >
+          node npm/build.mjs
+          --version ${{ needs.verify.outputs.version }}
+          --archives unpacked
+          --out packages
+
+      # Publication order is dependency order. Platform packages first: the launcher
+      # names them as optional dependencies, and a launcher published before them
+      # resolves to nothing for anyone installing in the gap. The alias last, because
+      # it pins the launcher at this exact version.
+      #
+      # `--provenance` links each published tarball to this workflow run and this
+      # commit, the npm counterpart of the build attestation on the release assets.
+      #
+      # The dist-tag is derived, never defaulted. The tag filter admits `v0.2.0-rc.1`,
+      # and npm's default tag is `latest`, so without this every `npx -y warden-db-mcp`
+      # in the world would resolve to a release candidate. A version containing `-` is
+      # a pre-release by SemVer and goes to `next`.
+      #
+      # Each publish is guarded rather than attempted blindly. `set -e` means a failure
+      # part-way through leaves the rest unpublished — which is the right order to fail
+      # in, since the launcher must never precede its platform packages — but a re-run
+      # would then abort on the first already-published name with EPUBLISHCONFLICT and
+      # never reach the launcher. Skipping what is already there makes the job
+      # idempotent, so recovering a partial publish is re-running it rather than
+      # publishing by hand.
+      - name: Publish
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          VERSION: ${{ needs.verify.outputs.version }}
+        run: |
+          set -euo pipefail
+          case "$VERSION" in
+            *-*) npm_tag="next" ;;
+            *) npm_tag="latest" ;;
+          esac
+          echo "publishing ${VERSION} under the ${npm_tag} dist-tag"
+
+          publish() {
+            directory="$1"
+            # The build script names each directory after the package it holds.
+            name="$(basename "$directory")"
+            if npm view "${name}@${VERSION}" version > /dev/null 2>&1; then
+              echo "${name}@${VERSION} is already published; skipping"
+              return 0
+            fi
+            npm publish "$directory" --access public --provenance --tag "$npm_tag"
+          }
+
+          for package in packages/warden-db-mcp-*; do
+            publish "$package"
+          done
+          publish packages/warden-db-mcp
+          publish packages/warden-sql-mcp
+
+      # The alias installs and runs; the deprecation is the signpost that says which
+      # name to use. Re-running it every release keeps the newest version marked too,
+      # since `npm deprecate` applies to the versions matching the range and a fresh
+      # publish is not deprecated by an earlier call.
+      - name: Signpost the alias
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          npm deprecate 'warden-sql-mcp@*' \
+            'This is an alias. Install warden-db-mcp; it is the same server.'

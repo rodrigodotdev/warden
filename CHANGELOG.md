@@ -13,6 +13,37 @@ implementation details before `1.0` and change without notice (`SPEC.md` section
 
 Nothing yet.
 
+## [0.2.0] - 2026-09-09
+
+Warden becomes installable and startable without hand-written files. Three new
+subcommands turn a fresh binary into a working MCP server, and two package managers now
+carry that binary. Nothing about the MCP tool schemas or the configuration format
+changed, so a 0.1.0 deployment upgrades in place.
+
+### Added
+
+- **npm distribution.** `npx -y warden-db-mcp` installs one prebuilt binary for the
+  platform and runs it, so an MCP client configuration needs no path to a downloaded
+  file. No package in the set declares an install script; npm resolves the platform
+  through `os` and `cpu` fields. Every tarball is published with npm provenance from
+  the same tag that publishes the release archives. `warden-sql-mcp` is published as a
+  deprecated alias of the same server, so the neighbouring name resolves to Warden.
+- **Homebrew tap.** `brew install rodrigodotdev/tap/warden` installs Warden on macOS
+  and Linux, on both x86_64 and arm64. Every tag renders the formula from the
+  release's own `SHA256SUMS` and pushes it, so the tap cannot describe a version that
+  was never published.
+- **`warden init`.** Writes a starting configuration and refuses to overwrite one that
+  already exists. The file it writes keeps the strict TLS default and carries no DSN.
+- **`warden role`.** Prints the least-privilege `CREATE ROLE` and `GRANT` statements
+  for MySQL or PostgreSQL — the database role is the real write boundary, and until
+  now nothing helped an operator create it. `--user` and `--database` take a plain SQL
+  name and refuse the words SQL reads as grantees that already exist, `public` above
+  all, so the script can never grant `SELECT` to every role in the database.
+- **`warden mcp-config`.** Prints the MCP client block with the binary and
+  configuration paths already resolved absolutely — including a `warden.toml` that
+  does not exist yet — which is what an MCP client needs because it spawns servers with
+  an arbitrary working directory.
+
 ## [0.1.0] - 2026-09-08
 
 The first developer-usable release. Warden runs as an MCP server over stdio and gives
@@ -97,5 +128,6 @@ These are documented deliberately, not oversights; `SPEC.md` section 7 and
 - A JSON document's integers above 2^53 reach a JavaScript client unquoted, and a
   PostgreSQL `time` of `24:00:00` reads back as `00:00:00`.
 
-[Unreleased]: https://github.com/rodrigodotdev/warden/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/rodrigodotdev/warden/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/rodrigodotdev/warden/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/rodrigodotdev/warden/releases/tag/v0.1.0

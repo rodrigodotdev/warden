@@ -7,11 +7,12 @@
 mod audit;
 mod check;
 mod cli;
+mod onboarding;
 mod panic;
 mod startup;
 
 use std::io::{self, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use anyhow::{Context as _, Result};
@@ -53,6 +54,8 @@ fn main() -> ExitCode {
     match command {
         Command::Serve { config, transport } => report(block_on(run_serve(&config, transport))),
         Command::Check { config } => report(block_on(run_check(&config))),
+        Command::Init { config } => run_init(&config),
+        Command::McpConfig { name, config } => run_mcp_config(&name, &config),
         immediate => run_immediate(immediate),
     }
 }
@@ -139,6 +142,107 @@ async fn run_check(config: &Path) -> Result<ExitCode> {
     // A warning describes a deployment an operator may have chosen; only a failed check
     // is a non-zero exit.
     Ok(ExitCode::SUCCESS)
+}
+
+/// Writes a starting configuration, refusing to touch a file that already exists.
+///
+/// `create_new` is the whole safety property: `warden init` is a command an operator
+/// may run twice, and the second run must not silently replace an edited file. The
+/// confirmation goes to stderr because stdout is reserved for MCP.
+fn run_init(config: &Path) -> ExitCode {
+    let mut stderr = io::stderr().lock();
+
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(config)
+    {
+        Ok(mut file) => match file.write_all(onboarding::config_template().as_bytes()) {
+            Ok(()) => {
+                let _ = writeln!(stderr, "warden: wrote {}", config.display());
+                let _ = writeln!(
+                    stderr,
+                    "warden: edit it, then run `warden check --config {}`",
+                    config.display()
+                );
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                // `create_new` already made the file, so what a failed write leaves
+                // behind is Warden's own truncated template — and the next run would
+                // report it as a file that "already exists and was left unchanged",
+                // which is the one thing it is not. Best effort: if the removal fails
+                // too, the message above is still the accurate one.
+                let _ = std::fs::remove_file(config);
+                let _ = writeln!(
+                    stderr,
+                    "warden: {} could not be written: {error}",
+                    config.display()
+                );
+                ExitCode::FAILURE
+            }
+        },
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let _ = writeln!(
+                stderr,
+                "warden: {} already exists and was left unchanged",
+                config.display()
+            );
+            ExitCode::FAILURE
+        }
+        Err(error) => {
+            let _ = writeln!(
+                stderr,
+                "warden: {} could not be created: {error}",
+                config.display()
+            );
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Prints the client configuration block, with both paths made absolute.
+///
+/// `current_exe`, `canonicalize`, and the working directory `absolute` reads are
+/// process globals, which is why this lives here rather than in `cli`
+/// (`docs/architecture.md` section 2).
+///
+/// The absolute `--config` path is the entire point of the command, so it is resolved
+/// twice over. `canonicalize` needs the file to exist, and an operator who runs
+/// `mcp-config` before `init` would otherwise get the relative default back — a block
+/// the client accepts and then fails to spawn, which is precisely the failure this
+/// command exists to prevent. `std::path::absolute` makes a path absolute without
+/// requiring the file, so print-as-written is left for the case where even that fails.
+fn run_mcp_config(name: &str, config: &Path) -> ExitCode {
+    let binary = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("warden"));
+    // Canonical first: it resolves symlinks and `..`, and a client spawns this from
+    // some other directory. `absolute` is the fallback the missing file needs.
+    let resolved = config
+        .canonicalize()
+        .or_else(|_missing| std::path::absolute(config))
+        .unwrap_or_else(|_| config.to_path_buf());
+
+    // A note, not a failure: the block is still correct for the file `warden init`
+    // will write there, and it goes to stderr so the JSON stays pipeable.
+    if !config.exists() {
+        let mut stderr = io::stderr().lock();
+        let _ = writeln!(
+            stderr,
+            "warden: {} does not exist yet; run `warden init --config {}` before serving",
+            resolved.display(),
+            resolved.display()
+        );
+    }
+
+    let mut stdout = io::stdout().lock();
+    match writeln!(
+        stdout,
+        "{}",
+        onboarding::mcp_config_json(name, &binary, &resolved)
+    ) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(_broken_pipe) => ExitCode::FAILURE,
+    }
 }
 
 /// Waits for `SIGINT` or, on Unix, `SIGTERM`.
