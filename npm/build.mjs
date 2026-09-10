@@ -58,7 +58,7 @@ function copyLicenses(from, to) {
 
 for (const target of selected) {
   const staged = path.join(archives, `warden-v${version}-${target.rustTarget}`);
-  const destination = path.join(out, target.package);
+  const destination = path.join(out, target.directory);
   fs.mkdirSync(path.join(destination, "bin"), { recursive: true });
 
   const binary = path.join(destination, "bin", target.binary);
@@ -92,6 +92,11 @@ for (const target of selected) {
         ...(target.platform === "linux" ? { libc: ["glibc"] } : {}),
         files: ["bin/", "README.md", "LICENSE", "LICENSES/"],
         preferUnplugged: true,
+        // A scoped package is restricted unless told otherwise, and a restricted
+        // platform package is one npm refuses to serve to anyone installing the
+        // launcher. `--access public` on the publish covers it; saying it here too
+        // means no invocation can get it wrong.
+        publishConfig: { access: "public" },
       },
       null,
       2,
