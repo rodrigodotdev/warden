@@ -109,6 +109,28 @@ test("the release workflow builds exactly the targets the map declares", () => {
   assert.deepEqual(matrix.sort(), TARGETS.map((target) => target.rustTarget).sort());
 });
 
+test("every npm publish in the release workflow names a directory, not a repo", () => {
+  // npm parses a bare `a/b` argument as a GitHub `owner/repo` shorthand before it
+  // looks at the filesystem, so `npm publish packages/warden-db-mcp-darwin-arm64`
+  // clones over SSH and exits 128 rather than publishing the directory that is
+  // plainly there. It cost one tag to learn; the `./` is what makes it a path.
+  const workflow = fs.readFileSync(RELEASE_WORKFLOW, "utf8");
+  // Comment lines are skipped: the one above this call site quotes the broken form
+  // on purpose, and a guard that its own explanation trips is a guard nobody keeps.
+  const args = workflow
+    .split("\n")
+    .filter((line) => !line.trimStart().startsWith("#"))
+    .flatMap((line) => [...line.matchAll(/npm publish (\S+)/g)].map((m) => m[1]));
+
+  assert.ok(args.length > 0, "release.yml no longer runs npm publish");
+  for (const arg of args) {
+    assert.ok(
+      arg.startsWith('"./') || arg.startsWith("./"),
+      `npm publish ${arg} is a git spec to npm, not a directory`,
+    );
+  }
+});
+
 test("binaryPath returns nothing when there is no package to find", () => {
   assert.equal(shim.binaryPath("freebsd", "x64"), null, "an unsupported pair has no package");
   // Supported, but no platform package is installed beside this checkout, which is the
