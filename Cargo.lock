@@ -3091,7 +3091,7 @@ dependencies = [
  "serde_json",
  "sha2 0.11.0",
  "sqlx",
- "syn 2.0.119",
+ "syn 3.0.5",
  "testcontainers-modules",
  "tokio",
  "tokio-util",
@@ -3118,7 +3118,7 @@ dependencies = [
  "same-file",
  "serde",
  "serde_json",
- "syn 2.0.119",
+ "syn 3.0.5",
  "time",
  "tokio",
  "tracing",
@@ -3134,7 +3134,7 @@ version = "0.1.0"
 dependencies = [
  "secrecy",
  "serde",
- "syn 2.0.119",
+ "syn 3.0.5",
  "thiserror",
  "toml",
  "warden-core",
@@ -3159,7 +3159,7 @@ version = "0.1.0"
 dependencies = [
  "proc-macro2",
  "quote",
- "syn 2.0.119",
+ "syn 3.0.5",
 ]
 
 [[package]]
@@ -3170,7 +3170,7 @@ dependencies = [
  "rmcp",
  "serde",
  "serde_json",
- "syn 2.0.119",
+ "syn 3.0.5",
  "thiserror",
  "tokio",
  "tokio-util",
@@ -3194,7 +3194,7 @@ dependencies = [
  "sha2 0.11.0",
  "sqlparser",
  "sqlx",
- "syn 2.0.119",
+ "syn 3.0.5",
  "testcontainers-modules",
  "thiserror",
  "time",
@@ -3243,7 +3243,7 @@ dependencies = [
  "sha2 0.11.0",
  "sqlparser",
  "sqlx",
- "syn 2.0.119",
+ "syn 3.0.5",
  "testcontainers-modules",
  "thiserror",
  "time",
@@ -3262,7 +3262,7 @@ version = "0.1.0"
 dependencies = [
  "proc-macro2",
  "serde_json",
- "syn 2.0.119",
+ "syn 3.0.5",
  "thiserror",
  "time",
  "tokio",
