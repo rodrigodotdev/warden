@@ -182,7 +182,7 @@ but public material does not present it as a security boundary.
   cannot build an `ObjectRef`.
 
   **Shipped in Milestone 5.** `warden-postgres` applies the same rule to its own CTE
-  subtraction: an unquoted alias folds to lowercase, a quoted one does not, so
+  resolution: an unquoted alias folds to lowercase, a quoted one does not, so
   `WITH "Report" AS (…) SELECT * FROM report` correctly reports `report` as a base
   table. It also refuses to describe `SELECT * FROM ONLY t`, which sqlparser 0.62
   parses as a relation named `ONLY`; recording that name would make the object rules

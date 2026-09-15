@@ -35,15 +35,18 @@ const TRUSTED_FUNCTION_SCHEMA: &str = "pg_catalog";
 /// Everything one walk of the tree saw.
 ///
 /// Not a `QueryAnalysis`: the analyzer still has to add the statement count and the
-/// fingerprint, and to subtract the CTE names. Keeping those steps outside the
-/// visitor keeps the visitor a pure observer.
+/// fingerprint. CTE resolution is not a step outside the visitor either — `scopes`
+/// tracks, at every point in the walk, which aliases the server would resolve there
+/// (`crate::scope`), so a relation that names a CTE in scope is never recorded as an
+/// object to begin with.
 #[derive(Debug, Default)]
 pub(crate) struct Evidence {
     /// Statement kinds in visit order. The first is the root.
     pub(crate) kinds: Vec<StatementKind>,
     /// Relations that did not resolve to a CTE where they appeared.
     pub(crate) objects: Vec<ObjectRef>,
-    /// CTE visibility for the query currently being walked.
+    /// CTE visibility for every query scope currently open — the whole nesting
+    /// stack, not only the innermost query.
     scopes: CteScopes,
     /// Functions the statement invokes.
     pub(crate) functions: Vec<FunctionRef>,
@@ -210,8 +213,8 @@ impl Evidence {
     /// way: `FunctionSafetyPolicy::qualified()` renders `schema.name` in its audit
     /// detail.
     ///
-    /// The bare name is folded by [`folded`] — the same helper CTE subtraction uses —
-    /// before it reaches the registry. Without this, `"Count"(1)` would be lowercased
+    /// The bare name is folded by [`folded`] — the same helper CTE resolution in
+    /// `crate::scope` uses — before it reaches the registry. Without this, `"Count"(1)` would be lowercased
     /// on its way into `functions::classify` and match the `count` entry despite
     /// being a different, quoted identifier: exactly the laundering ADR-0029 exists to
     /// close, achieved with quote characters instead of a schema qualifier.
@@ -505,7 +508,7 @@ mod tests {
     }
 
     #[test]
-    fn cte_subtraction_folds_each_side_by_its_own_quoting() {
+    fn cte_resolution_folds_each_side_by_its_own_quoting() {
         // An unquoted alias folds, so a differently cased reference is the CTE.
         assert_eq!(
             names(&evidence(

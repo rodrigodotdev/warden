@@ -209,7 +209,12 @@ mod tests {
             probe("WITH RECURSIVE a AS (SELECT * FROM t), t AS (SELECT 1) SELECT * FROM a"),
             vec![true, true, true]
         );
-        // outer, body of a (t is later: invisible), body of t (sees itself? no: non-recursive)
+    }
+
+    #[test]
+    fn a_non_recursive_body_does_not_see_an_alias_declared_after_it() {
+        // outer, body of a (t is declared later in this non-recursive WITH: invisible),
+        // body of t (declared after a, so a is not in scope for it either)
         assert_eq!(
             probe("WITH a AS (SELECT * FROM t), t AS (SELECT 1) SELECT * FROM a"),
             vec![true, false, false]

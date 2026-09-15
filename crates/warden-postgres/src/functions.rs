@@ -14,7 +14,8 @@
 //! family) and a registry too narrow to cover them would deny plain queries.
 //!
 //! Names arrive already folded. `visit::record_function` calls the shared `folded()`
-//! helper — the same one CTE subtraction uses — before consulting this registry: an
+//! helper — the same one CTE resolution in `crate::scope` uses — before consulting
+//! this registry: an
 //! unquoted identifier is lowercased the way PostgreSQL itself folds it, and a quoted
 //! one is compared by its literal, unfolded characters (ASCII-only on purpose: Unicode
 //! folding would make a security comparison depend on locale data). Every entry below

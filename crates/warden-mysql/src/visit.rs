@@ -23,15 +23,18 @@ use crate::statement::kind_of;
 /// Everything one walk of the tree saw.
 ///
 /// Not a `QueryAnalysis`: the analyzer still has to add the statement count, the
-/// fingerprint, and the token-guard risks, and to subtract the CTE names. Keeping
-/// those steps outside the visitor keeps the visitor a pure observer.
+/// fingerprint, and the token-guard risks. CTE resolution is not a step outside the
+/// visitor either — `scopes` tracks, at every point in the walk, which aliases the
+/// server would resolve there (`crate::scope`), so a relation that names a CTE in
+/// scope is never recorded as an object to begin with.
 #[derive(Debug, Default)]
 pub(crate) struct Evidence {
     /// Statement kinds in visit order. The first is the root.
     pub(crate) kinds: Vec<StatementKind>,
     /// Relations that did not resolve to a CTE where they appeared.
     pub(crate) objects: Vec<ObjectRef>,
-    /// CTE visibility for the query currently being walked.
+    /// CTE visibility for every query scope currently open — the whole nesting
+    /// stack, not only the innermost query.
     scopes: CteScopes,
     /// Functions the statement invokes.
     pub(crate) functions: Vec<FunctionRef>,

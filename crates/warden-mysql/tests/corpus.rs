@@ -777,6 +777,38 @@ fn cte_names_are_resolved_in_scope() {
 }
 
 #[test]
+fn a_cte_named_after_a_denied_table_no_longer_hides_it() {
+    use warden_policy::settings::ObjectRules;
+    let settings = PolicySettings {
+        objects: ObjectRules {
+            deny_tables: vec!["orders".to_owned(), "secrets".to_owned()],
+            ..ObjectRules::default()
+        },
+        ..PolicySettings::default()
+    };
+    let engine = PolicyEngine::with_defaults(&settings).unwrap();
+    for sql in [
+        "WITH orders AS (SELECT * FROM orders) SELECT * FROM orders",
+        "SELECT * FROM secrets WHERE EXISTS (WITH secrets AS (SELECT 1) SELECT * FROM secrets)",
+    ] {
+        let analyzed = MySqlAnalyzer::new().analyze(request(sql)).unwrap();
+        let rejection = engine
+            .authorize(
+                &context(),
+                &connection(),
+                analyzed,
+                ExecutionLimits::default(),
+            )
+            .unwrap_err();
+        assert_eq!(
+            rejection.primary_code(),
+            DenyCode::ObjectNotAllowed,
+            "{sql}"
+        );
+    }
+}
+
+#[test]
 fn no_analysis_ever_carries_the_statement_or_a_literal() {
     // SPEC section 6, invariants 22 and 23: an audit record built from this analysis
     // must not become a second store of the data an agent searched for.
