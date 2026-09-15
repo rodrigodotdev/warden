@@ -129,17 +129,15 @@ Seven structural bypasses exist:
 4. **Identifier folding.** PostgreSQL folds unquoted identifiers to lowercase, so a
    deny-list entry named `Users` would never match. MySQL case sensitivity depends on
    `lower_case_table_names` and the file system.
-5. **CTE-name shadowing (both analyzers).** `visit::collect` subtracts every
-   unqualified relation whose name matches a declared CTE alias anywhere in the
-   statement, not only within that alias's own scope. `WITH orders AS (SELECT * FROM
-   orders) SELECT * FROM orders` self-references the real base table — MySQL resolves
-   a non-`RECURSIVE` CTE's own body to a table of that name — but the analyzer drops
-   it along with the alias, so `TableAllowDenyPolicy` never evaluates it.
-
-   The PostgreSQL analyzer folds each side by its own quoting rather than comparing
-   case-insensitively, which is accurate for that dialect, but it is equally
-   scope-blind: `WITH orders AS (SELECT * FROM orders) SELECT * FROM orders` loses
-   the real base table there too.
+5. **CTE-name shadowing (both analyzers).** Closed in Milestone 13.2. Each
+   analyzer's `scope.rs` tracks, at every point in the walk, which CTE aliases the
+   server would actually resolve there, so `WITH orders AS (SELECT * FROM orders)
+   SELECT * FROM orders` now keeps `orders` as the real base table — a
+   non-`RECURSIVE` body cannot see its own alias — and `TableAllowDenyPolicy`
+   evaluates it. The dialects differ on what `RECURSIVE` exposes: PostgreSQL makes
+   every alias of the `WITH` visible to every body, including one declared later;
+   MySQL 8.4 makes a body see itself and the siblings declared before it, never one
+   declared after.
 
 6. **`INSERT`, `COPY`, and DDL target relations (both analyzers).** `INSERT INTO t`,
    `COPY t FROM/TO`, and every DDL target (`CREATE TABLE`, `ALTER TABLE`, `DROP`,
@@ -182,20 +180,19 @@ but public material does not present it as a security boundary.
   table. It also refuses to describe `SELECT * FROM ONLY t`, which sqlparser 0.62
   parses as a relation named `ONLY`; recording that name would make the object rules
   evaluate a relation that does not exist.
-- **CTE names and subquery aliases are not `ObjectRef`.** The shipped MySQL analyzer
-  does not track scope to distinguish them precisely; it approximates by dropping any
-  unqualified relation whose name matches a declared CTE alias anywhere in the
-  statement. That correctly removes the alias from `WITH x AS (SELECT * FROM secrets)
-  SELECT * FROM x`, but it also removes a real relation that happens to share a CTE's
-  name (bypass 5, above). Precise scope resolution needs a name resolver the analyzer
-  does not have.
+- **CTE names and subquery aliases are not `ObjectRef`.** A CTE alias must never be
+  reported as if it were a real relation, and a real relation that happens to share a
+  CTE's name must never be dropped for it (bypass 5, above). Getting both right needs
+  scope: which aliases the server would actually resolve at the point a name appears,
+  not merely whether that name matches an alias declared anywhere in the statement.
 
-  **Resolved in scope since Milestone 13.2:** a name is omitted only where the server
-  would resolve it to a CTE — a non-recursive body does not see its own alias, a
-  subquery's alias is invisible outside it, and `WITH RECURSIVE` makes every alias of
-  the list visible to every body. The global subtraction that dropped every homonym,
-  and let `WITH secrets AS (SELECT 1)` inside a subquery hide the real `secrets`, is
-  gone.
+  **Resolved in scope since Milestone 13.2, for both analyzers:** a name is omitted
+  only where the server would resolve it to a CTE — a non-recursive body does not see
+  its own alias, a subquery's alias is invisible outside it, and `RECURSIVE` makes
+  more of the list visible to a body (every alias on PostgreSQL, itself and earlier
+  siblings only on MySQL 8.4). The global subtraction that dropped every homonym
+  anywhere in the statement, and let `WITH secrets AS (SELECT 1)` inside a subquery
+  hide the real `secrets`, is gone.
 
 ### 5.2 Object policy applies to every tool
 

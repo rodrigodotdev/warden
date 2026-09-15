@@ -1418,6 +1418,74 @@ async fn the_analyzed_statement_is_the_executed_one() {
 }
 
 #[tokio::test]
+async fn a_cte_sharing_the_real_tables_name_still_reads_the_real_table() {
+    // Milestone 13.2: `scope.rs` resolves CTE names the way the server does. A
+    // non-`RECURSIVE` body cannot see its own alias, so the inner `orders` here is
+    // the real base table, both in the server's own resolution and in the
+    // analyzer's. This proves it against a real server, not only against the
+    // corpus's synthetic expectations.
+    let container = start_postgres().await;
+    let pools = Arc::new(
+        PostgreSqlConnectionPools::connect(config(dsn(&container).await))
+            .await
+            .unwrap(),
+    );
+    let mut connection = pools.control().acquire().await.unwrap();
+    let mut transaction = connection.begin_with("BEGIN READ WRITE").await.unwrap();
+    for statement in [
+        "CREATE TABLE orders (id bigint PRIMARY KEY)".to_owned(),
+        "INSERT INTO orders VALUES (1), (2), (3)".to_owned(),
+    ] {
+        sqlx::query(AssertSqlSafe(statement))
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+    }
+    transaction.commit().await.unwrap();
+    // Returned to the pool before the query path runs, exactly as `fixture` does:
+    // the fixture connection has no further reason to stay checked out.
+    drop(connection);
+
+    let (executor, runtime) = harness(Arc::clone(&pools), ExecutionLimits::default()).await;
+    let permit = runtime.acquire_query_permit().await.unwrap();
+
+    let sql = "WITH orders AS (SELECT * FROM orders) SELECT count(*) AS n FROM orders";
+    let request = QueryRequest::new(
+        "production-db".parse().unwrap(),
+        sql.to_owned(),
+        Vec::new(),
+        &InputLimits::default(),
+    )
+    .unwrap();
+    let analyzed = PostgreSqlAnalyzer::new().analyze(request).unwrap();
+    let objects: Vec<String> = analyzed
+        .analysis()
+        .objects()
+        .iter()
+        .map(|object| object.qualified_name())
+        .collect();
+    assert_eq!(objects, ["orders"]);
+
+    let query = engine()
+        .authorize(
+            &context(),
+            &metadata(),
+            analyzed,
+            ExecutionLimits::default(),
+        )
+        .unwrap();
+
+    let result = run(&executor, &permit, &query).await.unwrap();
+
+    // The real table has exactly three rows: the count the executor returns is the
+    // server's own resolution of `orders`, not the CTE being defined.
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0][0], ResultValue::I64(3));
+
+    pools.close().await;
+}
+
+#[tokio::test]
 async fn the_set_local_deadline_can_only_tighten_the_connections_own() {
     // `docs/operations.md` section 5.1 keeps `SET LOCAL statement_timeout` inside the
     // transaction as reinforcement, and design decision 2 makes it a floor rather

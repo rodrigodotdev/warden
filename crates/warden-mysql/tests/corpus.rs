@@ -165,19 +165,18 @@ const READS: &[Case] = &[
     Case {
         // Finding 3 of the whole-branch review, pinned as a recorded contract. The
         // CTE is named `orders`, the same as the real base table it selects from.
-        // CTE subtraction in `visit::collect` drops every unqualified relation whose
-        // name matches a declared alias anywhere in the statement, not only within
-        // that alias's own scope, so the inner `orders` — which MySQL resolves to
-        // the real table, since a non-`RECURSIVE` CTE cannot self-reference — is
-        // dropped along with the alias. `docs/security.md` section 5 records this as
-        // the fifth structural bypass of the allowlist; ADR-0023 makes the role's
-        // `GRANT SELECT` the actual read boundary. This row exists so a later change
-        // to the subtraction (exact match, or scope-aware) is visible here rather
-        // than silently changing behaviour.
+        // Milestone 13.2's `scope.rs` resolves CTE names in the scope where they
+        // appear, the way the server does: a non-`RECURSIVE` body cannot see its own
+        // alias, so the inner `orders` resolves to the real table, not to the CTE
+        // being defined. `docs/security.md` section 5 records the earlier global
+        // subtraction that used to drop it as the fifth structural bypass, closed by
+        // this milestone; ADR-0023 makes the role's `GRANT SELECT` the actual read
+        // boundary regardless. This row exists so a later change to the resolution
+        // is visible here rather than silently changing behaviour.
         sql: "WITH orders AS (SELECT * FROM orders) SELECT * FROM orders",
         root_kind: Some(StatementKind::Select),
         nested_kinds: &[],
-        objects: &[],
+        objects: &["orders"],
         functions: &[],
         risks: &[],
         verdict: None,
@@ -562,6 +561,75 @@ const FILE_OUTPUT: &[Case] = &[
     },
 ];
 
+/// Names a CTE shares with a real relation, resolved the way the server resolves them.
+///
+/// The self-reference case (`WITH orders AS (SELECT * FROM orders) ...`) is pinned in
+/// `READS` above, not repeated here.
+const CTE_SCOPES: &[Case] = &[
+    Case {
+        // An alias declared inside a subquery is invisible to the outer SELECT.
+        sql: "SELECT * FROM secrets \
+              WHERE EXISTS (WITH secrets AS (SELECT 1) SELECT * FROM secrets)",
+        root_kind: Some(StatementKind::Select),
+        nested_kinds: &[],
+        objects: &["secrets"],
+        functions: &[],
+        risks: &[],
+        verdict: None,
+    },
+    Case {
+        // Earlier siblings are visible; the chain resolves to one base table.
+        sql: "WITH a AS (SELECT * FROM t1), b AS (SELECT * FROM a) SELECT * FROM b",
+        root_kind: Some(StatementKind::Select),
+        nested_kinds: &[],
+        objects: &["t1"],
+        functions: &[],
+        risks: &[],
+        verdict: None,
+    },
+    Case {
+        // Without RECURSIVE a later sibling is not visible: `b` inside `a` is a table.
+        sql: "WITH a AS (SELECT * FROM b), b AS (SELECT 1) SELECT * FROM a",
+        root_kind: Some(StatementKind::Select),
+        nested_kinds: &[],
+        objects: &["b"],
+        functions: &[],
+        risks: &[],
+        verdict: None,
+    },
+    Case {
+        // MySQL RECURSIVE: a body sees itself and earlier siblings, not later ones.
+        sql: "WITH RECURSIVE a AS (SELECT * FROM b), b AS (SELECT 1) SELECT * FROM a",
+        root_kind: Some(StatementKind::Select),
+        nested_kinds: &[],
+        objects: &["b"],
+        functions: &[],
+        risks: &[],
+        verdict: None,
+    },
+    Case {
+        // A qualified reference is never a CTE, whatever the alias is called.
+        sql: "WITH x AS (SELECT 1) SELECT * FROM app.x",
+        root_kind: Some(StatementKind::Select),
+        nested_kinds: &[],
+        objects: &["app.x"],
+        functions: &[],
+        risks: &[],
+        verdict: None,
+    },
+    Case {
+        // The main body and its subqueries see every local alias.
+        sql: "WITH x AS (SELECT * FROM secrets) \
+              SELECT * FROM x WHERE id IN (SELECT id FROM x)",
+        root_kind: Some(StatementKind::Select),
+        nested_kinds: &[],
+        objects: &["secrets"],
+        functions: &[],
+        risks: &[],
+        verdict: None,
+    },
+];
+
 fn request(sql: &str) -> QueryRequest {
     QueryRequest::new(
         "production-mysql".parse().unwrap(),
@@ -701,6 +769,11 @@ fn statements_the_grammar_rejects_are_denied_not_executed() {
 #[test]
 fn file_output_is_named_even_though_it_does_not_parse() {
     run(FILE_OUTPUT);
+}
+
+#[test]
+fn cte_names_are_resolved_in_scope() {
+    run(CTE_SCOPES);
 }
 
 #[test]
