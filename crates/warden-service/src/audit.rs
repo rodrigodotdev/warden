@@ -19,14 +19,14 @@ use tokio::time::timeout;
 use tracing::Instrument as _;
 use tracing::instrument::WithSubscriber as _;
 use warden_core::analysis::StatementKind;
-use warden_core::connection::ConnectionMetadata;
+use warden_core::connection::{ConnectionMetadata, ConnectionName};
 use warden_core::context::RequestContext;
 use warden_core::error::PublicErrorCode;
 use warden_core::fingerprint::QueryFingerprint;
 use warden_policy::DenyReason;
 use warden_ports::{
     AuditAttempt, AuditError, AuditEventId, AuditOperation, AuditOutcome, AuditOutcomeEvent,
-    AuditSink,
+    AuditRejection, AuditRejectionStage, AuditSink,
 };
 
 use crate::limits::AUDIT_WRITE_TIMEOUT;
@@ -85,6 +85,53 @@ pub(crate) async fn record_attempt(
     {
         Ok(result) => result,
         Err(_elapsed) => Err(AuditError::Timeout),
+    }
+}
+
+/// Builds the terminal record of a call refused before any attempt existed.
+pub(crate) fn rejection(
+    context: &RequestContext,
+    operation: AuditOperation,
+    stage: AuditRejectionStage,
+    connection: Option<ConnectionName>,
+    error_code: PublicErrorCode,
+) -> AuditRejection {
+    AuditRejection {
+        id: AuditEventId::generate(),
+        timestamp: time::OffsetDateTime::now_utc(),
+        request_id: context.request_id().clone(),
+        principal: context.principal().clone(),
+        client: context.client().clone(),
+        operation,
+        stage,
+        connection,
+        error_code,
+    }
+}
+
+/// Records a rejection, raising an alarm if it cannot be written.
+///
+/// Returns unit like `record_outcome`: the call was refused before this write and
+/// stays refused after it, so a failure here changes nothing the agent sees. The
+/// alarm carries ids and the public code, never the argument that was refused.
+pub(crate) async fn record_rejection(sink: &dyn AuditSink, event: &AuditRejection) {
+    let span = tracing::debug_span!("audit.rejection");
+    let written = match timeout(AUDIT_WRITE_TIMEOUT, sink.record_rejection(event))
+        .instrument(span)
+        .await
+    {
+        Ok(result) => result,
+        Err(_elapsed) => Err(AuditError::Timeout),
+    };
+    if let Err(error) = written {
+        tracing::error!(
+            target: "warden.audit",
+            rejection_id = %event.id,
+            stage = %event.stage,
+            error_code = %event.error_code,
+            %error,
+            "the audit rejection could not be recorded"
+        );
     }
 }
 

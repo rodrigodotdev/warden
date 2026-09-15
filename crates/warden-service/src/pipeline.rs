@@ -29,6 +29,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 use warden_core::analysis::StatementKind;
+use warden_core::connection::ConnectionName;
 use warden_core::context::RequestContext;
 use warden_core::error::{PublicError as _, PublicErrorCode};
 use warden_core::explain::QueryPlan;
@@ -37,8 +38,8 @@ use warden_core::result::ResultSet;
 use warden_policy::{AuthorizedQuery, PolicyEngine, PolicyRejection};
 use warden_ports::{
     AnalyzeError, AuditAttempt, AuditError, AuditOperation, AuditOutcome, AuditOutcomeEvent,
-    AuditSink, ConnectionError, ConnectionRegistry, ConnectionRuntime, ExecuteError, ExplainError,
-    QueryPermit,
+    AuditRejectionStage, AuditSink, ConnectionError, ConnectionRegistry, ConnectionRuntime,
+    ExecuteError, ExplainError, QueryPermit,
 };
 
 use crate::audit::{self, StatementFacts};
@@ -173,6 +174,19 @@ impl ServiceCore {
         self.shutdown.child_token()
     }
 
+    /// Records a refusal that happened in this layer before any attempt existed.
+    pub(crate) async fn reject(
+        &self,
+        context: &RequestContext,
+        operation: AuditOperation,
+        stage: AuditRejectionStage,
+        connection: Option<ConnectionName>,
+        error_code: PublicErrorCode,
+    ) {
+        let event = audit::rejection(context, operation, stage, connection, error_code);
+        audit::record_rejection(self.audit.as_ref(), &event).await;
+    }
+
     /// Resolve, analyse, authorise, and build the attempt — in ADR-0022's order.
     ///
     /// Every failing arm records the attempt and completes it before returning, so a
@@ -188,10 +202,24 @@ impl ServiceCore {
         request: QueryRequest,
         operation: AuditOperation,
     ) -> Result<Preflight, PreflightError> {
-        let runtime = {
+        let resolved = {
             let _entered = tracing::debug_span!("connection.resolve").entered();
             self.registry.get(request.connection())
-        }?;
+        };
+        let runtime = match resolved {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                self.reject(
+                    context,
+                    operation,
+                    AuditRejectionStage::ConnectionResolution,
+                    Some(request.connection().clone()),
+                    error.public_code(),
+                )
+                .await;
+                return Err(error.into());
+            }
+        };
 
         let analysis_result = {
             let _entered = tracing::debug_span!("sql.analyze").entered();

@@ -33,8 +33,8 @@ use warden_core::schema::{
 };
 use warden_policy::{ObjectFilter, PolicyContext, PolicyEngine};
 use warden_ports::{
-    AuditAttempt, AuditOperation, AuditOutcome, AuditOutcomeEvent, AuditSink, ConnectionRegistry,
-    SchemaError,
+    AuditAttempt, AuditOperation, AuditOutcome, AuditOutcomeEvent, AuditRejectionStage, AuditSink,
+    ConnectionRegistry, SchemaError,
 };
 
 use crate::audit::{self, StatementFacts};
@@ -93,9 +93,33 @@ impl SchemaService {
         );
         let outcome_parent = span.clone();
         async move {
-            let runtime = self.core.registry().get(request.connection())?;
+            let runtime = match self.core.registry().get(request.connection()) {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    self.core
+                        .reject(
+                            context,
+                            AuditOperation::SearchSchema,
+                            AuditRejectionStage::ConnectionResolution,
+                            Some(request.connection().clone()),
+                            error.public_code(),
+                        )
+                        .await;
+                    return Err(error.into());
+                }
+            };
             if !runtime.capabilities().schema_search {
-                return Err(SchemaServiceError::SearchUnsupported);
+                let error = SchemaServiceError::SearchUnsupported;
+                self.core
+                    .reject(
+                        context,
+                        AuditOperation::SearchSchema,
+                        AuditRejectionStage::Capability,
+                        Some(request.connection().clone()),
+                        error.public_code(),
+                    )
+                    .await;
+                return Err(error);
             }
             let attempt = audit::attempt(
                 context,
@@ -154,7 +178,21 @@ impl SchemaService {
         );
         let outcome_parent = span.clone();
         async move {
-            let runtime = self.core.registry().get(request.connection())?;
+            let runtime = match self.core.registry().get(request.connection()) {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    self.core
+                        .reject(
+                            context,
+                            AuditOperation::DescribeSchema,
+                            AuditRejectionStage::ConnectionResolution,
+                            Some(request.connection().clone()),
+                            error.public_code(),
+                        )
+                        .await;
+                    return Err(error.into());
+                }
+            };
             let attempt = audit::attempt(
                 context,
                 runtime.metadata(),
@@ -241,13 +279,15 @@ mod tests {
 
     use tokio::time::Instant;
     use tokio_util::sync::CancellationToken;
+    use warden_core::connection::Capabilities;
     use warden_core::dialect::Dialect;
     use warden_core::error::{PublicError, PublicErrorCode};
     use warden_core::limits::ExecutionLimits;
     use warden_core::schema::{MatchReason, SchemaMatch, TableKind};
     use warden_policy::{ObjectRules, PolicyEngine, PolicySettings};
     use warden_ports::{
-        AuditOperation, AuditOutcome, ConnectionRegistry, QueryPermit, SchemaError, SchemaInspector,
+        AuditOperation, AuditOutcome, AuditRejectionStage, ConnectionRegistry, QueryPermit,
+        SchemaError, SchemaInspector,
     };
 
     use super::*;
@@ -255,6 +295,30 @@ mod tests {
     use crate::error::SchemaServiceError;
     use crate::redaction::REDACTED;
     use crate::testing;
+
+    #[tokio::test]
+    async fn a_connection_without_schema_search_records_a_capability_rejection() {
+        let sink = Arc::new(testing::FakeAuditSink::new());
+        let service = testing::schema_service(testing::ServiceFakes {
+            capabilities: Capabilities {
+                schema_search: false,
+                ..testing::capabilities()
+            },
+            audit: sink.clone(),
+            ..testing::ServiceFakes::default()
+        });
+        let error = service
+            .search(&testing::request_context(), testing::search_request())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, SchemaServiceError::SearchUnsupported));
+        assert!(sink.attempts().is_empty());
+        let rejections = sink.rejections();
+        assert_eq!(rejections.len(), 1);
+        assert_eq!(rejections[0].stage, AuditRejectionStage::Capability);
+        assert_eq!(rejections[0].operation, AuditOperation::SearchSchema);
+        assert!(rejections[0].connection.is_some());
+    }
 
     async fn assert_catalog_panic_records_abandoned(describe: bool) {
         let sink = Arc::new(testing::FakeAuditSink::new());

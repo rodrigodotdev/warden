@@ -69,9 +69,13 @@ pub use redaction::{REDACTED, RedactionRuleError, RedactionSettings, RedactionSt
 pub use registry::{RegistryError, StaticConnectionRegistry};
 pub use schema::SchemaService;
 pub use warden_ports::{
-    AuditRejection, AuditSink, ConnectionRegistry, ConnectionRuntime, ConnectionRuntimeParts,
-    RuntimeError,
+    AuditOperation, AuditRejection, AuditRejectionStage, AuditSink, ConnectionRegistry,
+    ConnectionRuntime, ConnectionRuntimeParts, RuntimeError,
 };
+
+use warden_core::connection::ConnectionName;
+use warden_core::context::RequestContext;
+use warden_core::error::PublicErrorCode;
 
 /// Everything the three services need, assembled by the composition root.
 ///
@@ -109,6 +113,7 @@ impl fmt::Debug for ServiceParts {
 /// The application services, sharing one registry, engine, sink, and redactor.
 pub struct Services {
     registry: Arc<dyn ConnectionRegistry>,
+    audit: Arc<dyn AuditSink>,
     query: QueryService,
     explain: ExplainService,
     schema: SchemaService,
@@ -147,6 +152,7 @@ impl Services {
         );
         Ok(Self {
             registry: parts.registry,
+            audit: parts.audit,
             query,
             explain,
             schema,
@@ -179,6 +185,23 @@ impl Services {
     #[must_use]
     pub fn registry(&self) -> &dyn ConnectionRegistry {
         self.registry.as_ref()
+    }
+
+    /// Records a call the adapter refused before this layer could see it.
+    ///
+    /// The one entry the MCP adapter has for the audit trail. It takes the public
+    /// code and the connection name when it validated — never the argument, the
+    /// deserializer's text, or a fabricated dialect (ADR-0054).
+    pub async fn reject_request(
+        &self,
+        context: &RequestContext,
+        operation: AuditOperation,
+        stage: AuditRejectionStage,
+        connection: Option<ConnectionName>,
+        error_code: PublicErrorCode,
+    ) {
+        let event = audit::rejection(context, operation, stage, connection, error_code);
+        audit::record_rejection(self.audit.as_ref(), &event).await;
     }
 }
 

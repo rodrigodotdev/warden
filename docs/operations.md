@@ -885,6 +885,19 @@ mcp.tool.describe_schema
 mcp.tool.list_connections
 ```
 
+```text
+mcp.tool.query
+└── warden.query
+    └── audit.rejection
+```
+
+An unknown connection or a missing capability is refused inside the service, after
+`warden.query` (or `warden.explain`, `warden.search_schema`, `warden.describe_schema`)
+has already opened, so its rejection nests under that root span as a sibling of
+`connection.resolve` rather than preceding it. A call the adapter refuses before it
+ever reaches the service — malformed arguments, a validation failure — records its
+rejection directly under the tool span instead, with no service root beneath it.
+
 Tool and service roots are `info`; phase children are `debug`. The shipped
 `warn,warden=info` filter therefore records one root per participating layer: two
 for each database-backed tool and one for `list_connections`. An operator opts into

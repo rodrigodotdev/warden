@@ -183,10 +183,93 @@ mod tests {
 
     use warden_core::dialect::Dialect;
     use warden_core::error::{PublicError, PublicErrorCode};
+    use warden_core::query::{InputLimits, QueryRequest};
     use warden_core::result::NormalizationError;
-    use warden_ports::{AnalyzeError, AuditOutcome, ExecuteError};
+    use warden_ports::{
+        AnalyzeError, AuditOperation, AuditOutcome, AuditRejectionStage, ExecuteError,
+    };
 
+    use crate::limits::AUDIT_WRITE_TIMEOUT;
     use crate::testing;
+
+    #[tokio::test]
+    async fn an_unknown_connection_records_one_rejection_and_no_attempt() {
+        let sink = Arc::new(testing::FakeAuditSink::new());
+        let service = testing::query_service(testing::ServiceFakes {
+            audit: sink.clone(),
+            ..testing::ServiceFakes::default()
+        });
+        let request = QueryRequest::new(
+            "nowhere".parse().unwrap(),
+            "SELECT 1".to_owned(),
+            Vec::new(),
+            &InputLimits::default(),
+        )
+        .unwrap();
+        let error = service
+            .execute(&testing::request_context(), request)
+            .await
+            .unwrap_err();
+        assert_eq!(error.public_code(), PublicErrorCode::ConnectionNotFound);
+        assert!(sink.attempts().is_empty());
+        assert!(sink.outcomes().is_empty());
+        let rejections = sink.rejections();
+        assert_eq!(rejections.len(), 1);
+        assert_eq!(
+            rejections[0].stage,
+            AuditRejectionStage::ConnectionResolution
+        );
+        assert_eq!(rejections[0].operation, AuditOperation::Query);
+        assert_eq!(
+            rejections[0].connection.as_ref().map(|c| c.as_str()),
+            Some("nowhere")
+        );
+        assert_eq!(
+            rejections[0].error_code,
+            PublicErrorCode::ConnectionNotFound
+        );
+        assert_eq!(
+            rejections[0].request_id,
+            *testing::request_context().request_id()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_denied_statement_records_attempt_and_outcome_and_no_rejection() {
+        let sink = Arc::new(testing::FakeAuditSink::new());
+        let service = testing::query_service(testing::ServiceFakes {
+            analyzer: Arc::new(testing::FakeAnalyzer::writing(Dialect::MySql)),
+            audit: sink.clone(),
+            ..testing::ServiceFakes::default()
+        });
+        let _ = service
+            .execute(&testing::request_context(), testing::request())
+            .await;
+        assert_eq!(sink.attempts().len(), 1);
+        assert_eq!(sink.outcomes().len(), 1);
+        assert!(sink.rejections().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_rejection_write_keeps_the_original_error_and_alarms() {
+        let sink = Arc::new(testing::FakeAuditSink::taking(AUDIT_WRITE_TIMEOUT * 10));
+        let service = testing::query_service(testing::ServiceFakes {
+            audit: sink.clone(),
+            ..testing::ServiceFakes::default()
+        });
+        let request = QueryRequest::new(
+            "nowhere".parse().unwrap(),
+            "SELECT 1".to_owned(),
+            Vec::new(),
+            &InputLimits::default(),
+        )
+        .unwrap();
+        let error = service
+            .execute(&testing::request_context(), request)
+            .await
+            .unwrap_err();
+        assert_eq!(error.public_code(), PublicErrorCode::ConnectionNotFound);
+    }
 
     #[tokio::test]
     async fn a_safe_select_runs_and_is_audited_twice() {
