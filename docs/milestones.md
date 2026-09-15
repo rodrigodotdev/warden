@@ -324,6 +324,70 @@ trusted-extension mechanism rather than planted by the adversary it targets.
 
 ---
 
+## M13.3 — Audit rejections and drained shutdown
+
+**A call refused before any attempt exists now leaves an audit trace, and shutdown
+waits for admitted work instead of racing it.** `AuditRejection`/`AuditRejectionStage`
+join `warden-ports`'s audit port as a third terminal record kind alongside the
+two-phase attempt/outcome pair (ADR-0022): readers must now accept a third `event`
+value, `rejection`, in the same `warden.audit.v1` schema, and both sinks project it —
+the JSONL file sink durably, the tracing sink as a fixed `"audit rejection"` message,
+inside a new `audit.rejection` debug span documented in `docs/operations.md` §10.1.
+`Services::reject_request` and `ServiceCore::reject` give `warden-service` its one
+entry point: connection resolution (`ServiceCore::preflight`, `SchemaService::search`/
+`::describe`) and a missing `schema_search` capability now record exactly one
+rejection and build no fabricated attempt. The MCP adapter closes the last gap
+(ADR-0054, resolves open question 25): the four database tools take a raw
+`JsonObject` with an explicit `input_schema` derived from the same typed DTO,
+deserialize it themselves through `input::parse` — which discards the SDK's own
+deserialization text — and answer a failure with a new public code,
+`invalid_arguments`, recording the refusal at `AuditRejectionStage::Input` before
+`Services` ever sees the call. The tool schema an agent reads is unchanged
+(`crates/warden-mcp/tests/snapshots/tools.json` is unmodified by this milestone).
+
+Shutdown changed to match: `Services` owns a `tokio_util::task::TaskTracker`, every
+tool call is spawned on it, and the outcome guard's previously-detached `abandoned`
+write now spawns on the same tracker via `spawn_on`, which still accepts work after
+`close()`, so a request dropped mid-drain still leaves its record.
+`ConnectionRuntime::close_gate` closes the query semaphore so a queued caller wakes
+at once as `Unavailable` instead of waiting out `max_queue_wait`.
+`Services::drain(deadline)` closes every connection's gate, closes the tracker, and
+waits under the deadline without aborting anything, returning a `DrainReport` that
+says whether every task ended and how many were still running if not. The
+composition root wires this in (ADR-0055): `Deployment::close` cancels the root
+shutdown token, drains `Services` under one 30-second `DRAIN_DEADLINE`, then closes
+pools with whatever time is left, so the number of connections can no longer
+multiply the shutdown wait. An incomplete drain logs an alarm naming the pending
+count, and `run_serve` now exits non-zero when that happens instead of reporting
+success over an incomplete audit trail; `warden check` discards its report since it
+admits no request.
+
+Measured by `warden-ports`'s `runtime::tests::closing_the_gate_wakes_a_queued_caller_as_unavailable`;
+`warden-service`'s `query::tests::{an_unknown_connection_records_one_rejection_and_no_attempt,
+a_denied_statement_records_attempt_and_outcome_and_no_rejection,
+a_slow_rejection_write_keeps_the_original_error_and_alarms,
+a_dropped_request_completes_its_audit_record_too}`,
+`schema::tests::a_connection_without_schema_search_records_a_capability_rejection`, and
+`lib.rs::drain_tests::{drain_reports_incomplete_when_admitted_work_outlives_the_deadline,
+drain_completes_once_every_tracked_task_has_ended,
+drain_closes_every_gate_so_queued_requests_stop_waiting}`; `warden-mcp`'s
+`input::tests::the_raw_argument_schema_is_the_derived_one_for_every_tool`,
+`server::tests::{every_pre_resolution_refusal_is_one_rejection_and_nothing_else,
+an_executed_and_a_denied_call_record_no_rejection,
+a_tool_task_is_tracked_by_the_services_it_runs_against}`, and
+`tests/protocol.rs`'s `{a_malformed_argument_is_refused_with_invalid_arguments_and_echoes_nothing,
+a_missing_required_field_is_still_refused_and_never_defaulted}`; and the end-to-end
+`tests/mcp_database.rs::stdout_carries_protocol_only_and_the_process_exits_on_eof`,
+which now also asserts stderr never carries the drain-deadline alarm. See ADR-0054
+and ADR-0055.
+
+Deliberately left: a client-sent cancellation reaching a running query (open question
+23, second half — `close_gate` only stops a queued request from outliving shutdown,
+not a running one); cancelling the token at EOF ahead of the SDK's own drain, which
+ADR-0055 records as a refinement rather than closing; and the HTTP transport (M14).
+
+---
+
 ## M14 — Streamable HTTP
 
 Use rmcp's HTTP transport with `2026-07-28` semantics, authentication integration,

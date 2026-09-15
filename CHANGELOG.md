@@ -11,6 +11,14 @@ implementation details before `1.0` and change without notice (`SPEC.md` section
 
 ## [Unreleased]
 
+### Added
+
+- Audit `rejection` records for database-tool calls refused before an attempt exists:
+  malformed or oversized arguments, unknown connections, missing capabilities. Same
+  `warden.audit.v1` schema; readers must accept the third `event` value.
+- `invalid_arguments`: the public code for tool arguments that do not match the input
+  schema. Warden no longer relays the SDK's deserialization text.
+
 ### Changed
 
 - `query` and `explain` refuse a parameter over 64 KiB or parameters totalling over
@@ -24,6 +32,8 @@ implementation details before `1.0` and change without notice (`SPEC.md` section
   the failure names the functions. `warden check` reports the same.
 - `warden role` now revokes the default `EXECUTE` grant from `PUBLIC` for the schema
   and for future functions.
+- Shutdown waits up to 30 seconds for in-flight tool calls and their audit outcomes,
+  wakes queued requests immediately, and exits non-zero if anything was still running.
 
 ### Fixed
 
