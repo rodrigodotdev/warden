@@ -11,9 +11,13 @@
 //! would leak internal detail past the boundary [`crate::error`] owns.
 
 use std::fmt;
+use std::sync::Arc;
 
+use rmcp::model::JsonObject;
 use rmcp::schemars::JsonSchema;
 use serde::Deserialize;
+use serde::de::DeserializeOwned;
+use warden_core::connection::ConnectionName;
 use warden_core::error::{PublicError, PublicErrorCode};
 use warden_core::explain::ExplainRequest;
 use warden_core::parameter::ParameterValue;
@@ -25,6 +29,43 @@ use warden_core::schema::{
 /// The default number of matches `search_schema` returns when the agent omits
 /// `limit` (`docs/mcp.md` section 2).
 pub const DEFAULT_SEARCH_LIMIT: usize = 20;
+
+/// The input schema of a tool whose arguments arrive raw, derived from its typed DTO.
+///
+/// `#[tool]` derives this itself when a handler takes `Parameters<T>`; the handlers
+/// take `JsonObject` instead so that a deserialization failure is Warden's to classify
+/// and audit (ADR-0054). The schema an agent reads is the same one.
+pub(crate) fn schema_for<T: JsonSchema + 'static>() -> Arc<JsonObject> {
+    match rmcp::handler::server::common::schema_for_input::<T>() {
+        Ok(schema) => schema,
+        // Unreachable for a struct DTO: `schema_for_input` fails only when the root is
+        // not `type: object`. `tests/tool_schema.rs` snapshots every descriptor, so an
+        // empty schema here cannot ship unnoticed.
+        Err(_reason) => rmcp::handler::server::common::schema_for_empty_input(),
+    }
+}
+
+/// Deserializes raw tool arguments, discarding the deserializer's text.
+///
+/// # Errors
+///
+/// [`PublicErrorCode::InvalidArguments`], and nothing else: serde's message can quote
+/// the submitted value, and the agent already holds the schema it failed against.
+pub(crate) fn parse<T: DeserializeOwned>(arguments: JsonObject) -> Result<T, PublicErrorCode> {
+    serde_json::from_value(serde_json::Value::Object(arguments))
+        .map_err(|_| PublicErrorCode::InvalidArguments)
+}
+
+/// The connection an agent named, if it named one that validates.
+///
+/// For the audit record of a refused call: a valid but unknown name is worth recording,
+/// an invalid one is not (it would be the refused input itself).
+pub(crate) fn connection_name(arguments: &JsonObject) -> Option<ConnectionName> {
+    arguments
+        .get("connection")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|name| name.parse().ok())
+}
 
 /// One placeholder value bound to a `query` or `explain` statement.
 ///
@@ -264,6 +305,27 @@ mod tests {
 
     fn query_input(json: serde_json::Value) -> Result<QueryInput, serde_json::Error> {
         serde_json::from_value(json)
+    }
+
+    #[test]
+    fn the_raw_argument_schema_is_the_derived_one_for_every_tool() {
+        use rmcp::handler::server::common::schema_for_input;
+        assert_eq!(
+            schema_for::<QueryInput>(),
+            schema_for_input::<QueryInput>().unwrap()
+        );
+        assert_eq!(
+            schema_for::<ExplainInput>(),
+            schema_for_input::<ExplainInput>().unwrap()
+        );
+        assert_eq!(
+            schema_for::<SearchInput>(),
+            schema_for_input::<SearchInput>().unwrap()
+        );
+        assert_eq!(
+            schema_for::<DescribeInput>(),
+            schema_for_input::<DescribeInput>().unwrap()
+        );
     }
 
     #[test]

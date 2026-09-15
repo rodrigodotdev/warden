@@ -543,20 +543,16 @@ for `{error}`-style interpolation; it is a name-based heuristic backstop and its
 comment says so, because the structural guarantee is `failure`'s signature rather than
 anything a syntactic scan can prove.
 
-One documented gap: an argument that fails `serde` deserialization is refused by rmcp
-before Warden sees it, and the agent reads rmcp's own wording ("failed to deserialize
-parameters: missing field `sql`") rather than a `PublicErrorCode`. rmcp forwards the whole
-`serde` message after its fixed prefix, so that text can name a field from Warden's own
-input schema, a field name the agent invented, or the agent's own submitted value
-(`invalid type: string "oops", expected a sequence`). None of it is new to the agent: the
-schema is already public in the tool-schema snapshot, and the rest is what the agent just
-sent. The refusal fires before any Warden code runs, so no database content, driver
-message, or DSN can be in it, and this section's prohibitions hold. Intercepting it would
-mean every tool taking a raw `Value` and hand-rolling deserialization; open question 25
-carries it, and `crates/warden-mcp/tests/protocol.rs` pins the current framing with a
-comment saying it pins the SDK's behaviour, not a Warden invariant. An oversized frame
-is refused before identity or a public code exists; the only trace is a fixed transport
-diagnostic.
+**Milestone 13.3 closed the deserialization gap (ADR-0054, resolves open question 25).**
+The four database tools take their arguments as a raw `JsonObject` with an explicit
+`input_schema` derived from the same typed DTO the tool already advertised, deserialize
+them in `warden-mcp`'s own `input::parse`, and answer a failure with `invalid_arguments`
+and the fixed sentence above — never the `serde` message, so neither the deserializer's
+wording nor the agent's own submitted value travels back to it. The refusal is recorded
+as an audit rejection (section 11.2) at `AuditRejectionStage::Input` before `Services`
+ever sees the call; the connection name is recorded only when it validated. The schema
+an agent reads does not change. An oversized frame is still refused before identity or a
+public code exists; the only trace is a fixed transport diagnostic.
 
 ## 11. Auditing
 
@@ -669,6 +665,13 @@ auditor can tell a malformed argument from a name nobody configured. Like
 projects the same allowlisted fields both sinks write, and a durable sink writes it
 as it writes an attempt, because its failure is an alarm — nothing was going to run
 either way.
+
+`warden_service::audit::record_rejection` is the only writer: `warden-mcp`'s four
+database tools call `Services::reject_request` at `AuditRejectionStage::Input` when
+their own argument deserialization fails, and the service calls the same writer
+internally at `ConnectionResolution` and `Capability`, so a refusal at any stage
+reaches the sink through one function and no adapter writes to `AuditSink` itself
+(ADR-0054).
 
 ### 11.3 SQL in audits
 

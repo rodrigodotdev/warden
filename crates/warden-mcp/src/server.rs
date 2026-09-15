@@ -6,6 +6,20 @@
 //! `sqlx` type — SPEC section 6, invariants 26 and 27, and the reason `warden-mcp` may
 //! not depend on either adapter.
 //!
+//! # Raw arguments, deserialized here
+//!
+//! The four database tools declare `input_schema = input::schema_for::<T>()` and take a
+//! raw [`rmcp::model::JsonObject`] rather than `Parameters<T>`, so a deserialization
+//! failure never leaves `rmcp`'s own extractor before Warden sees it. Each tool method
+//! delegates to a `*_from_arguments` runner, which calls `input::parse::<T>` and, on
+//! failure, [`WardenServer::reject`]: the call is answered with `invalid_arguments`
+//! (never the `serde` text, which can quote the agent's own submitted value) and
+//! recorded as an audit rejection at `AuditRejectionStage::Input` before `Services` ever
+//! sees the call. The schema an agent reads is unchanged — `input::schema_for` derives
+//! it from the same typed DTO `#[tool]` would have used for `Parameters<T>` — so this is
+//! a change in who classifies a bad argument, not in what the agent is told to send
+//! (ADR-0054).
+//!
 //! # One task per request
 //!
 //! `docs/architecture.md` section 8 and ADR-0038 both assign this to Milestone 12: a
@@ -48,20 +62,20 @@ use std::future::Future;
 use std::sync::Arc;
 
 use rmcp::handler::server::router::tool::ToolRouter;
-use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolResult, ErrorData, Implementation, InitializeRequestParams, InitializeResult,
-    ProtocolVersion, ServerCapabilities, ServerInfo,
+    JsonObject, ProtocolVersion, ServerCapabilities, ServerInfo,
 };
 use rmcp::service::RequestContext as McpRequestContext;
 use rmcp::{RoleServer, ServerHandler, tool, tool_router};
 use tracing::Instrument as _;
+use warden_core::connection::ConnectionName;
 use warden_core::context::RequestContext;
 use warden_core::error::{PublicError, PublicErrorCode};
-use warden_service::Services;
+use warden_service::{AuditOperation, AuditRejectionStage, Services};
 
 use crate::error::failure;
-use crate::input::{DescribeInput, ExplainInput, QueryInput, SearchInput};
+use crate::input::{self, DescribeInput, ExplainInput, QueryInput, SearchInput};
 use crate::output::ToolResponse;
 use crate::{identity, output};
 
@@ -144,15 +158,16 @@ impl WardenServer {
             idempotent_hint = true,
             open_world_hint = false
         ),
+        input_schema = input::schema_for::<SearchInput>(),
         output_schema = rmcp::handler::server::tool::schema_for_output::<output::SearchOutput>()
     )]
     async fn search_schema(
         &self,
-        Parameters(input): Parameters<SearchInput>,
+        arguments: JsonObject,
         context: McpRequestContext<RoleServer>,
     ) -> CallToolResult {
         match identity::for_request(&context) {
-            Ok(identity) => self.run_search_schema(identity, input).await,
+            Ok(identity) => self.search_schema_from_arguments(identity, arguments).await,
             Err(code) => failure(code),
         }
     }
@@ -171,15 +186,19 @@ impl WardenServer {
             idempotent_hint = true,
             open_world_hint = false
         ),
+        input_schema = input::schema_for::<DescribeInput>(),
         output_schema = rmcp::handler::server::tool::schema_for_output::<output::DescribeOutput>()
     )]
     async fn describe_schema(
         &self,
-        Parameters(input): Parameters<DescribeInput>,
+        arguments: JsonObject,
         context: McpRequestContext<RoleServer>,
     ) -> CallToolResult {
         match identity::for_request(&context) {
-            Ok(identity) => self.run_describe_schema(identity, input).await,
+            Ok(identity) => {
+                self.describe_schema_from_arguments(identity, arguments)
+                    .await
+            }
             Err(code) => failure(code),
         }
     }
@@ -201,15 +220,16 @@ impl WardenServer {
             idempotent_hint = false,
             open_world_hint = false
         ),
+        input_schema = input::schema_for::<QueryInput>(),
         output_schema = rmcp::handler::server::tool::schema_for_output::<output::QueryOutput>()
     )]
     async fn query(
         &self,
-        Parameters(input): Parameters<QueryInput>,
+        arguments: JsonObject,
         context: McpRequestContext<RoleServer>,
     ) -> CallToolResult {
         match identity::for_request(&context) {
-            Ok(identity) => self.run_query(identity, input).await,
+            Ok(identity) => self.query_from_arguments(identity, arguments).await,
             Err(code) => failure(code),
         }
     }
@@ -227,15 +247,16 @@ impl WardenServer {
             idempotent_hint = true,
             open_world_hint = false
         ),
+        input_schema = input::schema_for::<ExplainInput>(),
         output_schema = rmcp::handler::server::tool::schema_for_output::<output::ExplainOutput>()
     )]
     async fn explain(
         &self,
-        Parameters(input): Parameters<ExplainInput>,
+        arguments: JsonObject,
         context: McpRequestContext<RoleServer>,
     ) -> CallToolResult {
         match identity::for_request(&context) {
-            Ok(identity) => self.run_explain(identity, input).await,
+            Ok(identity) => self.explain_from_arguments(identity, arguments).await,
             Err(code) => failure(code),
         }
     }
@@ -282,15 +303,107 @@ impl WardenServer {
         output::ConnectionsOutput::from_metadata(&self.services.registry().list()).into_result()
     }
 
+    /// Deserializes `query`'s arguments, auditing a refusal, then runs the statement.
+    async fn query_from_arguments(
+        &self,
+        identity: RequestContext,
+        arguments: JsonObject,
+    ) -> CallToolResult {
+        let connection = input::connection_name(&arguments);
+        match input::parse::<QueryInput>(arguments) {
+            Ok(input) => self.run_query(identity, input).await,
+            Err(code) => {
+                self.reject(identity, AuditOperation::Query, connection, code)
+                    .await
+            }
+        }
+    }
+
+    /// Deserializes `explain`'s arguments, auditing a refusal, then plans the statement.
+    async fn explain_from_arguments(
+        &self,
+        identity: RequestContext,
+        arguments: JsonObject,
+    ) -> CallToolResult {
+        let connection = input::connection_name(&arguments);
+        match input::parse::<ExplainInput>(arguments) {
+            Ok(input) => self.run_explain(identity, input).await,
+            Err(code) => {
+                self.reject(identity, AuditOperation::Explain, connection, code)
+                    .await
+            }
+        }
+    }
+
+    /// Deserializes `search_schema`'s arguments, auditing a refusal, then searches.
+    async fn search_schema_from_arguments(
+        &self,
+        identity: RequestContext,
+        arguments: JsonObject,
+    ) -> CallToolResult {
+        let connection = input::connection_name(&arguments);
+        match input::parse::<SearchInput>(arguments) {
+            Ok(input) => self.run_search_schema(identity, input).await,
+            Err(code) => {
+                self.reject(identity, AuditOperation::SearchSchema, connection, code)
+                    .await
+            }
+        }
+    }
+
+    /// Deserializes `describe_schema`'s arguments, auditing a refusal, then describes.
+    async fn describe_schema_from_arguments(
+        &self,
+        identity: RequestContext,
+        arguments: JsonObject,
+    ) -> CallToolResult {
+        let connection = input::connection_name(&arguments);
+        match input::parse::<DescribeInput>(arguments) {
+            Ok(input) => self.run_describe_schema(identity, input).await,
+            Err(code) => {
+                self.reject(identity, AuditOperation::DescribeSchema, connection, code)
+                    .await
+            }
+        }
+    }
+
+    /// Records a refusal that happened before the service saw the call, then answers it.
+    ///
+    /// Every pre-resolution refusal in this crate leaves through here, so none can skip
+    /// the audit trail (ADR-0054). The connection is recorded only when it validated.
+    async fn reject(
+        &self,
+        identity: RequestContext,
+        operation: AuditOperation,
+        connection: Option<ConnectionName>,
+        code: PublicErrorCode,
+    ) -> CallToolResult {
+        self.services
+            .reject_request(
+                &identity,
+                operation,
+                AuditRejectionStage::Input,
+                connection,
+                code,
+            )
+            .await;
+        failure(code)
+    }
+
     /// Answers `query`: validate the arguments, then run one statement in its own task.
     async fn run_query(&self, identity: RequestContext, input: QueryInput) -> CallToolResult {
         let span = tracing::info_span!(
             "mcp.tool.query",
             request_id = %identity.request_id(),
         );
+        let connection = input.connection.parse::<ConnectionName>().ok();
         let request = match span.in_scope(|| input.into_request()) {
             Ok(request) => request,
-            Err(code) => return failure(code),
+            Err(code) => {
+                return self
+                    .reject(identity, AuditOperation::Query, connection, code)
+                    .await;
+            }
         };
         let services = Arc::clone(&self.services);
         let outcome = Self::run_in_task(
@@ -310,9 +423,14 @@ impl WardenServer {
             "mcp.tool.explain",
             request_id = %identity.request_id(),
         );
+        let connection = input.connection.parse::<ConnectionName>().ok();
         let request = match span.in_scope(|| input.into_request()) {
             Ok(request) => request,
-            Err(code) => return failure(code),
+            Err(code) => {
+                return self
+                    .reject(identity, AuditOperation::Explain, connection, code)
+                    .await;
+            }
         };
         let services = Arc::clone(&self.services);
         let outcome = Self::run_in_task(
@@ -336,9 +454,14 @@ impl WardenServer {
             "mcp.tool.search_schema",
             request_id = %identity.request_id(),
         );
+        let connection = input.connection.parse::<ConnectionName>().ok();
         let request = match span.in_scope(|| input.into_request()) {
             Ok(request) => request,
-            Err(code) => return failure(code),
+            Err(code) => {
+                return self
+                    .reject(identity, AuditOperation::SearchSchema, connection, code)
+                    .await;
+            }
         };
         let services = Arc::clone(&self.services);
         let outcome = Self::run_in_task(
@@ -362,9 +485,14 @@ impl WardenServer {
             "mcp.tool.describe_schema",
             request_id = %identity.request_id(),
         );
+        let connection = input.connection.parse::<ConnectionName>().ok();
         let request = match span.in_scope(|| input.into_request()) {
             Ok(request) => request,
-            Err(code) => return failure(code),
+            Err(code) => {
+                return self
+                    .reject(identity, AuditOperation::DescribeSchema, connection, code)
+                    .await;
+            }
         };
         let services = Arc::clone(&self.services);
         let outcome = Self::run_in_task(
@@ -670,11 +798,18 @@ mod tests {
         let spans = capture.spans.lock().unwrap();
         assert_eq!(
             spans.iter().map(|span| span.name).collect::<Vec<_>>(),
+            // Each bad connection name fails `into_request` and is recorded through
+            // `reject`, so every tool span is followed by the service's own
+            // "audit.rejection" span (`warden_service::audit::record_rejection`).
             [
                 "mcp.tool.query",
+                "audit.rejection",
                 "mcp.tool.explain",
+                "audit.rejection",
                 "mcp.tool.search_schema",
+                "audit.rejection",
                 "mcp.tool.describe_schema",
+                "audit.rejection",
             ]
         );
         for span in spans.iter() {
@@ -919,6 +1054,99 @@ mod tests {
             info.instructions
                 .is_some_and(|text| text.contains("list_connections"))
         );
+    }
+
+    #[tokio::test]
+    async fn every_pre_resolution_refusal_is_one_rejection_and_nothing_else() {
+        use rmcp::model::JsonObject;
+        let (services, sink) = testing::services_observed(testing::FakeParts::new());
+        let server = WardenServer::new(services);
+
+        // 1. Wrong type: an input rejection with no validated connection.
+        let arguments: JsonObject = serde_json::from_value(serde_json::json!({
+            "connection": "bad connection", "sql": 1
+        }))
+        .unwrap();
+        let result = server.query_from_arguments(identity(), arguments).await;
+        assert_eq!(
+            result.structured_content.unwrap()["error"]["code"],
+            "invalid_arguments"
+        );
+
+        // 2. Valid shape, invalid connection name: input stage, connection absent.
+        let result = server
+            .run_query(identity(), query_input("bad connection", "SELECT 1"))
+            .await;
+        assert_eq!(
+            result.structured_content.unwrap()["error"]["code"],
+            "connection_not_found"
+        );
+
+        // 3. Valid name, no such connection: the service records it (resolution stage).
+        let result = server
+            .run_query(identity(), query_input("nowhere", "SELECT 1"))
+            .await;
+        assert_eq!(
+            result.structured_content.unwrap()["error"]["code"],
+            "connection_not_found"
+        );
+
+        // 4. Oversized parameter: input stage, connection present.
+        let input: QueryInput = serde_json::from_value(serde_json::json!({
+            "connection": testing::CONNECTION, "sql": "SELECT ?",
+            "parameters": ["a".repeat(64 * 1024 + 1)],
+        }))
+        .unwrap();
+        let result = server.run_query(identity(), input).await;
+        assert_eq!(
+            result.structured_content.unwrap()["error"]["code"],
+            "query_too_large"
+        );
+
+        let rejections = sink.rejections();
+        assert_eq!(rejections.len(), 4, "{rejections:?}");
+        assert!(sink.attempts().is_empty());
+        assert!(sink.outcomes().is_empty());
+        let stages: Vec<_> = rejections.iter().map(|r| r.stage).collect();
+        assert_eq!(
+            stages,
+            [
+                AuditRejectionStage::Input,
+                AuditRejectionStage::Input,
+                AuditRejectionStage::ConnectionResolution,
+                AuditRejectionStage::Input,
+            ]
+        );
+        assert!(rejections[0].connection.is_none());
+        assert!(rejections[1].connection.is_none());
+        assert_eq!(
+            rejections[2].connection.as_ref().map(|c| c.as_str()),
+            Some("nowhere")
+        );
+        assert_eq!(
+            rejections[3].connection.as_ref().map(|c| c.as_str()),
+            Some(testing::CONNECTION)
+        );
+        assert!(
+            rejections
+                .iter()
+                .all(|r| r.operation == AuditOperation::Query)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_executed_and_a_denied_call_record_no_rejection() {
+        let (services, sink) = testing::services_observed(testing::FakeParts::writing());
+        let server = WardenServer::new(services);
+        let _ = server
+            .run_query(
+                identity(),
+                query_input(testing::CONNECTION, "DELETE FROM t"),
+            )
+            .await;
+        assert_eq!(sink.attempts().len(), 1);
+        assert_eq!(sink.outcomes().len(), 1);
+        assert!(sink.rejections().is_empty());
     }
 
     #[test]

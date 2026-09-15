@@ -134,6 +134,10 @@ sentence from `docs/security.md` section 10 — no database content at all — s
 in both `structured_content` and `content`, which costs nothing and still serves a client
 that reads only text.
 
+A call whose arguments do not match the tool's input schema is answered with
+`invalid_arguments` and recorded as an audit rejection; Warden no longer relays the
+SDK's deserialization text (ADR-0054).
+
 ### `list_connections`
 
 Return only safe public metadata.
@@ -273,6 +277,9 @@ The first transport and shortest path to a local vertical slice.
 - Do not print a startup banner to stdout.
 - Handle signals during shutdown.
 - Malformed messages do not expose internal errors.
+- A tool call whose arguments do not match its input schema is answered with
+  `invalid_arguments`, recorded as an audit rejection, and never with the SDK's own
+  deserialization text (ADR-0054).
 - Each newline-delimited frame is limited to 1 MiB, counted before the SDK parses it. A
   frame that grows past the limit without a newline ends the session with a fixed
   stderr diagnostic; no JSON-RPC error is sent, because nothing was decoded to

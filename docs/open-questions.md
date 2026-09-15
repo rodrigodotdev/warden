@@ -224,22 +224,17 @@ otherwise, none blocks M0–M5.
     when a deployment needs a different one, not before; a limit with a key nobody sets
     is a limit nobody has reviewed.
 
-25. **Should a malformed tool argument reach the agent as a `PublicErrorCode`?** rmcp
-    refuses an argument that fails `serde` deserialization before any Warden code runs,
-    and turns it into an in-band `isError: true` result carrying rmcp's own text: a fixed
-    prefix plus the whole `serde` message, which can name a field from Warden's input
-    schema, a field name the agent invented, or the agent's own submitted value. None of
-    it is new to the agent, and none of it can be database content, a driver message, or
-    a DSN, so `docs/security.md` section 10's prohibitions hold — but it is the one
-    agent-visible failure that is not one of the fourteen public codes, which the global
-    rule otherwise makes universal. Closing it means every tool taking a raw
-    `serde_json::Value` and hand-rolling deserialization so the failure can be mapped, a
-    structural change Milestone 12 declined to make at its end. **Decision: defer this
-    to Milestone 14**, which reworks the tool signatures for HTTP anyway; intercepting
-    rmcp's deserialization refusal means every tool would have to take a raw
-    `serde_json::Value`. Until then,
-    `crates/warden-mcp/tests/protocol.rs` pins the current framing so an SDK change reads
-    as a decision point rather than a mystery failure. Resolved in M13.3, see ADR-0054.
+25. **Resolved in Milestone 13.3 by ADR-0054 — should a malformed tool argument reach
+    the agent as a `PublicErrorCode`?** rmcp refused an argument that failed `serde`
+    deserialization before any Warden code ran, and turned it into an in-band
+    `isError: true` result carrying rmcp's own text: a fixed prefix plus the whole
+    `serde` message, which could name a field from Warden's input schema, a field name
+    the agent invented, or the agent's own submitted value. The four database tools now
+    take their arguments as a raw `JsonObject` with an explicit `input_schema` derived
+    from the same typed DTO, deserialize them in `warden-mcp`'s own `input::parse`, and
+    answer a failure with `invalid_arguments` — one of the fifteen public codes — rather
+    than the SDK's free-text message, recording the refusal as an audit rejection before
+    `Services` ever sees the call.
 
 26. **Should Warden export OpenTelemetry metrics?** `docs/operations.md` section 10.3
     names eleven metrics and defers OpenTelemetry until after the first vertical slice.

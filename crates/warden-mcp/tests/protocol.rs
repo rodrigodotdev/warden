@@ -729,35 +729,43 @@ async fn a_denied_statement_is_an_error_result_the_agent_can_read() {
 }
 
 #[tokio::test]
-async fn a_malformed_argument_is_refused_loudly_and_not_a_silent_default() {
-    // Not a top-level JSON-RPC `error`: rmcp 3.1.4's `into_tool_argument_error`
-    // (`handler/server/router/tool.rs`) deliberately downgrades an INVALID_PARAMS
-    // deserialization failure into an in-band `CallToolResult` with `isError: true`
-    // instead of propagating it as a protocol error. Confirmed by reading that
-    // function directly; the brief's own assumption of a protocol-level error does
-    // not hold against the SDK actually vendored here. What this test can still pin
-    // is the invariant the name is really about: a missing required field is refused
-    // loudly, on whichever channel carries the refusal, rather than silently defaulted.
+async fn a_malformed_argument_is_refused_with_invalid_arguments_and_echoes_nothing() {
+    // The value is wrong-typed on purpose and looks like a secret: neither it nor the
+    // deserializer's text may travel back to the agent (ADR-0054).
+    let response = &exchange(&[
+        initialize(LATEST),
+        initialized(),
+        call(
+            "query",
+            json!({ "connection": "production-db", "sql": 42, "parameters": "hunter2" }),
+        ),
+    ])
+    .await[1];
+    assert!(response["error"].is_null(), "{response}");
+    assert_eq!(response["result"]["isError"], json!(true), "{response}");
+    assert_eq!(
+        response["result"]["structuredContent"]["error"]["code"],
+        json!("invalid_arguments"),
+        "{response}"
+    );
+    let rendered = response.to_string();
+    assert!(!rendered.contains("hunter2"), "{rendered}");
+    assert!(!rendered.contains("failed to deserialize"), "{rendered}");
+}
+
+#[tokio::test]
+async fn a_missing_required_field_is_still_refused_and_never_defaulted() {
     let response = &exchange(&[
         initialize(LATEST),
         initialized(),
         call("query", json!({ "connection": "production-db" })),
     ])
     .await[1];
-    assert!(response["error"].is_null(), "{response}");
-    assert_eq!(response["result"]["isError"], json!(true), "{response}");
-    let text = response["result"]["content"][0]["text"].as_str().unwrap();
-    // This pins rmcp's own free-text extractor message ("failed to deserialize
-    // parameters: missing field `sql`"), not a Warden `PublicErrorCode` — Warden does
-    // not intercept a `Parameters<T>` extraction failure before it reaches the agent.
-    // That is a deliberate, documented gap for this milestone (recorded in the task
-    // report): intercepting it would mean every tool taking a raw `Value` and
-    // hand-rolling deserialization, a structural change bigger than anything else M12
-    // takes on. The content is provably limited to Warden's own schema field names,
-    // already public in `tests/snapshots/tools.json`. If a future SDK change makes
-    // this assertion fail, that is a decision point (does the new message still
-    // satisfy "refused loudly, never defaulted"?), not a mystery regression.
-    assert!(text.contains("sql"), "{text}");
+    assert_eq!(
+        response["result"]["structuredContent"]["error"]["code"],
+        json!("invalid_arguments"),
+        "{response}"
+    );
 }
 
 #[tokio::test]
