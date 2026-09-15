@@ -34,4 +34,6 @@ Inputs previously accepted are refused: a parameter over 64 KiB, a frame over 1 
 a `json` value whose raw text is more than twice `max_value_bytes` even if whitespace
 made it so. None of these budgets claims an absolute memory ceiling: the driver still
 materializes a row before Warden sees it, and the frame budget is per line, not per
-session.
+session. A parameter budget is not a guarantee that its JSON encoding fits one frame:
+escaping can expand a legal 256 KiB of control characters past 1 MiB on the wire, and
+the frame cap then ends the session rather than answering `query_too_large`.

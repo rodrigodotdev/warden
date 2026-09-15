@@ -24,8 +24,10 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 # `rt` for the per-request task (docs/architecture.md section 8, ADR-0038); `time` is
 # what `warden-service` deadlines are measured on. `io-util` is `tokio::io::split` in
-# `serve_duplex` (`src/stdio.rs`) and the `AsyncRead` impl in `bounded_read.rs`. No
-# `macros`: the runtime is started by the binary, not here.
+# `serve_duplex` (`src/stdio.rs`); the `AsyncRead` impl in `bounded_read.rs` itself
+# needs none of it (`AsyncRead`/`ReadBuf` are unconditional), but its tests use
+# `duplex`/`BufReader`, which do. No `macros`: the runtime is started by the binary,
+# not here.
 tokio = { workspace = true, features = ["io-util", "rt", "time"] }
 tokio-util = { workspace = true }
 tracing = { workspace = true }

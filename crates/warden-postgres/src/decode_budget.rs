@@ -25,11 +25,17 @@ impl CompoundKind {
     /// How many raw bytes one normalized byte may have cost on the wire.
     fn expansion(self) -> usize {
         match self {
-            // `json` is its own text. `jsonb` stores numerics in about half the width
-            // of their digits, so its text can be up to twice the binary.
+            // On the wire, `jsonb` is `jsonb_send`: one version byte plus the text
+            // form (sqlx strips `buf[0]` and parses the rest), and `json` is already
+            // its own text. Raw is therefore never smaller than the normalized text,
+            // so the honest expansion is ~1×. 2 is a deliberate margin for whitespace
+            // and for numeric literals that normalize shorter (e.g.
+            // `1000000000000000000000000` → `1e24`).
             Self::Json => 2,
-            // The worst honest case: an `int8[]` of small numbers costs 12 bytes per
-            // element (4-byte length + 8-byte value) that render as `1,` in JSON.
+            // The honest worst case is an `int8[]` of single-digit values: 12 raw
+            // bytes per element (4-byte length + 8-byte value) rendering as 2
+            // normalized bytes (`1,`) — 6×. 16 is a deliberate margin, not a
+            // derivation.
             Self::Array => 16,
         }
     }

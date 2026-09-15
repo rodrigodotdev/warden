@@ -99,8 +99,10 @@ impl TryFrom<ParameterInput> for ParameterValue {
 
 /// Builds the size-validated statement `query` and `explain` share.
 ///
-/// Decision 12: [`InputLimits::default`] — the 64 KiB / 100-parameter bounds of
-/// `docs/data-model.md` section 2 — because no configuration key exposes them yet.
+/// Decision 12: [`InputLimits::default`] — the four input bounds of
+/// `docs/data-model.md` section 2 (64 KiB of SQL, 100 parameters, 64 KiB per
+/// parameter, 256 KiB for all parameters) — because no configuration key exposes
+/// them yet.
 fn build_query_request(
     connection: String,
     sql: String,

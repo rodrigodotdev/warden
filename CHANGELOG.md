@@ -15,8 +15,8 @@ implementation details before `1.0` and change without notice (`SPEC.md` section
 
 - `query` and `explain` refuse a parameter over 64 KiB or parameters totalling over
   256 KiB with `query_too_large`; previously only their count was bounded.
-- The stdio transport ends the session on a frame over 1 MiB that never terminates
-  in a newline, before any of it is parsed.
+- The stdio transport ends the session on any frame that exceeds 1 MiB before its
+  newline arrives, before any of it is parsed.
 - PostgreSQL `json`, `jsonb` and array values are measured on the wire before they are
   decoded; a value far over `max_value_bytes` is refused without building it.
 

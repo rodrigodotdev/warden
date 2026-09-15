@@ -834,7 +834,7 @@ async fn an_array_larger_on_the_wire_than_in_json_still_reaches_the_normalized_c
     let (executor, runtime) = harness(Arc::clone(&pools), limits).await;
     let permit = runtime.acquire_query_permit().await.unwrap();
 
-    // 100 int8 elements: 1 220 raw bytes, under the raw budget of 16 × 256 + 64 =
+    // 100 int4 elements: 820 raw bytes, under the raw budget of 16 × 256 + 64 =
     // 4 160, but 293 normalized bytes, over 256. The builder, not the raw guard,
     // must be the one that refuses it — proven by the `limit` it reports.
     let query = authorized(
