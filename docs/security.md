@@ -190,6 +190,13 @@ but public material does not present it as a security boundary.
   name (bypass 5, above). Precise scope resolution needs a name resolver the analyzer
   does not have.
 
+  **Resolved in scope since Milestone 13.2:** a name is omitted only where the server
+  would resolve it to a CTE — a non-recursive body does not see its own alias, a
+  subquery's alias is invisible outside it, and `WITH RECURSIVE` makes every alias of
+  the list visible to every body. The global subtraction that dropped every homonym,
+  and let `WITH secrets AS (SELECT 1)` inside a subquery hide the real `secrets`, is
+  gone.
+
 ### 5.2 Object policy applies to every tool
 
 `SchemaAllowListPolicy` and `TableAllowDenyPolicy` operate on `ObjectRef`, not

@@ -78,6 +78,7 @@ mod parse;
 mod plan;
 mod pool;
 mod query;
+mod scope;
 mod statement;
 mod visit;
 

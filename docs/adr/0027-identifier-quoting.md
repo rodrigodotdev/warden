@@ -37,3 +37,6 @@ a `SqlIdentifier`, which is the intended constraint.
 
 This does not change the read-scope boundary. The dedicated role's `GRANT SELECT`
 remains it (ADR-0023); the allowlist gets more accurate, not more authoritative.
+
+Milestone 13.2 applies the same folding when resolving CTE names per scope (`scope.rs`
+in each adapter).

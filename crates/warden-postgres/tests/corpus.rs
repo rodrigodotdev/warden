@@ -878,6 +878,83 @@ const UNPARSEABLE: &[Case] = &[
     },
 ];
 
+/// Names a CTE shares with a real relation, resolved the way the server resolves them.
+const CTE_SCOPES: &[Case] = &[
+    Case {
+        // The body of a non-recursive CTE cannot see its own alias: `orders` inside it
+        // is the base table, and it must stay in the evidence.
+        sql: "WITH orders AS (SELECT * FROM orders) SELECT * FROM orders",
+        root_kind: Some(StatementKind::Select),
+        nested_kinds: &[],
+        objects: &["orders"],
+        functions: &[],
+        risks: &[],
+        verdict: None,
+    },
+    Case {
+        // An alias declared inside a subquery is invisible to the outer SELECT.
+        sql: "SELECT * FROM secrets \
+              WHERE EXISTS (WITH secrets AS (SELECT 1) SELECT * FROM secrets)",
+        root_kind: Some(StatementKind::Select),
+        nested_kinds: &[],
+        objects: &["secrets"],
+        functions: &[],
+        risks: &[],
+        verdict: None,
+    },
+    Case {
+        // Earlier siblings are visible; the chain resolves to one base table.
+        sql: "WITH a AS (SELECT * FROM t1), b AS (SELECT * FROM a) SELECT * FROM b",
+        root_kind: Some(StatementKind::Select),
+        nested_kinds: &[],
+        objects: &["t1"],
+        functions: &[],
+        risks: &[],
+        verdict: None,
+    },
+    Case {
+        // Without RECURSIVE a later sibling is not visible: `b` inside `a` is a table.
+        sql: "WITH a AS (SELECT * FROM b), b AS (SELECT 1) SELECT * FROM a",
+        root_kind: Some(StatementKind::Select),
+        nested_kinds: &[],
+        objects: &["b"],
+        functions: &[],
+        risks: &[],
+        verdict: None,
+    },
+    Case {
+        // With RECURSIVE every alias in the list is visible to every body.
+        sql: "WITH RECURSIVE a AS (SELECT * FROM b), b AS (SELECT 1) SELECT * FROM a",
+        root_kind: Some(StatementKind::Select),
+        nested_kinds: &[],
+        objects: &[],
+        functions: &[],
+        risks: &[],
+        verdict: None,
+    },
+    Case {
+        // A qualified reference is never a CTE, whatever the alias is called.
+        sql: "WITH x AS (SELECT 1) SELECT * FROM app.x",
+        root_kind: Some(StatementKind::Select),
+        nested_kinds: &[],
+        objects: &["app.x"],
+        functions: &[],
+        risks: &[],
+        verdict: None,
+    },
+    Case {
+        // The main body and its subqueries see every local alias.
+        sql: "WITH x AS (SELECT * FROM secrets) \
+              SELECT * FROM x WHERE id IN (SELECT id FROM x)",
+        root_kind: Some(StatementKind::Select),
+        nested_kinds: &[],
+        objects: &["secrets"],
+        functions: &[],
+        risks: &[],
+        verdict: None,
+    },
+];
+
 fn request(sql: &str) -> QueryRequest {
     QueryRequest::new(
         "production-postgres".parse().unwrap(),
@@ -1022,6 +1099,43 @@ fn dialect_specific_hazards_are_denied() {
 #[test]
 fn statements_the_grammar_rejects_are_denied_not_executed() {
     run(UNPARSEABLE);
+}
+
+#[test]
+fn cte_names_are_resolved_in_scope() {
+    run(CTE_SCOPES);
+}
+
+#[test]
+fn a_cte_named_after_a_denied_table_no_longer_hides_it() {
+    use warden_policy::settings::ObjectRules;
+    let settings = PolicySettings {
+        objects: ObjectRules {
+            deny_tables: vec!["orders".to_owned(), "secrets".to_owned()],
+            ..ObjectRules::default()
+        },
+        ..PolicySettings::default()
+    };
+    let engine = PolicyEngine::with_defaults(&settings).unwrap();
+    for sql in [
+        "WITH orders AS (SELECT * FROM orders) SELECT * FROM orders",
+        "SELECT * FROM secrets WHERE EXISTS (WITH secrets AS (SELECT 1) SELECT * FROM secrets)",
+    ] {
+        let analyzed = PostgreSqlAnalyzer::new().analyze(request(sql)).unwrap();
+        let rejection = engine
+            .authorize(
+                &context(),
+                &connection(),
+                analyzed,
+                ExecutionLimits::default(),
+            )
+            .unwrap_err();
+        assert_eq!(
+            rejection.primary_code(),
+            DenyCode::ObjectNotAllowed,
+            "{sql}"
+        );
+    }
 }
 
 #[test]
