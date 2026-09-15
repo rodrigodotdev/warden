@@ -272,6 +272,11 @@ The first transport and shortest path to a local vertical slice.
 - Do not print a startup banner to stdout.
 - Handle signals during shutdown.
 - Malformed messages do not expose internal errors.
+- Each newline-delimited frame is limited to 1 MiB, counted before the SDK parses it. A
+  frame that grows past the limit without a newline ends the session with a fixed
+  stderr diagnostic; no JSON-RPC error is sent, because nothing was decoded to
+  correlate one with, and no byte of the frame is logged (ADR-0052). The limit is per
+  frame, not per session.
 
 ### 5.2 Streamable HTTP
 

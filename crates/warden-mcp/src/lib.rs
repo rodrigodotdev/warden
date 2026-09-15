@@ -28,6 +28,7 @@
 //! model would violate `docs/security.md` section 10, so `error` is the only module that
 //! builds a failed [`rmcp::model::CallToolResult`] and it takes a code, not a message.
 
+mod bounded_read;
 mod error;
 mod identity;
 mod input;

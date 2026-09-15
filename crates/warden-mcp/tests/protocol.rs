@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt as _, AsyncWriteExt, BufReader};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use warden_core::analysis::{QueryAnalysis, QueryAnalysisParts, StatementKind};
@@ -829,4 +829,79 @@ async fn an_oversized_parameter_is_refused_as_query_too_large_over_the_wire() {
             "{tool}: {response}"
         );
     }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_frame_over_one_mebibyte_ends_the_session_and_runs_no_tool() {
+    let (server_side, client_side) = tokio::io::duplex(1 << 20);
+    let (read_half, mut write_half) = tokio::io::split(client_side);
+    let shutdown = CancellationToken::new();
+    let serving = tokio::spawn(warden_mcp::serve_duplex(
+        WardenServer::new(services()),
+        server_side,
+        shutdown.clone(),
+    ));
+
+    // A real session first, so the budget is proven on an initialized transport.
+    for request in [initialize(LATEST), initialized()] {
+        let mut line = serde_json::to_string(&request).unwrap();
+        line.push('\n');
+        write_half.write_all(line.as_bytes()).await.unwrap();
+    }
+    let mut reader = BufReader::new(read_half);
+    let mut handshake = String::new();
+    reader.read_line(&mut handshake).await.unwrap();
+    assert!(handshake.contains("protocolVersion"), "{handshake}");
+
+    // One byte over the budget and never a newline: the SDK would otherwise buffer
+    // this forever. `write_all` may see the far end close under it; the assertion
+    // that matters is the one on `serving`.
+    let oversized = vec![b'{'; 1024 * 1024 + 1];
+    let _ = write_half.write_all(&oversized).await;
+    let _ = write_half.flush().await;
+
+    let outcome = tokio::time::timeout(Duration::from_secs(30), serving)
+        .await
+        .expect("the session did not end after an oversized frame")
+        .expect("the serving task panicked");
+    assert!(outcome.is_ok(), "{outcome:?}");
+
+    // The server closed its end: the client reads EOF and no tool response.
+    let mut rest = String::new();
+    reader.read_to_string(&mut rest).await.unwrap();
+    assert!(!rest.contains("\"result\""), "{rest}");
+}
+
+#[tokio::test]
+async fn a_large_frame_under_the_budget_is_served_and_the_next_frame_starts_fresh() {
+    let responses = exchange(&[
+        initialize(LATEST),
+        initialized(),
+        call(
+            "query",
+            json!({
+                "connection": "production-db",
+                "sql": "SELECT ?",
+                // 700 KiB: past the parameter budget (Task 1), under the frame budget.
+                "parameters": ["a".repeat(700 * 1024)],
+            }),
+        ),
+        call(
+            "query",
+            json!({ "connection": "production-db", "sql": "SELECT 1" }),
+        ),
+    ])
+    .await;
+    assert_eq!(
+        responses[1]["result"]["structuredContent"]["error"]["code"],
+        json!("query_too_large"),
+        "{}",
+        responses[1]
+    );
+    assert_eq!(
+        responses[2]["result"]["isError"],
+        json!(false),
+        "{}",
+        responses[2]
+    );
 }

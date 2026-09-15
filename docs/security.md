@@ -525,7 +525,9 @@ sent. The refusal fires before any Warden code runs, so no database content, dri
 message, or DSN can be in it, and this section's prohibitions hold. Intercepting it would
 mean every tool taking a raw `Value` and hand-rolling deserialization; open question 25
 carries it, and `crates/warden-mcp/tests/protocol.rs` pins the current framing with a
-comment saying it pins the SDK's behaviour, not a Warden invariant.
+comment saying it pins the SDK's behaviour, not a Warden invariant. An oversized frame
+is refused before identity or a public code exists; the only trace is a fixed transport
+diagnostic.
 
 ## 11. Auditing
 
