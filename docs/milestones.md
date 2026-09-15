@@ -318,6 +318,10 @@ static inference over arbitrary SQL (`docs/security.md` §5). The startup prefli
 not repeated per request: a function created after startup by a privileged role is
 outside its proof, which ADR-0053 documents rather than closes.
 
+**Fix wave:** the preflight now excludes extension-owned functions (`citext`,
+`orafce`, pre-13 `pgcrypto`, …), since those are installed by a superuser through the
+trusted-extension mechanism rather than planted by the adversary it targets.
+
 ---
 
 ## M14 — Streamable HTTP

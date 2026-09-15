@@ -80,13 +80,13 @@ pub enum ConnectError {
     /// remediation actionable (`docs/security.md` section 4.2).
     #[error(
         "{} executable function(s) shadow built-ins Warden trusts unqualified: {}; \
-         revoke EXECUTE from the Warden role, rename them, or remove their schema from \
-         search_path (docs/security.md section 4.2, ADR-0053)",
+         revoke EXECUTE from PUBLIC (or from the Warden role), rename them, or remove \
+         their schema from search_path (docs/security.md section 4.2, ADR-0053)",
         .functions.len(),
         .functions.join(", ")
     )]
     ShadowedBuiltins {
-        /// The shadowing functions, in catalog order.
+        /// The shadowing functions, sorted by schema, name and arguments.
         functions: Vec<String>,
     },
 }

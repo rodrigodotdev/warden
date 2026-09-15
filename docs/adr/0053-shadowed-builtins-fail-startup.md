@@ -26,13 +26,22 @@ The premise is proved once, at startup, by the composition root:
 pool for functions the role can execute, in schemas on the effective `search_path`,
 whose name is in the `SAFE` registry. Any row fails the connection with every offending
 `schema.name(arguments)` and the remediation. `warden check` fails the same way. There
-is no configuration key to skip it (ADR-0026).
+is no configuration key to skip it (ADR-0026). Functions owned by an extension
+(`pg_depend.deptype = 'e'`) are excluded: `CREATE EXTENSION citext` (also `orafce`, or
+`pgcrypto` before PostgreSQL 13) legitimately overloads names the `SAFE` registry
+carries, such as `replace`, `strpos` and `min`/`max`, and that code is installed by a
+superuser through the trusted-extension mechanism, not planted by the adversary this
+preflight targets.
 
 `REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA … FROM PUBLIC` and the matching
 `ALTER DEFAULT PRIVILEGES` join the role contract: `warden role` prints them and
 `docs/security.md` section 4.2 requires them. They are also what stops a domain
 `CHECK` or a user-defined cast from running code, which is why no static cast
-allowlist is added.
+allowlist is added. The `REVOKE` is schema-wide, not author-scoped: it also withdraws
+`PUBLIC`'s `EXECUTE` on any extension-owned function installed in that schema (citext,
+hstore, PostGIS, pg_trgm, …), so an operator who runs it must re-grant `EXECUTE` to
+the application roles that need those functions, or install extensions in a schema of
+their own instead of the one Warden's role reads.
 
 ## Consequences
 
@@ -40,5 +49,8 @@ Analyzer behaviour is unchanged; ordinary unqualified SQL keeps working. A deplo
 whose role can execute a shadowing function does not start until the operator revokes
 `EXECUTE`, renames the function, or removes its schema from `search_path`. The check
 is not repeated per request: a function created after startup by a privileged role is
-outside this proof and is documented as such. MySQL needs no check: an unqualified name
-there always means the built-in.
+outside this proof and is documented as such. A deployment with `citext`, `orafce` or
+pre-13 `pgcrypto` installed in a schema on the role's path starts normally, because the
+preflight excludes those extension-owned overloads; it still fails on a hand-written
+function with the same kind of name. MySQL needs no check: an unqualified name there
+always means the built-in.

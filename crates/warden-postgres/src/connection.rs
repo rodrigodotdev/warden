@@ -160,16 +160,30 @@ pub struct PostgreSqlConnectionConfig {
 /// system schemas, and both pools connect with the same pinned `search_path` and the
 /// same role, so the control pool's answer is the agent pool's. The two-argument
 /// `has_function_privilege` evaluates for `current_user`: the Warden role itself.
+///
+/// Excludes functions owned by an extension (`pg_depend.deptype = 'e'`): those are
+/// installed by a superuser through the trusted-extension mechanism, not planted by
+/// the adversary this preflight targets, and `CREATE EXTENSION citext` (or `orafce`,
+/// or pre-13 `pgcrypto`) legitimately overloads names such as `replace`, `strpos` and
+/// `min`/`max` that the built-in registry classifies as safe. All comparison
+/// operators are schema-qualified so a same-named operator on the search path cannot
+/// change this query's meaning.
 const SHADOWED_BUILTINS_SQL: &str = "\
     SELECT n.nspname AS schema, \
            p.proname AS name, \
            pg_catalog.pg_get_function_identity_arguments(p.oid) AS arguments \
     FROM pg_catalog.pg_proc p \
     JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
-    WHERE n.nspname <> 'pg_catalog' \
-      AND n.nspname = ANY(pg_catalog.current_schemas(false)) \
-      AND p.proname = ANY($1) \
+    WHERE n.nspname OPERATOR(pg_catalog.<>) 'pg_catalog' \
+      AND n.nspname OPERATOR(pg_catalog.=) ANY(pg_catalog.current_schemas(false)) \
+      AND p.proname OPERATOR(pg_catalog.=) ANY($1) \
       AND pg_catalog.has_function_privilege(p.oid, 'EXECUTE') \
+      AND NOT EXISTS ( \
+        SELECT 1 FROM pg_catalog.pg_depend d \
+        WHERE d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_proc'::pg_catalog.regclass \
+          AND d.objid OPERATOR(pg_catalog.=) p.oid \
+          AND d.deptype OPERATOR(pg_catalog.=) 'e' \
+      ) \
     ORDER BY 1, 2, 3";
 
 /// One PostgreSQL connection's two pools (ADR-0025).

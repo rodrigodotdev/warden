@@ -112,8 +112,15 @@ This is what stops a domain `CHECK`, a `CREATE CAST … WITH FUNCTION`, or a fun
 that shadows a built-in from running code on an agent's behalf: all of them execute as
 the caller. Warden verifies the last case itself at startup — a function the role can
 execute, in a schema on the connection's `search_path`, named like a built-in the
-analyzer trusts, fails the connection with the offending names (ADR-0053). `warden
-role` prints both statements.
+analyzer trusts, fails the connection with the offending names (ADR-0053). That check
+excludes functions owned by an extension (`citext`, `hstore`, PostGIS, `pg_trgm`, …):
+those are installed by a superuser through the trusted-extension mechanism, not by the
+adversary the check targets, and several extensions legitimately overload names the
+analyzer trusts (`citext` alone adds `replace`, `strpos`, `min`/`max`, …). `warden
+role` prints both statements above; because the `REVOKE` is schema-wide rather than
+author-scoped, it also withdraws `PUBLIC`'s `EXECUTE` on any extension function
+installed in that schema, so re-grant `EXECUTE` to the application roles that need
+those functions, or install extensions in a schema of their own.
 
 ## 5. Real read-scope boundary
 

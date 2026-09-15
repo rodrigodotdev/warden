@@ -162,9 +162,17 @@ REVOKE CREATE ON SCHEMA {schema} FROM PUBLIC;
 -- PostgreSQL grants EXECUTE on every function to PUBLIC, so this role could call any
 -- function in the schema: a domain CHECK, a user-defined cast, or a function named
 -- like a built-in (docs/security.md section 4.2, ADR-0053). Revoke the default, then
--- grant EXECUTE back to the application roles that need it. Warden refuses to start
--- while a function this role can execute shadows a built-in it trusts.
+-- grant EXECUTE back to the application roles that need it. This also revokes EXECUTE
+-- from every role on any extension-owned function installed in this schema (citext,
+-- hstore, PostGIS, pg_trgm, …), not only functions the schema's owner wrote by hand —
+-- re-grant EXECUTE to application roles, or install extensions in their own schema.
+-- Warden refuses to start while a function this role can execute shadows a built-in
+-- it trusts, but excludes extension-owned functions from that check, since those are
+-- installed by a superuser through the trusted-extension mechanism.
 REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA {schema} FROM PUBLIC;
+-- As with the SELECT default privilege above, without FOR ROLE this only withholds
+-- EXECUTE from functions the role running this script creates in the future — add
+-- FOR ROLE <owner> if migrations run as a different application or owner role.
 ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
 
 -- The second barrier: the session refuses a write even with every Warden layer removed.

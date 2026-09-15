@@ -53,6 +53,34 @@ async fn provision(root: &PostgreSqlConnectionPools) {
     transaction.commit().await.unwrap();
 }
 
+/// `citext` installed in `public` by the superuser connection, plus a role that can
+/// reach it unqualified.
+///
+/// PostgreSQL grants `EXECUTE` on a newly created function to `PUBLIC` by default,
+/// `CREATE EXTENSION` included, so the role needs no separate `GRANT EXECUTE`: this
+/// is the same default the shadowing test above exploits, now exercised by extension
+/// code instead of a hand-written function.
+async fn provision_citext(root: &PostgreSqlConnectionPools) {
+    let mut connection = root.control().acquire().await.unwrap();
+    let mut transaction = connection.begin_with("BEGIN READ WRITE").await.unwrap();
+    for statement in [
+        "CREATE EXTENSION citext".to_owned(),
+        "REVOKE CONNECT, TEMPORARY ON DATABASE postgres FROM PUBLIC".to_owned(),
+        format!(
+            "CREATE ROLE {ROLE} LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE \
+             NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD '{ROLE_PASSWORD}'"
+        ),
+        format!("GRANT CONNECT ON DATABASE postgres TO {ROLE}"),
+        format!("GRANT USAGE ON SCHEMA public TO {ROLE}"),
+    ] {
+        sqlx::query(AssertSqlSafe(statement))
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+    }
+    transaction.commit().await.unwrap();
+}
+
 async fn revoke_execute(root: &PostgreSqlConnectionPools) {
     let mut connection = root.control().acquire().await.unwrap();
     let mut transaction = connection.begin_with("BEGIN READ WRITE").await.unwrap();
@@ -155,6 +183,32 @@ async fn a_shadowing_function_outside_the_search_path_is_not_reachable_and_not_r
         .unwrap();
     let resolved: String = row.try_get("resolved").unwrap();
     assert_eq!(resolved, "abc");
+    warden.verify_function_identity(deadline()).await.unwrap();
+
+    warden.close().await;
+    root.close().await;
+}
+
+#[tokio::test]
+async fn an_extension_owned_overload_does_not_trip_the_preflight() {
+    // `CREATE EXTENSION citext` installs `replace`, `strpos`, `split_part`,
+    // `translate`, `regexp_*(citext, …)` and `min`/`max(citext)` in `public`, every
+    // one of them a name the `SAFE` registry trusts unqualified. Unlike
+    // `app.lower(integer)` above, this is not the adversary the preflight targets —
+    // it is a superuser installing a trusted contrib extension — so it must not fail
+    // the connection.
+    let container = start_postgres().await;
+    let root = PostgreSqlConnectionPools::connect(config(dsn(&container).await))
+        .await
+        .unwrap();
+    provision_citext(&root).await;
+    let warden = PostgreSqlConnectionPools::connect(config_with_path(
+        role_dsn(&container).await,
+        &["public"],
+    ))
+    .await
+    .unwrap();
+
     warden.verify_function_identity(deadline()).await.unwrap();
 
     warden.close().await;
