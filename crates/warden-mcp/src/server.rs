@@ -35,11 +35,12 @@
 //! answer. It does not read the panic payload: a payload can contain a row value, and
 //! Milestone 13 owns the payload-free hook that records the location instead.
 //!
-//! What the spawn buys is containment, not a complete record of the request that
-//! panicked. ADR-0038's consequences say so directly: it keeps an ordinary request on
-//! the path that writes its outcome *and* contains a panic to the one request that
-//! raised it, but a task that panics still leaves its audit attempt without a terminal
-//! outcome. Closing that last gap is not this milestone's.
+//! What the spawn buys is containment and, since Milestone 13.3, a place in the
+//! services' task tracker, so shutdown waits for it — not a complete record of the
+//! request that panicked. ADR-0038's consequences say so directly: it keeps an
+//! ordinary request on the path that writes its outcome *and* contains a panic to the
+//! one request that raised it, but a task that panics still leaves its audit attempt
+//! without a terminal outcome. Closing that last gap is not this milestone's.
 //!
 //! # Client cancellation is not wired through, deliberately
 //!
@@ -263,13 +264,13 @@ impl WardenServer {
 }
 
 impl WardenServer {
-    /// Runs one future in its own task and maps a lost task to `internal_error`.
-    async fn run_in_task<T, F>(future: F) -> Result<T, PublicErrorCode>
+    /// Runs one future in its own tracked task and maps a lost task to `internal_error`.
+    async fn run_in_task<T, F>(&self, future: F) -> Result<T, PublicErrorCode>
     where
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        match tokio::spawn(future).await {
+        match self.services.tasks().spawn(future).await {
             Ok(value) => Ok(value),
             Err(join) => {
                 // No payload: it can contain a row value, and Milestone 13 owns the
@@ -406,10 +407,11 @@ impl WardenServer {
             }
         };
         let services = Arc::clone(&self.services);
-        let outcome = Self::run_in_task(
-            async move { services.query().execute(&identity, request).await }.instrument(span),
-        )
-        .await;
+        let outcome = self
+            .run_in_task(
+                async move { services.query().execute(&identity, request).await }.instrument(span),
+            )
+            .await;
         match outcome {
             Ok(Ok(result)) => output::QueryOutput::from(&result).into_result(),
             Ok(Err(error)) => failure(error.public_code()),
@@ -433,10 +435,12 @@ impl WardenServer {
             }
         };
         let services = Arc::clone(&self.services);
-        let outcome = Self::run_in_task(
-            async move { services.explain().explain(&identity, request).await }.instrument(span),
-        )
-        .await;
+        let outcome = self
+            .run_in_task(
+                async move { services.explain().explain(&identity, request).await }
+                    .instrument(span),
+            )
+            .await;
         match outcome {
             Ok(Ok(plan)) => output::ExplainOutput::from(&plan).into_result(),
             Ok(Err(error)) => failure(error.public_code()),
@@ -464,10 +468,11 @@ impl WardenServer {
             }
         };
         let services = Arc::clone(&self.services);
-        let outcome = Self::run_in_task(
-            async move { services.schema().search(&identity, request).await }.instrument(span),
-        )
-        .await;
+        let outcome = self
+            .run_in_task(
+                async move { services.schema().search(&identity, request).await }.instrument(span),
+            )
+            .await;
         match outcome {
             Ok(Ok(found)) => output::SearchOutput::from(&found).into_result(),
             Ok(Err(error)) => failure(error.public_code()),
@@ -495,10 +500,12 @@ impl WardenServer {
             }
         };
         let services = Arc::clone(&self.services);
-        let outcome = Self::run_in_task(
-            async move { services.schema().describe(&identity, request).await }.instrument(span),
-        )
-        .await;
+        let outcome = self
+            .run_in_task(
+                async move { services.schema().describe(&identity, request).await }
+                    .instrument(span),
+            )
+            .await;
         match outcome {
             Ok(Ok(described)) => output::DescribeOutput::from(&described).into_result(),
             Ok(Err(error)) => failure(error.public_code()),
@@ -601,6 +608,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
 
     use tracing::field::{Field, Visit};
     use tracing::instrument::WithSubscriber as _;
@@ -753,6 +761,29 @@ mod tests {
             connection: testing::CONNECTION.to_owned(),
             tables: tables.iter().map(|table| (*table).to_owned()).collect(),
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_tool_task_is_tracked_by_the_services_it_runs_against() {
+        let services = testing::services_from(testing::FakeParts {
+            executor: Arc::new(testing::FakeExecutor::taking(Duration::from_secs(10))),
+            ..testing::FakeParts::new()
+        });
+        let server = Arc::new(WardenServer::new(Arc::clone(&services)));
+        let call = tokio::spawn({
+            let server = Arc::clone(&server);
+            async move {
+                server
+                    .run_query(identity(), query_input(testing::CONNECTION, "SELECT 1"))
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(services.tasks().len(), 1);
+        call.await.unwrap();
+        services.tasks().close();
+        services.tasks().wait().await;
+        assert_eq!(services.tasks().len(), 0);
     }
 
     #[tokio::test]

@@ -22,6 +22,7 @@ use std::sync::Arc;
 
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::Instrument as _;
 use warden_core::context::RequestContext;
 use warden_core::error::PublicError;
@@ -55,9 +56,10 @@ impl ExplainService {
         audit: Arc<dyn AuditSink>,
         redactor: Arc<Redactor>,
         shutdown: CancellationToken,
+        tasks: TaskTracker,
     ) -> Self {
         Self {
-            core: ServiceCore::new(registry, engine, audit, redactor, shutdown),
+            core: ServiceCore::new(registry, engine, audit, redactor, shutdown, tasks),
         }
     }
 

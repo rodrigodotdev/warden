@@ -21,6 +21,7 @@
 use std::sync::Arc;
 
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::Instrument as _;
 use warden_core::context::RequestContext;
 use warden_core::error::PublicError;
@@ -55,9 +56,10 @@ impl QueryService {
         audit: Arc<dyn AuditSink>,
         redactor: Arc<Redactor>,
         shutdown: CancellationToken,
+        tasks: TaskTracker,
     ) -> Self {
         Self {
-            core: ServiceCore::new(registry, engine, audit, redactor, shutdown),
+            core: ServiceCore::new(registry, engine, audit, redactor, shutdown, tasks),
         }
     }
 
@@ -181,6 +183,7 @@ mod tests {
 
     use std::sync::Arc;
 
+    use tokio_util::task::TaskTracker;
     use warden_core::dialect::Dialect;
     use warden_core::error::{PublicError, PublicErrorCode};
     use warden_core::query::{InputLimits, QueryRequest};
@@ -692,22 +695,31 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn a_dropped_request_completes_its_audit_record_too() {
-        let sink = Arc::new(testing::FakeAuditSink::new());
+        let sink = Arc::new(testing::FakeAuditSink::taking(Duration::from_millis(50)));
+        let tasks = TaskTracker::new();
         let service = testing::query_service(testing::ServiceFakes {
             executor: Arc::new(testing::FakeExecutor::taking(Duration::from_secs(600))),
             audit: sink.clone(),
+            tasks: tasks.clone(),
             ..testing::ServiceFakes::default()
         });
         let context = testing::request_context();
         let mut execution = Box::pin(service.execute(&context, testing::request()));
+        // Past the sink's 50ms attempt write, so the request is dropped while it is
+        // executing — the state in which it owes an outcome.
         tokio::select! {
             result = &mut execution => panic!("query completed early: {result:?}"),
-            () = tokio::time::sleep(Duration::from_millis(1)) => {}
+            () = tokio::time::sleep(Duration::from_millis(100)) => {}
         }
         drop(execution);
 
-        let outcome = testing::await_outcome(&sink).await;
-        assert_eq!(outcome.outcome, AuditOutcome::Abandoned);
+        // No polling: the detached write is a tracked task, so waiting for the tracker
+        // is waiting for the record.
+        tasks.close();
+        tasks.wait().await;
+        let outcomes = sink.outcomes();
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].outcome, AuditOutcome::Abandoned);
     }
 
     #[tokio::test(start_paused = true)]

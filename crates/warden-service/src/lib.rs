@@ -46,7 +46,9 @@
 use std::fmt;
 use std::sync::Arc;
 
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use warden_policy::PolicyEngine;
 
 pub mod error;
@@ -110,10 +112,20 @@ impl fmt::Debug for ServiceParts {
     }
 }
 
+/// What a drain left behind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DrainReport {
+    /// Whether every tracked task ended before the deadline.
+    pub complete: bool,
+    /// Tasks still running when the deadline passed; zero when complete.
+    pub pending: usize,
+}
+
 /// The application services, sharing one registry, engine, sink, and redactor.
 pub struct Services {
     registry: Arc<dyn ConnectionRegistry>,
     audit: Arc<dyn AuditSink>,
+    tasks: TaskTracker,
     query: QueryService,
     explain: ExplainService,
     schema: SchemaService,
@@ -129,12 +141,14 @@ impl Services {
     pub fn new(parts: ServiceParts) -> Result<Self, ServiceBuildError> {
         let redactor = Arc::new(Redactor::new(&parts.redaction)?);
         let redactor_is_empty = redactor.is_empty();
+        let tasks = TaskTracker::new();
         let query = QueryService::new(
             Arc::clone(&parts.registry),
             Arc::clone(&parts.engine),
             Arc::clone(&parts.audit),
             Arc::clone(&redactor),
             parts.shutdown.clone(),
+            tasks.clone(),
         );
         let explain = ExplainService::new(
             Arc::clone(&parts.registry),
@@ -142,6 +156,7 @@ impl Services {
             Arc::clone(&parts.audit),
             Arc::clone(&redactor),
             parts.shutdown.clone(),
+            tasks.clone(),
         );
         let schema = SchemaService::new(
             Arc::clone(&parts.registry),
@@ -149,10 +164,12 @@ impl Services {
             Arc::clone(&parts.audit),
             redactor,
             parts.shutdown,
+            tasks.clone(),
         );
         Ok(Self {
             registry: parts.registry,
             audit: parts.audit,
+            tasks,
             query,
             explain,
             schema,
@@ -187,6 +204,40 @@ impl Services {
         self.registry.as_ref()
     }
 
+    /// The tracker every admitted piece of work runs on.
+    ///
+    /// The MCP adapter spawns each tool call here and the outcome guard spawns its
+    /// detached write here, so `drain` can wait for both (ADR-0055).
+    #[must_use]
+    pub fn tasks(&self) -> &TaskTracker {
+        &self.tasks
+    }
+
+    /// Stops queued requests, then waits for every tracked task until `deadline`.
+    ///
+    /// Closing each connection's gate first turns a queued request into an immediate
+    /// `connection_unavailable` with a `not_started` outcome instead of a wait. The
+    /// tracker is closed, not aborted: a task that outlives the deadline is reported,
+    /// never claimed finished.
+    pub async fn drain(&self, deadline: Instant) -> DrainReport {
+        for metadata in self.registry.list() {
+            if let Ok(runtime) = self.registry.get(&metadata.name) {
+                runtime.close_gate();
+            }
+        }
+        self.tasks.close();
+        match tokio::time::timeout_at(deadline, self.tasks.wait()).await {
+            Ok(()) => DrainReport {
+                complete: true,
+                pending: 0,
+            },
+            Err(_elapsed) => DrainReport {
+                complete: false,
+                pending: self.tasks.len(),
+            },
+        }
+    }
+
     /// Records a call the adapter refused before this layer could see it.
     ///
     /// The one entry the MCP adapter has for the audit trail. It takes the public
@@ -217,6 +268,72 @@ impl fmt::Debug for Services {
 
 #[cfg(test)]
 mod testing;
+
+#[cfg(test)]
+mod drain_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use std::time::Duration;
+
+    use tokio::time::Instant;
+    use warden_core::error::{PublicError as _, PublicErrorCode};
+    use warden_ports::AuditOutcome;
+
+    use super::*;
+    use crate::testing::{self, FakeAuditSink};
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_reports_incomplete_when_admitted_work_outlives_the_deadline() {
+        let (services, _sink) =
+            testing::services_with_sink(FakeAuditSink::taking(Duration::from_secs(3600)));
+        let _write = services.tasks().spawn(async move {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        });
+        let report = services
+            .drain(Instant::now() + Duration::from_secs(30))
+            .await;
+        assert_eq!(
+            report,
+            DrainReport {
+                complete: false,
+                pending: 1
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_completes_once_every_tracked_task_has_ended() {
+        let (services, _sink) = testing::services_with_sink(FakeAuditSink::new());
+        services.tasks().spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let report = services
+            .drain(Instant::now() + Duration::from_secs(30))
+            .await;
+        assert_eq!(
+            report,
+            DrainReport {
+                complete: true,
+                pending: 0
+            }
+        );
+        assert!(services.tasks().is_closed());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn drain_closes_every_gate_so_queued_requests_stop_waiting() {
+        let (services, sink) = testing::services_with_sink(FakeAuditSink::new());
+        let (_held, queued) = testing::hold_one_permit_and_queue_a_request(&services).await;
+        let report_and_result = tokio::join!(
+            services.drain(Instant::now() + Duration::from_secs(30)),
+            queued,
+        );
+        assert!(report_and_result.0.complete);
+        let error = report_and_result.1.unwrap_err();
+        assert_eq!(error.public_code(), PublicErrorCode::ConnectionUnavailable);
+        assert_eq!(sink.outcomes()[0].outcome, AuditOutcome::NotStarted);
+    }
+}
 
 #[cfg(test)]
 mod composition_tests {

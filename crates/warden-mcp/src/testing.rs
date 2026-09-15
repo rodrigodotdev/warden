@@ -18,6 +18,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -176,9 +177,10 @@ impl QueryAnalyzer for FakeAnalyzer {
     }
 }
 
-/// An executor with a fixed outcome and an observable call count.
+/// An executor with a fixed outcome, an optional delay, and an observable call count.
 #[derive(Debug)]
 pub(crate) struct FakeExecutor {
+    duration: Duration,
     failure: Option<ExecuteError>,
     calls: AtomicUsize,
 }
@@ -193,8 +195,17 @@ impl FakeExecutor {
     /// Creates an executor that returns the fixture result.
     pub(crate) fn new() -> Self {
         Self {
+            duration: Duration::ZERO,
             failure: None,
             calls: AtomicUsize::new(0),
+        }
+    }
+
+    /// Creates an executor that takes the given duration before returning the fixture.
+    pub(crate) fn taking(duration: Duration) -> Self {
+        Self {
+            duration,
+            ..Self::new()
         }
     }
 
@@ -202,7 +213,7 @@ impl FakeExecutor {
     pub(crate) fn failing(error: ExecuteError) -> Self {
         Self {
             failure: Some(error),
-            calls: AtomicUsize::new(0),
+            ..Self::new()
         }
     }
 
@@ -222,6 +233,7 @@ impl QueryExecutor for FakeExecutor {
     ) -> warden_ports::BoxFuture<'a, Result<ResultSet, ExecuteError>> {
         Box::pin(async move {
             self.calls.fetch_add(1, Ordering::Relaxed);
+            tokio::time::sleep(self.duration).await;
             match &self.failure {
                 Some(error) => Err(error.clone()),
                 None => Ok(result_set()),

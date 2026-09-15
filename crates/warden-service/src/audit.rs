@@ -16,6 +16,7 @@ use std::fmt;
 use std::sync::Arc;
 
 use tokio::time::timeout;
+use tokio_util::task::TaskTracker;
 use tracing::Instrument as _;
 use tracing::instrument::WithSubscriber as _;
 use warden_core::analysis::StatementKind;
@@ -166,7 +167,8 @@ pub(crate) async fn record_outcome(sink: &dyn AuditSink, event: AuditOutcomeEven
 
 /// Tracks a recorded attempt through queueing, database access, and redaction.
 ///
-/// An abandoned pending request raises an alarm and detaches a best-effort outcome.
+/// An abandoned pending request raises an alarm and spawns a best-effort outcome
+/// write on the services' task tracker, so a drain waits for it.
 /// Cancellation during completion raises only an alarm: the sink may already have
 /// persisted that terminal record, so writing another would risk a contradiction.
 pub(crate) struct OutcomeGuard {
@@ -176,6 +178,8 @@ pub(crate) struct OutcomeGuard {
     parent: tracing::Span,
     /// The dispatcher that created `parent`, because spawned tasks do not inherit it.
     dispatch: tracing::Dispatch,
+    /// Where a detached outcome write is spawned, so a drain can wait for it.
+    tasks: TaskTracker,
 }
 
 #[derive(Debug)]
@@ -206,12 +210,14 @@ impl OutcomeGuard {
         sink: Arc<dyn AuditSink>,
         attempt_id: AuditEventId,
         parent: tracing::Span,
+        tasks: TaskTracker,
     ) -> Self {
         Self {
             sink,
             state: OutcomeState::Pending(attempt_id),
             parent,
             dispatch: tracing::dispatcher::get_default(Clone::clone),
+            tasks,
         }
     }
 
@@ -264,20 +270,24 @@ impl Drop for OutcomeGuard {
             result_bytes: None,
             error_code: Some(PublicErrorCode::InternalError),
         };
-        // `Drop` cannot await, so the durable write is detached. The future carries
-        // both the owning service span and its dispatcher because Tokio tasks inherit
-        // neither. It is bounded by `AUDIT_WRITE_TIMEOUT` like every other write, and
-        // there is no runtime to spawn on when a request is dropped during shutdown —
-        // the alarm above is what covers that case.
+        // `Drop` cannot await, so the durable write runs on its own task. The future
+        // carries both the owning service span and its dispatcher because Tokio tasks
+        // inherit neither. It is bounded by `AUDIT_WRITE_TIMEOUT` like every other
+        // write, and there is no runtime to spawn on when a request is dropped after
+        // the runtime is gone — the alarm above is what covers that case.
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
                 let sink = Arc::clone(&self.sink);
                 let parent = self.parent.clone();
                 let dispatch = self.dispatch.clone();
-                handle.spawn(
+                // Tracked, so the drain waits for it. The tracker still accepts a spawn
+                // after `close()`, which is what makes a request dropped *during* the
+                // drain leave its `abandoned` record rather than a stderr line alone.
+                self.tasks.spawn_on(
                     async move { record_outcome(sink.as_ref(), event).await }
                         .instrument(parent)
                         .with_subscriber(dispatch),
+                    &handle,
                 );
             }
             Err(_no_runtime) => {}
@@ -451,7 +461,12 @@ mod tests {
         let sink = Arc::new(PendingOutcomeSink(Mutex::new(Vec::new())));
         let recorded = outcome();
         let ((), events) = alarms_while(|| {
-            let guard = OutcomeGuard::arm(sink.clone(), recorded.attempt_id, tracing::Span::none());
+            let guard = OutcomeGuard::arm(
+                sink.clone(),
+                recorded.attempt_id,
+                tracing::Span::none(),
+                TaskTracker::new(),
+            );
             let mut completion = Box::pin(guard.complete(recorded));
             assert!(
                 completion

@@ -25,8 +25,10 @@ thiserror = { workspace = true }
 # `Handle::try_current` in the audit drop guard, which detaches one write during
 # unwinding; this crate still starts no runtime.
 tokio = { workspace = true, features = ["time", "rt"] }
-# `CancellationToken` lives in the ungated `tokio_util::sync` module.
-tokio-util = { workspace = true }
+# `CancellationToken` lives in the ungated `tokio_util::sync` module; `rt` is for
+# `tokio_util::task::TaskTracker`, which `Services` owns so every tool task and every
+# detached audit write can be waited for at shutdown (ADR-0055).
+tokio-util = { workspace = true, features = ["rt"] }
 # The redaction matcher walks `QueryPlan::plan`, which is a `serde_json::Value`.
 serde_json = { workspace = true }
 # The audit outcome write fails open with an alarm (ADR-0022), and an alarm needs a

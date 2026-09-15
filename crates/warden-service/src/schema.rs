@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::Instrument as _;
 use warden_core::context::RequestContext;
 use warden_core::error::PublicError;
@@ -58,9 +59,10 @@ impl SchemaService {
         audit: Arc<dyn AuditSink>,
         redactor: Arc<Redactor>,
         shutdown: CancellationToken,
+        tasks: TaskTracker,
     ) -> Self {
         Self {
-            core: ServiceCore::new(registry, engine, audit, redactor, shutdown),
+            core: ServiceCore::new(registry, engine, audit, redactor, shutdown, tasks),
         }
     }
 
@@ -132,8 +134,12 @@ impl SchemaService {
                 Vec::new(),
             );
             audit::record_attempt(self.core.audit().as_ref(), &attempt).await?;
-            let guard =
-                audit::OutcomeGuard::arm(Arc::clone(self.core.audit()), attempt.id, outcome_parent);
+            let guard = audit::OutcomeGuard::arm(
+                Arc::clone(self.core.audit()),
+                attempt.id,
+                outcome_parent,
+                self.core.tasks().clone(),
+            );
 
             let started = Instant::now();
             let filter = ObjectFilter::new(
@@ -204,8 +210,12 @@ impl SchemaService {
                 Vec::new(),
             );
             audit::record_attempt(self.core.audit().as_ref(), &attempt).await?;
-            let guard =
-                audit::OutcomeGuard::arm(Arc::clone(self.core.audit()), attempt.id, outcome_parent);
+            let guard = audit::OutcomeGuard::arm(
+                Arc::clone(self.core.audit()),
+                attempt.id,
+                outcome_parent,
+                self.core.tasks().clone(),
+            );
 
             let started = Instant::now();
             let filter = ObjectFilter::new(
@@ -480,6 +490,7 @@ mod tests {
             Arc::new(testing::FakeAuditSink::new()),
             redactor,
             shutdown,
+            TaskTracker::new(),
         )
     }
 
@@ -515,6 +526,7 @@ mod tests {
             Arc::new(testing::FakeAuditSink::new()),
             testing::redactor(&[]),
             CancellationToken::new(),
+            TaskTracker::new(),
         );
         (service, inspector, held)
     }
@@ -737,6 +749,7 @@ mod tests {
             Arc::new(testing::FakeAuditSink::new()),
             testing::redactor(&[]),
             CancellationToken::new(),
+            TaskTracker::new(),
         );
 
         service

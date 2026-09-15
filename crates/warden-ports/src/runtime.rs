@@ -226,6 +226,16 @@ impl ConnectionRuntime {
         }
     }
 
+    /// Stops admitting queued callers: every waiter, and every later caller, gets
+    /// [`ConnectionError::Unavailable`] at once instead of waiting out `max_queue_wait`.
+    ///
+    /// Permits already held are unaffected. Called once, at shutdown, by the service
+    /// layer's drain; `acquire_query_permit` has mapped a closed semaphore to
+    /// `Unavailable` since it was written, and this is what closes it.
+    pub fn close_gate(&self) {
+        self.query_semaphore.close();
+    }
+
     /// How many slots are free right now. Diagnostics and tests only.
     #[must_use]
     pub fn available_permits(&self) -> usize {
@@ -387,5 +397,32 @@ mod tests {
         assert_eq!(runtime.available_permits(), 1);
         let reacquired = runtime.acquire_query_permit().await.unwrap();
         drop(reacquired);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn closing_the_gate_wakes_a_queued_caller_as_unavailable() {
+        let runtime = Arc::new(testing::runtime(
+            Dialect::MySql,
+            ExecutionLimits {
+                max_concurrent_queries: 1,
+                max_queue_wait: Duration::from_secs(3600),
+                ..ExecutionLimits::default()
+            },
+        ));
+        let held = runtime.acquire_query_permit().await.unwrap();
+        let waiter = tokio::spawn({
+            let runtime = Arc::clone(&runtime);
+            async move { runtime.acquire_query_permit().await }
+        });
+        tokio::task::yield_now().await;
+        runtime.close_gate();
+        // Paused time: had the close not woken it, the waiter would only return after
+        // an auto-advanced hour, as `Busy`.
+        let error = waiter.await.unwrap().unwrap_err();
+        assert!(
+            matches!(error, ConnectionError::Unavailable { .. }),
+            "{error:?}"
+        );
+        drop(held);
     }
 }

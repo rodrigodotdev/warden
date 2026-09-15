@@ -29,7 +29,9 @@ thiserror = { workspace = true }
 # `duplex`/`BufReader`, which do. No `macros`: the runtime is started by the binary,
 # not here.
 tokio = { workspace = true, features = ["io-util", "rt", "time"] }
-tokio-util = { workspace = true }
+# `rt` for `tokio_util::task::TaskTracker`: `run_in_task` spawns each tool call on
+# the tracker `warden-service` owns, so shutdown can wait for it (ADR-0055).
+tokio-util = { workspace = true, features = ["rt"] }
 tracing = { workspace = true }
 # Request ids are generated, never taken from the agent-controlled JSON-RPC id.
 uuid = { workspace = true }
