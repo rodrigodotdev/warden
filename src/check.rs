@@ -95,7 +95,9 @@ pub(crate) async fn run(config: &Path, out: &mut dyn Write) -> Result<bool> {
     // refuses to open never reaches this point: `build` aborts, closing whatever it had
     // already opened, and the error propagates from the line above.
     let probed = probe(&deployment, out).await;
-    deployment.close().await;
+    // `check` admits no request, so nothing is ever tracked to drain; an incomplete
+    // report here would be a fixture bug, not a deployment one.
+    let _report = deployment.close().await;
     let failures = probed?;
 
     for warning in &warnings {

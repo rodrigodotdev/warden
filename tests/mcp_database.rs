@@ -1276,6 +1276,12 @@ async fn stdout_carries_protocol_only_and_the_process_exits_on_eof() {
         stderr.contains("warden starting"),
         "the startup log line is missing from stderr: {stderr}"
     );
+    // A normal EOF shutdown has nothing outstanding to drain; the alarm `Deployment::close`
+    // logs for an incomplete drain must not fire on the ordinary path.
+    assert!(
+        !stderr.contains("outlived the drain deadline"),
+        "an ordinary shutdown logged a drain-deadline alarm: {stderr}"
+    );
 }
 
 #[tokio::test]

@@ -216,6 +216,13 @@ otherwise, none blocks M0–M5.
     unbounded wait. Milestone 14, where long-lived HTTP requests make it matter, should
     add the seam rather than the abort.
 
+    Milestone 13.3 closed the half of this question about a queued request outliving
+    shutdown: `ConnectionRuntime::close_gate` stops admitting queued callers at the start
+    of `Deployment::close`, so a request still waiting for a permit fails fast with
+    `connection_unavailable` instead of riding out `max_queue_wait` past the drain
+    deadline (ADR-0055). Propagating a client's own cancellation to a query already
+    running remains open.
+
 24. **Should `InputLimits` be configurable?** `warden-core` calls them configurable and no
     configuration key exposes them. Milestone 12 passes `InputLimits::default()` — the
     64 KiB statement and 100-parameter figures of `docs/data-model.md` section 2 —

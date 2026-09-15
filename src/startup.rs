@@ -62,7 +62,7 @@ use warden_postgres::{
     PostgreSqlQueryExecutor, PostgreSqlSchemaInspector, SearchPath,
 };
 use warden_service::{
-    MAX_ADAPTER_CLEANUP, RedactionSettings, RedactionStrategy, ServiceParts, Services,
+    DrainReport, MAX_ADAPTER_CLEANUP, RedactionSettings, RedactionStrategy, ServiceParts, Services,
     StaticConnectionRegistry,
 };
 
@@ -71,6 +71,13 @@ use warden_service::{
 /// One catalog read on the control pool; the same order of magnitude as `check`'s
 /// probes.
 const FUNCTION_IDENTITY_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The longest Warden itself waits for admitted work after the session ends.
+///
+/// Counted from `Deployment::close`, which runs after the SDK's own drain (up to 5 s on
+/// EOF, 2 s on cancellation). One deadline for every phase — tracked tasks, then pools —
+/// so the number of connections cannot multiply it (ADR-0055).
+pub(crate) const DRAIN_DEADLINE: Duration = Duration::from_secs(30);
 
 /// One running Warden: its services, the pools behind them, and the token that stops both.
 ///
@@ -100,31 +107,40 @@ impl Deployment {
         &self.pools
     }
 
-    /// Signals cancellation and then closes every pool, bounded.
+    /// Cancels, drains, closes, and says whether everything finished.
     ///
-    /// `docs/architecture.md` section 13 in order: stop in-flight operations by
-    /// cancelling the root token every service child descends from, then close the
-    /// pools, and never wait indefinitely. The bound is
-    /// [`MAX_ADAPTER_CLEANUP`], the same figure `warden-service` budgets for an
-    /// adapter's post-query cleanup, because that is what a draining pool is waiting on.
-    pub(crate) async fn close(self) {
+    /// `docs/architecture.md` section 13 in order: cancel the root token every service
+    /// child descends from; close every connection's gate and wait for every tracked
+    /// task — tool calls and detached audit writes — under one deadline; then close the
+    /// pools with whatever time is left. Never waits indefinitely, and never claims a
+    /// task finished when it did not.
+    pub(crate) async fn close(self) -> DrainReport {
+        let deadline = Instant::now() + DRAIN_DEADLINE;
         self.shutdown.cancel();
-        close_pools(&self.pools).await;
+        let report = self.services.drain(deadline).await;
+        if !report.complete {
+            tracing::error!(
+                target: "warden",
+                pending = report.pending,
+                "admitted work outlived the drain deadline; its audit outcomes may not have been written"
+            );
+        }
+        close_pools(&self.pools, deadline).await;
+        report
     }
 }
 
-/// Closes each pool in turn, none of them for longer than [`MAX_ADAPTER_CLEANUP`].
+/// Closes each pool in turn, none past `deadline` and none for longer than
+/// [`MAX_ADAPTER_CLEANUP`] on its own.
 ///
 /// Shared by [`Deployment::close`] and by [`build`]'s own failure path, so a connection
 /// opened during a startup that later fails is closed the same way one opened during a
 /// startup that succeeded is: `docs/architecture.md` section 13 bounds every wait, and a
 /// server that has stopped answering must not turn a failure into a hang.
-async fn close_pools(pools: &[PoolHandle]) {
+async fn close_pools(pools: &[PoolHandle], deadline: Instant) {
     for pool in pools {
-        if tokio::time::timeout(MAX_ADAPTER_CLEANUP, pool.close())
-            .await
-            .is_err()
-        {
+        let bound = deadline.min(Instant::now() + MAX_ADAPTER_CLEANUP);
+        if tokio::time::timeout_at(bound, pool.close()).await.is_err() {
             tracing::warn!(
                 target: "warden.startup",
                 connection = %pool.name(),
@@ -256,7 +272,7 @@ pub(crate) async fn build(
                 // be reclaimed by the operating system with no close handshake sent, and
                 // a multi-connection deployment is exactly where a startup failure is
                 // most likely to be retried.
-                close_pools(&pools).await;
+                close_pools(&pools, Instant::now() + DRAIN_DEADLINE).await;
                 return Err(error);
             }
         }

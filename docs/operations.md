@@ -289,6 +289,11 @@ an attempt synchronized between the copy and truncate can be erased. Renaming a 
 file also leaves Warden writing its old open handle. Coordinated reopening is not
 implemented (ADR-0043).
 
+Warden waits up to 30 seconds after the session ends for in-flight tool calls and their
+audit outcomes, then closes the pools within the same deadline. If anything is still
+running, it logs `admitted work outlived the drain deadline` and exits non-zero; treat
+that exit as an incomplete audit trail, not as a crash.
+
 ### 3.1 Structural rules
 
 **`allow_multiple_statements` does not exist.** One statement is an invariant (SPEC
