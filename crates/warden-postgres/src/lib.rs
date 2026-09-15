@@ -65,6 +65,7 @@ mod analyzer;
 mod bind;
 mod catalog;
 mod connection;
+mod decode_budget;
 mod error;
 mod execute;
 mod explain;

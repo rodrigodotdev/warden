@@ -247,6 +247,14 @@ is not constrained by `max_rows` or incremental result-byte accounting. This lim
 only bounds what **leaves** Warden; the driver still materializes the incoming value.
 Database `GRANT`s or views are the real mitigation for giant values.
 
+**Compound PostgreSQL values are measured twice.** Before SQLx decodes a `json`,
+`jsonb` or array value, its raw wire size must fit `min(max_value_bytes × factor + 64,
+16 MiB)` — factor 2 for JSON, 16 for arrays. This bounds the decoded structure Warden
+would otherwise build only to refuse it; the `ResultBuilder` still measures the
+normalized bytes afterwards and remains the authority. A `json` value padded with
+whitespace can therefore be refused on its raw size even though its compact form
+would fit (ADR-0052).
+
 **`max_queue_wait` is necessary** because `timeout` measures execution, not waiting.
 Without it, 50 concurrent calls with `max_concurrent_queries = 3` leave 47 tasks
 waiting indefinitely, so client-perceived latency includes an unbounded queue.

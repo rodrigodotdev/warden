@@ -40,6 +40,8 @@ use sqlx::{Column, Decode, Row, Type, TypeInfo, ValueRef};
 use warden_core::dialect::Dialect;
 use warden_core::result::{NormalizationError, ResultBuildError, ResultColumn, ResultValue};
 
+use crate::decode_budget::{CompoundKind, guard_raw_decode};
+
 /// The origin every PostgreSQL `date`, `timestamp` and `timestamptz` counts from.
 const PG_EPOCH: time::Date = time::macros::date!(2000 - 01 - 01);
 
@@ -176,7 +178,8 @@ pub(crate) fn row(
 /// `max_value_bytes` is checked here against the value's **raw** size as well as by
 /// `ResultBuilder` against its encoded size. The early check is not a duplicate: a
 /// 500 MB `bytea` would otherwise be copied into a 666 MB base64 string purely to be
-/// rejected. The builder remains the authority.
+/// rejected, and a compound value is measured on the wire before SQLx builds its
+/// decoded form (`decode_budget`). The builder remains the authority.
 fn value(
     row: &PgRow,
     index: usize,
@@ -193,6 +196,13 @@ fn value(
         ValueKind::Array(element) => array_value(element, raw, column, max_value_bytes),
         ValueKind::Unsupported => Err(unsupported(column).into()),
     }
+}
+
+/// The raw wire size of one non-null value, without copying it.
+fn raw_len(raw: &PgValueRef<'_>, column: &ResultColumn) -> Result<usize, ResultBuildError> {
+    raw.as_bytes()
+        .map(<[u8]>::len)
+        .map_err(|_| unsupported(column).into())
 }
 
 /// One non-null scalar.
@@ -239,7 +249,15 @@ fn scalar_value(
             ))
         }
         Scalar::Uuid => ResultValue::Uuid(decode::<Uuid>(raw, column)?.to_string()),
-        Scalar::Json => ResultValue::Json(decode::<serde_json::Value>(raw, column)?),
+        Scalar::Json => {
+            guard_raw_decode(
+                CompoundKind::Json,
+                raw_len(&raw, column)?,
+                column,
+                max_value_bytes,
+            )?;
+            ResultValue::Json(decode::<serde_json::Value>(raw, column)?)
+        }
     };
     Ok(value)
 }
@@ -257,6 +275,12 @@ fn array_value(
     column: &ResultColumn,
     max_value_bytes: usize,
 ) -> Result<ResultValue, ResultBuildError> {
+    guard_raw_decode(
+        CompoundKind::Array,
+        raw_len(&raw, column)?,
+        column,
+        max_value_bytes,
+    )?;
     match element {
         Scalar::Bool => array_of::<bool, _>(raw, column, |value| Ok(ResultValue::Bool(value))),
         Scalar::Signed => array_of::<i64, _>(raw, column, |value| Ok(ResultValue::I64(value))),
@@ -291,9 +315,11 @@ fn array_value(
 /// The elements are owned rather than borrowed because `sqlx`'s array decoder
 /// requires `T: for<'a> Decode<'a, Postgres>`, a higher-ranked bound `&str` and
 /// `&[u8]` cannot satisfy. One consequence is honest and worth stating: an array
-/// element is copied before it is measured against `max_value_bytes`, unlike a
-/// scalar. As `docs/data-model.md` section 7 already records, that budget bounds
-/// what **leaves** Warden; the driver has materialized the row either way.
+/// element is still copied before it is measured against `max_value_bytes`, unlike a
+/// scalar; `array_value` only bounds the raw array as a whole before this function
+/// decodes it (`decode_budget`). As `docs/data-model.md` section 7 already records,
+/// that per-value budget bounds what **leaves** Warden; the driver has materialized
+/// the row either way.
 ///
 /// One asymmetry with the scalar path is accepted rather than engineered around: a
 /// `NaN` inside a `numeric[]` fails through `decode` and is reported as

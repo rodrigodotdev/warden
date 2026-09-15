@@ -460,7 +460,9 @@ pub enum ResultBuildError {
         column: String,
         /// The value's encoded size.
         actual: usize,
-        /// The configured per-value budget.
+        /// The budget the value failed: the configured per-value budget, or, for a
+        /// compound PostgreSQL value refused before decoding, the raw budget
+        /// derived from it (ADR-0052).
         limit: usize,
     },
     /// The first row alone exceeded `max_result_bytes`, so nothing can be returned.
