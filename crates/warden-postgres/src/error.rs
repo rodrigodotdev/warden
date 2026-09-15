@@ -73,6 +73,22 @@ pub enum ConnectError {
         /// What the server reports.
         actual: String,
     },
+    /// A user function the role can execute shadows a built-in Warden trusts.
+    ///
+    /// Each entry is `schema.name(identity arguments)`: operator-facing names of the
+    /// operator's own objects, never a DSN or a host. Listing them is what makes the
+    /// remediation actionable (`docs/security.md` section 4.2).
+    #[error(
+        "{} executable function(s) shadow built-ins Warden trusts unqualified: {}; \
+         revoke EXECUTE from the Warden role, rename them, or remove their schema from \
+         search_path (docs/security.md section 4.2, ADR-0053)",
+        .functions.len(),
+        .functions.join(", ")
+    )]
+    ShadowedBuiltins {
+        /// The shadowing functions, in catalog order.
+        functions: Vec<String>,
+    },
 }
 
 impl ConnectError {
@@ -111,5 +127,16 @@ mod tests {
             .to_string(),
             "session setting default_transaction_read_only is \"off\" at the server; expected \"on\""
         );
+    }
+
+    #[test]
+    fn shadowed_builtins_lists_every_function_and_the_remediation() {
+        let error = ConnectError::ShadowedBuiltins {
+            functions: vec!["app.lower(integer)".to_owned(), "app.now()".to_owned()],
+        };
+        let text = error.to_string();
+        assert!(text.starts_with("2 executable function(s)"), "{text}");
+        assert!(text.contains("app.lower(integer), app.now()"), "{text}");
+        assert!(text.contains("revoke EXECUTE"), "{text}");
     }
 }

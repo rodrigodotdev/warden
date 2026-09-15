@@ -42,6 +42,7 @@
 //! errors through `Display`.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use tokio::time::Instant;
@@ -64,6 +65,12 @@ use warden_service::{
     MAX_ADAPTER_CLEANUP, RedactionSettings, RedactionStrategy, ServiceParts, Services,
     StaticConnectionRegistry,
 };
+
+/// How long PostgreSQL's function-identity preflight may take (ADR-0053).
+///
+/// One catalog read on the control pool; the same order of magnitude as `check`'s
+/// probes.
+const FUNCTION_IDENTITY_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One running Warden: its services, the pools behind them, and the token that stops both.
 ///
@@ -345,6 +352,19 @@ async fn build_connection(
                 .await
                 .with_context(|| format!("connection {name} could not be opened"))?,
             );
+            // Before the connection is usable by anything: a role that can reach a
+            // user function under a trusted built-in's name makes the analyzer's
+            // `KnownSafe` a false statement (ADR-0053). The pools this just opened are
+            // closed on the way out, like every other startup failure.
+            if let Err(error) = pools
+                .verify_function_identity(Instant::now() + FUNCTION_IDENTITY_TIMEOUT)
+                .await
+            {
+                pools.close().await;
+                return Err(anyhow::Error::new(error).context(format!(
+                    "connection {name} cannot trust unqualified function calls"
+                )));
+            }
             let parts = ConnectionRuntimeParts {
                 capabilities: capabilities_for(Dialect::PostgreSql),
                 limits,

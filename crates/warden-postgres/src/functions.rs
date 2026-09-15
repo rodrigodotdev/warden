@@ -358,6 +358,12 @@ pub(crate) fn classify(name: &str) -> (FunctionClassification, Option<RiskFlag>)
     )
 }
 
+/// Every name the registry classifies as `KnownSafe`, for the startup check that
+/// proves no executable user function shadows one of them (ADR-0053).
+pub(crate) fn safe_names() -> &'static [&'static str] {
+    SAFE
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]

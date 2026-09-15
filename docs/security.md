@@ -98,6 +98,23 @@ own unsafe-function set while preserving safe reporting functions. RLS restricts
 within a granted table; grants remain the boundary for whether the role can read that
 table or a granted view at all.
 
+PostgreSQL also grants `EXECUTE` on every function to `PUBLIC` by default, so the
+Warden role can call any user function unless that default is revoked. Revoke it per
+schema and for future functions, then grant `EXECUTE` back to the application roles
+that need it:
+
+```sql
+REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA app FROM PUBLIC;
+ALTER DEFAULT PRIVILEGES IN SCHEMA app REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+```
+
+This is what stops a domain `CHECK`, a `CREATE CAST … WITH FUNCTION`, or a function
+that shadows a built-in from running code on an agent's behalf: all of them execute as
+the caller. Warden verifies the last case itself at startup — a function the role can
+execute, in a schema on the connection's `search_path`, named like a built-in the
+analyzer trusts, fails the connection with the offending names (ADR-0053). `warden
+role` prints both statements.
+
 ## 5. Real read-scope boundary
 
 **The table allowlist does not bound what the agent can read.** It operates on AST
@@ -376,7 +393,9 @@ nextval  setval  pg_notify
 unverified user-defined functions
 ```
 
-Function classification is conservative by definition.
+Function classification is conservative by definition. Trusting an unqualified name
+(ADR-0029) is conditioned on the startup preflight of ADR-0053; a function created
+after startup by a privileged role is outside that proof.
 
 **How each one is detected (Milestone 5).** Data-modifying CTEs, locking clauses,
 `SELECT INTO`, `COPY`, `CALL`, and every function above come from the AST.

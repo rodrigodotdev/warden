@@ -1000,8 +1000,10 @@ validates the configuration, resolves every secret reference, opens and drops th
 configured audit destination to prove it is writable, opens every connection with the
 same eager connect `serve` performs, runs each adapter's fixed readiness probe on
 `control_pool` (section 10.4), reads the session settings back on **both** pools to catch
-a pooler or proxy that discarded the connection-time options (section 5.2), and closes
-every pool it opened before it returns. It **never executes arbitrary user SQL**: it takes
+a pooler or proxy that discarded the connection-time options (section 5.2), checks
+function identity — no executable function on the `search_path` shadows a trusted
+built-in (PostgreSQL only; fails startup with the names) — and closes every pool it
+opened before it returns. It **never executes arbitrary user SQL**: it takes
 no query permit and dispatches no query, so the only statements it causes are those two
 fixed adapter ones.
 
