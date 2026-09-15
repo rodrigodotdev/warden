@@ -159,6 +159,14 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} GRANT SELECT ON TABLES TO {user};
 -- PostgreSQL 14 and earlier grant CREATE on the public schema to PUBLIC.
 REVOKE CREATE ON SCHEMA {schema} FROM PUBLIC;
 
+-- PostgreSQL grants EXECUTE on every function to PUBLIC, so this role could call any
+-- function in the schema: a domain CHECK, a user-defined cast, or a function named
+-- like a built-in (docs/security.md section 4.2, ADR-0053). Revoke the default, then
+-- grant EXECUTE back to the application roles that need it. Warden refuses to start
+-- while a function this role can execute shadows a built-in it trusts.
+REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA {schema} FROM PUBLIC;
+ALTER DEFAULT PRIVILEGES IN SCHEMA {schema} REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+
 -- The second barrier: the session refuses a write even with every Warden layer removed.
 ALTER ROLE {user} SET default_transaction_read_only = on;
 "
@@ -354,6 +362,28 @@ mod tests {
             "{sql}"
         );
         assert!(sql.contains("FOR ROLE <owner>"), "{sql}");
+    }
+
+    #[test]
+    fn the_postgresql_role_script_revokes_the_default_execute_grant() {
+        let sql = role_sql(Dialect::PostgreSql, "warden_ro", "app", "public");
+        assert!(
+            sql.contains("REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA public FROM PUBLIC;"),
+            "{sql}"
+        );
+        assert!(
+            sql.contains(
+                "ALTER DEFAULT PRIVILEGES IN SCHEMA public REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;"
+            ),
+            "{sql}"
+        );
+        // The revoke precedes the read-only session setting, so an operator who stops
+        // reading at the first barrier still ran it.
+        assert!(
+            sql.find("REVOKE EXECUTE").unwrap()
+                < sql.find("default_transaction_read_only").unwrap(),
+            "{sql}"
+        );
     }
 
     #[test]

@@ -151,12 +151,7 @@ Seven structural bypasses exist:
    or `RiskFlag::Ddl`, and policy denies it on that evidence alone. It becomes
    load-bearing the moment a write-permitting profile exists, at which point
    `TableAllowDenyPolicy` would not see the relation being written.
-7. **User-defined casts on PostgreSQL.** `'x'::evil_type` and
-   `CAST('x' AS evil_type)` reach `Expr::Cast`, never `Expr::Function`, so the
-   function classification in section 7.3 never sees them. `CREATE CAST ... WITH
-   FUNCTION` and a type's input function both run arbitrary code. This does not
-   need a wildcard-to-`Unknown` `Expr` arm to close: creating the cast, or the type
-   it casts to, is DDL, and DDL is denied outright.
+7. **User-defined casts on PostgreSQL.** `'x'::evil_type` and `CAST('x' AS evil_type)` reach `Expr::Cast`, never `Expr::Function`, so function classification never sees them. `CREATE CAST ... WITH FUNCTION` and a domain's `CHECK` run code — as the **caller**. Denying DDL does not close this: both objects can predate the session. What closes it is the role contract of section 4.2: with `EXECUTE` revoked from `PUBLIC`, the cast fails with `insufficient_privilege` instead of running. A static allowlist of cast targets was considered and rejected (ADR-0053): it would refuse enums, `citext`, `vector`, ranges and every extension type — none of which runs user SQL — while adding nothing the grant does not provide.
 
 **Design consequence:** the dedicated role's `GRANT SELECT` bounds read scope. The
 allowlist remains useful for reducing attack surface and improving error messages,
