@@ -239,6 +239,31 @@ work); and client cancellation reaching a running query (open question 23, also 
 
 ---
 
+## M13.1 — Resource bounds
+
+**Three inputs Warden accepted without a size check of their own now have one.**
+`InputLimits` gained `max_parameter_bytes` (64 KiB) and `max_total_parameter_bytes`
+(256 KiB), measured by `ParameterValue::input_bytes` — UTF-8 bytes for text, eight
+per number, one per boolean, zero per null — and enforced in `QueryRequest::new`
+before a query reaches analysis; an oversized parameter is refused as
+`query_too_large`. The stdio transport wraps its read half in `BoundedRead`
+(`crates/warden-mcp/src/bounded_read.rs`), which counts bytes since the last
+newline and fails a frame over 1 MiB with `io::ErrorKind::InvalidData` ahead of
+rmcp's own reader; the session ends without a JSON-RPC error and without a byte of
+the oversized frame ever being logged. PostgreSQL's `json`, `jsonb`, and array
+values are measured on the wire before SQLx decodes them: the raw size must fit
+`min(max_value_bytes × factor + 64, 16 MiB)`, factor 2 for JSON and 16 for arrays,
+or the value is refused as `ResultBuildError::ValueTooLarge` carrying the raw
+budget as `limit`, before the decode allocates anything. All three budgets are
+constants with no configuration key (ADR-0026), and the `ResultBuilder` remains
+the sole authority on normalized bytes. See ADR-0052.
+
+Deliberately left: none of these budgets claims an absolute memory ceiling. The
+driver still materializes a full row before Warden's own checks run, and the
+frame budget resets at every newline, so it bounds one frame, not a session.
+
+---
+
 ## M14 — Streamable HTTP
 
 Use rmcp's HTTP transport with `2026-07-28` semantics, authentication integration,
