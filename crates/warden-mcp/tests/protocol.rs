@@ -801,3 +801,32 @@ async fn no_response_ever_carries_a_connection_string() {
         assert!(!transcript.contains(forbidden), "{forbidden} in transcript");
     }
 }
+
+#[tokio::test]
+async fn an_oversized_parameter_is_refused_as_query_too_large_over_the_wire() {
+    for tool in ["query", "explain"] {
+        let response = &exchange(&[
+            initialize(LATEST),
+            initialized(),
+            call(
+                tool,
+                json!({
+                    "connection": "production-db",
+                    "sql": "SELECT ?",
+                    "parameters": ["a".repeat(64 * 1024 + 1)],
+                }),
+            ),
+        ])
+        .await[1];
+        assert_eq!(
+            response["result"]["isError"],
+            json!(true),
+            "{tool}: {response}"
+        );
+        assert_eq!(
+            response["result"]["structuredContent"]["error"]["code"],
+            json!("query_too_large"),
+            "{tool}: {response}"
+        );
+    }
+}

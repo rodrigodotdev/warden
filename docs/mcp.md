@@ -187,6 +187,9 @@ Initial limit: **20 tables per call**. Object policy applies.
 
 The tool schema is generic; SQL is dialect-native.
 
+Each parameter is limited to 64 KiB and all parameters together to 256 KiB; exceeding
+either is `query_too_large`.
+
 ### `explain`
 
 ```json
@@ -199,6 +202,9 @@ The tool schema is generic; SQL is dialect-native.
 
 **Do not invent a universal cost metric.** MySQL and PostgreSQL cost units are not
 comparable.
+
+Each parameter is limited to 64 KiB and all parameters together to 256 KiB; exceeding
+either is `query_too_large`.
 
 ## 3. EXPLAIN semantics
 

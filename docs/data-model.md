@@ -55,9 +55,15 @@ pub struct QueryRequest {
 The public constructor validates hard, configurable size limits **before parsing**:
 
 ```text
-maximum SQL bytes:  64 KiB
-maximum parameters: 100
+maximum SQL bytes:               64 KiB
+maximum parameters:              100
+maximum bytes per parameter:     64 KiB   (UTF-8 bytes of text; 8 for a number; 1 for a boolean; 0 for null)
+maximum bytes, all parameters:   256 KiB
 ```
+
+The parameter figures measure the domain payload (`ParameterValue::input_bytes`), not
+JSON or the driver's wire encoding. All four are checked before parsing and reported
+as `query_too_large` (ADR-0052).
 
 ## 3. Parameters
 

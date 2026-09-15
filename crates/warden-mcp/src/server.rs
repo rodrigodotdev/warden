@@ -717,6 +717,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_oversized_parameter_never_reaches_the_executor() {
+        use warden_ports::QueryExecutor;
+        let executor = Arc::new(testing::FakeExecutor::new());
+        let services = testing::services_from(testing::FakeParts {
+            executor: Arc::clone(&executor) as Arc<dyn QueryExecutor>,
+            ..testing::FakeParts::new()
+        });
+        let server = WardenServer::new(services);
+        let input: QueryInput = serde_json::from_value(serde_json::json!({
+            "connection": testing::CONNECTION,
+            "sql": "SELECT ?",
+            "parameters": ["a".repeat(64 * 1024 + 1)],
+        }))
+        .unwrap();
+        let result = server.run_query(identity(), input).await;
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            result.structured_content.unwrap()["error"]["code"],
+            serde_json::json!("query_too_large")
+        );
+        assert_eq!(executor.calls(), 0);
+    }
+
+    #[tokio::test]
     async fn a_denied_statement_reaches_the_agent_as_query_rejected_and_nothing_else() {
         let server = WardenServer::new(testing::services_from(testing::FakeParts::writing()));
         let result = server

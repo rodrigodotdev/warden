@@ -78,6 +78,21 @@ impl ParameterValue {
         Ok(Self::F64(value))
     }
 
+    /// How many bytes of caller input this value represents, for `InputLimits`.
+    ///
+    /// A measure of the domain payload, not of a JSON or wire encoding: the UTF-8
+    /// length of text, a fixed eight for any number, one for a boolean, zero for
+    /// `NULL`. It never serializes or copies the value (SPEC section 6, invariant 23).
+    #[must_use]
+    pub fn input_bytes(&self) -> usize {
+        match self {
+            Self::Null => 0,
+            Self::Bool(_) => 1,
+            Self::I64(_) | Self::U64(_) | Self::F64(_) => 8,
+            Self::String(value) => value.len(),
+        }
+    }
+
     /// Classifies a JSON number without rounding integer syntax into a float.
     fn from_json_number(number: serde_json::Number) -> Result<Self, ParameterError> {
         if let Some(value) = number.as_u64() {

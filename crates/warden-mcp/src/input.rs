@@ -109,12 +109,18 @@ fn build_query_request(
     let connection = connection
         .parse()
         .map_err(|_| PublicErrorCode::ConnectionNotFound)?;
+    let limits = InputLimits::default();
+    // The cheap half of the core's own checks, before a `serde_json::from_value` per
+    // parameter: the core repeats them, so nothing depends on this pass, but an input
+    // that is already too long buys no conversion work with it.
+    if sql.len() > limits.max_sql_bytes || parameters.len() > limits.max_parameters {
+        return Err(PublicErrorCode::QueryTooLarge);
+    }
     let parameters = parameters
         .into_iter()
         .map(ParameterValue::try_from)
         .collect::<Result<Vec<_>, _>>()?;
-    QueryRequest::new(connection, sql, parameters, &InputLimits::default())
-        .map_err(|error| error.public_code())
+    QueryRequest::new(connection, sql, parameters, &limits).map_err(|error| error.public_code())
 }
 
 /// Arguments to the `query` tool (`docs/mcp.md` section 2).
