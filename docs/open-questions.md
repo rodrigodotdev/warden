@@ -239,7 +239,7 @@ otherwise, none blocks M0–M5.
     rmcp's deserialization refusal means every tool would have to take a raw
     `serde_json::Value`. Until then,
     `crates/warden-mcp/tests/protocol.rs` pins the current framing so an SDK change reads
-    as a decision point rather than a mystery failure.
+    as a decision point rather than a mystery failure. Resolved in M13.3, see ADR-0054.
 
 26. **Should Warden export OpenTelemetry metrics?** `docs/operations.md` section 10.3
     names eleven metrics and defers OpenTelemetry until after the first vertical slice.

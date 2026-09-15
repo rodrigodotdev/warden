@@ -21,7 +21,7 @@
 //! ```text
 //! in :  JSON arguments ─▶ input.rs ─▶ warden-core request types (already size-validated)
 //! out:  service result  ─▶ output.rs ─▶ structured_content + a summary line
-//! err:  typed error     ─▶ PublicErrorCode ─▶ error.rs ─▶ one of fourteen fixed codes
+//! err:  typed error     ─▶ PublicErrorCode ─▶ error.rs ─▶ one of fifteen fixed codes
 //! ```
 //!
 //! Nothing else. A raw `sqlx` message, a DSN, a hostname, or a SQL fragment reaching a

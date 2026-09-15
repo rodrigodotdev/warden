@@ -20,6 +20,8 @@ pub enum PublicErrorCode {
     ConnectionUnavailable,
     /// The input exceeded an accepted size before parsing.
     QueryTooLarge,
+    /// The tool arguments did not deserialize into the tool's input schema.
+    InvalidArguments,
     /// The dialect parser rejected the statement.
     QueryParseError,
     /// Policy denied the statement.
@@ -49,10 +51,11 @@ impl PublicErrorCode {
     ///
     /// Keep this array in step with the enum; the unit tests below fail loudly if
     /// it drifts.
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::ConnectionNotFound,
         Self::ConnectionUnavailable,
         Self::QueryTooLarge,
+        Self::InvalidArguments,
         Self::QueryParseError,
         Self::QueryRejected,
         Self::ServerBusy,
@@ -76,6 +79,7 @@ impl PublicErrorCode {
             Self::ConnectionNotFound => "connection_not_found",
             Self::ConnectionUnavailable => "connection_unavailable",
             Self::QueryTooLarge => "query_too_large",
+            Self::InvalidArguments => "invalid_arguments",
             Self::QueryParseError => "query_parse_error",
             Self::QueryRejected => "query_rejected",
             Self::ServerBusy => "server_busy",
@@ -143,6 +147,7 @@ mod tests {
             "query_too_large",
             "schema_lookup_error",
             "server_busy",
+            "invalid_arguments",
         ]);
         assert_eq!(actual, documented);
         assert_eq!(

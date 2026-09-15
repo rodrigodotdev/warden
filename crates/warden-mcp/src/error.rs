@@ -1,6 +1,6 @@
 //! The one place an internal failure becomes something a model may see.
 //!
-//! `docs/security.md` section 10 fixes a closed set of fourteen codes and says raw SQLx
+//! `docs/security.md` section 10 fixes a closed set of fifteen codes and says raw SQLx
 //! errors — which can carry hostnames, users, database names, SQL, and server details —
 //! must never reach the model. Every service error already knows its own
 //! [`warden_core::error::PublicErrorCode`], so this module takes a *code* and never a
@@ -48,6 +48,9 @@ pub(crate) fn public_message(code: PublicErrorCode) -> &'static str {
         }
         PublicErrorCode::QueryTooLarge => {
             "the statement or its parameter list exceeds the accepted size"
+        }
+        PublicErrorCode::InvalidArguments => {
+            "the tool arguments do not match the tool's input schema; check the field names and types"
         }
         PublicErrorCode::QueryParseError => {
             "the statement could not be parsed in this connection's dialect"
@@ -105,6 +108,13 @@ mod tests {
             }
             assert!(message.is_ascii(), "{code}: {message}");
         }
+    }
+
+    #[test]
+    fn invalid_arguments_tells_the_agent_what_to_fix_without_echoing_anything() {
+        let message = public_message(PublicErrorCode::InvalidArguments);
+        assert!(message.contains("input schema"), "{message}");
+        assert!(message.contains("field names and types"), "{message}");
     }
 
     #[test]

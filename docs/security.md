@@ -520,7 +520,11 @@ query_parse_error           query_normalization_error
 query_rejected              query_execution_error
 server_busy                 schema_lookup_error
 explain_error               internal_error
+invalid_arguments
 ```
+
+`invalid_arguments`: the arguments of a tool call did not match its input schema; the
+schema field names are the only detail an agent needs, and it already has the schema.
 
 **Shipped in Milestone 12.** `crates/warden-mcp/src/error.rs` is the single boundary:
 every failed tool call in `warden-mcp` leaves through its `failure` function, and so does
