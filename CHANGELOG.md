@@ -19,6 +19,17 @@ implementation details before `1.0` and change without notice (`SPEC.md` section
   newline arrives, before any of it is parsed.
 - PostgreSQL `json`, `jsonb` and array values are measured on the wire before they are
   decoded; a value far over `max_value_bytes` is refused without building it.
+- A PostgreSQL connection fails to start when a function the Warden role can execute,
+  in a schema on its `search_path`, shares a name with a built-in the analyzer trusts;
+  the failure names the functions. `warden check` reports the same.
+- `warden role` now revokes the default `EXECUTE` grant from `PUBLIC` for the schema
+  and for future functions.
+
+### Fixed
+
+- CTE names are resolved in scope on both dialects. A CTE that reads a table of its own
+  name, or an alias declared inside a subquery, no longer hides the real table from
+  `deny_tables`/`allow_tables`.
 
 ## [0.2.0] - 2026-09-09
 

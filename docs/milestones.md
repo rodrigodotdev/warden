@@ -264,6 +264,62 @@ frame budget resets at every newline, so it bounds one frame, not a session.
 
 ---
 
+## M13.2 — SQL analysis precision
+
+**Two gaps between what the analyzer proves and what the server actually runs are
+closed.** PostgreSQL resolves an unqualified call across every schema on the
+`search_path` and picks an exact match regardless of path position, so a function the
+Warden role can execute — which PostgreSQL grants to `PUBLIC` by default — can shadow
+a built-in the analyzer trusts by name alone (ADR-0029). `PostgreSqlConnectionPools::
+verify_function_identity` closes it by proving the premise once, at startup, on the
+control pool: it reads `pg_proc` for functions the role can execute, in schemas on the
+effective `search_path`, whose name is in the `SAFE` registry, and fails the connection
+with every offending `schema.name(arguments)` and its remediation when a row exists.
+`warden check` runs the same preflight and fails the same way; there is no
+configuration key to skip it. See ADR-0053, `docs/security.md` §4.2 and §7.3, and
+`docs/operations.md`. The container test
+`an_unqualified_call_resolves_to_the_shadowing_function_and_startup_refuses_it`
+(`crates/warden-postgres/src/container_tests/identity.rs`) measures the resolution
+rule directly, and `a_shadowing_function_outside_the_search_path_is_not_reachable_and_
+not_reported` confirms the preflight names only what a query could actually reach. The
+end-to-end test `a_shadowing_function_fails_serve_and_check_until_execute_is_revoked`
+(`tests/mcp_database.rs`) drives both `serve` and `check` against a real shadowing
+function and confirms both refuse until `EXECUTE` is revoked. `warden role`'s
+PostgreSQL script now revokes the default `EXECUTE` grant from `PUBLIC` for the schema
+and for future functions (`ALTER DEFAULT PRIVILEGES`), which is also what stops a
+domain `CHECK` or a user-defined cast from running code — the reason no static cast
+allowlist was added instead (`crates/warden-postgres/src/visit.rs`,
+`docs/security.md` §5 item 7).
+
+The second gap was CTE scope. Both dialect analyzers previously subtracted every CTE
+name declared anywhere in a statement from `deny_tables`/`allow_tables` evidence,
+global to the whole walk rather than scoped to where each name is actually visible —
+so a CTE named after a denied table, or an alias declared inside an unrelated
+subquery, could hide a real table reference from the policy engine. `scope.rs`
+(`crates/warden-postgres/src/scope.rs`, `crates/warden-mysql/src/scope.rs`) tracks a
+stack of per-query scopes during the single visitor walk instead, resolving each
+unqualified name against only the CTEs actually visible at that point in the
+document, the way each server resolves it. The two dialects differ on `RECURSIVE`:
+PostgreSQL makes every alias of a `WITH` visible to every body in it, while MySQL
+8.4 limits a body to itself and the siblings declared before it, never one declared
+after. The corpus case set `CTE_SCOPES` and the regression case
+`a_cte_named_after_a_denied_table_no_longer_hides_it` exist in both adapters'
+`tests/corpus.rs`, and the container tests
+`a_cte_sharing_the_real_tables_name_still_reads_the_real_table` (in
+`crates/warden-postgres/src/container_tests/execution.rs` and
+`crates/warden-mysql/src/container_tests/execution.rs`) confirm the real servers
+resolve a CTE named after a real table the same way the corpus predicts.
+
+Deliberately left: operator precedence and implicit casts that change a value's
+apparent type, views, and row-level security remain outside static analysis — they
+are the database role's job (`GRANT`, `REVOKE`, `CREATE POLICY`), not the analyzer's,
+and Warden's read-scope boundary has always been the role plus the allowlist, not
+static inference over arbitrary SQL (`docs/security.md` §5). The startup preflight is
+not repeated per request: a function created after startup by a privileged role is
+outside its proof, which ADR-0053 documents rather than closes.
+
+---
+
 ## M14 — Streamable HTTP
 
 Use rmcp's HTTP transport with `2026-07-28` semantics, authentication integration,

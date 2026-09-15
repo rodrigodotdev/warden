@@ -274,6 +274,31 @@ otherwise, none blocks M0–M5.
     ADR-0051 keeps the list, adds `WARDEN_HANDSHAKE_VERSION`, and answers every handshake
     with `2025-11-25`. rmcp is unpinned again at 3.2.0.
 
+28. **Should startup warn about domains with a `CHECK` and `pg_cast` entries backed by a
+    user function?** Both can run arbitrary code the same way a shadowing built-in
+    does (ADR-0053), but neither is named by the preflight
+    `PostgreSqlConnectionPools::verify_function_identity` adds in Milestone 13.2, which
+    reads `pg_proc` for functions matching the `SAFE` registry's names, not every
+    function the role could reach through a domain constraint or an implicit cast.
+    **Deferred.** Both already require the same `EXECUTE` privilege the role contract
+    now revokes from `PUBLIC` by default (`warden role`, `docs/security.md` §4.2), so
+    the same remediation that closes the shadowing gap closes this one without a
+    second check. A dedicated warning would need to walk `pg_constraint` and `pg_cast`
+    separately and explain a different failure mode than "a function shadows a
+    built-in," for a risk the role contract already mitigates. Revisit if a deployment
+    demonstrates a role that can execute such a function despite the revoke.
+
+29. **Does the startup preflight need to run more than once?** ADR-0053's
+    `verify_function_identity` proves its premise once, at startup and on `warden
+    check`, not per request. A function created after that moment by a privileged role
+    — one with `CREATEROLE` or superuser, since the Warden role itself no longer has
+    `EXECUTE` on `PUBLIC` by default — falls outside the proof until the process
+    restarts or `check` runs again. Re-checking per request would put catalog I/O and
+    a TOCTOU cache into the request path, the same shape ADR-0053 rejected for
+    per-query name resolution (ADR-0012, ADR-0023). Left as a documented boundary
+    rather than closed; a deployment that rotates privileged roles frequently should
+    restart Warden or re-run `check` after doing so.
+
 ## 3. Future work deliberately outside v0.x
 
 ### Adapters
