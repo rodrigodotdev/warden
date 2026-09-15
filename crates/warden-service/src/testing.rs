@@ -37,8 +37,8 @@ use warden_policy::{
 };
 use warden_ports::{
     AnalyzeError, AuditAttempt, AuditError, AuditEventId, AuditOperation, AuditOutcomeEvent,
-    AuditSink, ConnectionRegistry, ConnectionRuntime, ConnectionRuntimeParts, ExecuteError,
-    ExplainError, Explainer, QueryAnalyzer, QueryExecutor, QueryPermit, SchemaError,
+    AuditRejection, AuditSink, ConnectionRegistry, ConnectionRuntime, ConnectionRuntimeParts,
+    ExecuteError, ExplainError, Explainer, QueryAnalyzer, QueryExecutor, QueryPermit, SchemaError,
     SchemaInspector,
 };
 
@@ -673,12 +673,15 @@ pub(crate) enum FakeAuditEvent {
     Attempt(AuditAttempt),
     /// An outcome write that was issued, including a write that then failed.
     Outcome(AuditOutcomeEvent),
+    /// A rejection write that succeeded.
+    Rejection(AuditRejection),
 }
 
 #[derive(Debug, Default)]
 struct FakeAuditRecords {
     attempts: Vec<AuditAttempt>,
     outcomes: Vec<AuditOutcomeEvent>,
+    rejections: Vec<AuditRejection>,
     history: Vec<FakeAuditEvent>,
 }
 
@@ -725,6 +728,10 @@ impl FakeAuditSink {
     pub(crate) fn outcomes(&self) -> Vec<AuditOutcomeEvent> {
         self.records.lock().unwrap().outcomes.clone()
     }
+    /// Returns recorded rejection events.
+    pub(crate) fn rejections(&self) -> Vec<AuditRejection> {
+        self.records.lock().unwrap().rejections.clone()
+    }
     /// Returns every recorded phase in the order the sink observed it.
     pub(crate) fn history(&self) -> Vec<FakeAuditEvent> {
         self.records.lock().unwrap().history.clone()
@@ -765,6 +772,20 @@ impl AuditSink for FakeAuditSink {
             if self.broken_outcomes {
                 return Err(Self::failure());
             }
+            Ok(())
+        })
+    }
+    fn record_rejection<'a>(
+        &'a self,
+        event: &'a AuditRejection,
+    ) -> warden_ports::BoxFuture<'a, Result<(), AuditError>> {
+        Box::pin(async move {
+            sleep(self.duration).await;
+            let mut records = self.records.lock().unwrap();
+            records.rejections.push(event.clone());
+            records
+                .history
+                .push(FakeAuditEvent::Rejection(event.clone()));
             Ok(())
         })
     }

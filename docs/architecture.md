@@ -231,6 +231,8 @@ pub trait AuditSink: Send + Sync {
         -> BoxFuture<'a, Result<(), AuditError>>;
     fn record_outcome<'a>(&'a self, e: &'a AuditOutcomeEvent)
         -> BoxFuture<'a, Result<(), AuditError>>;
+    fn record_rejection<'a>(&'a self, e: &'a AuditRejection)
+        -> BoxFuture<'a, Result<(), AuditError>>;
 }
 ```
 

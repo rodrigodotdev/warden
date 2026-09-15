@@ -252,7 +252,7 @@ mod tests {
     use tracing::span;
     use tracing::{Event, Metadata, Subscriber};
     use warden_core::dialect::Dialect;
-    use warden_ports::{AuditError, AuditOutcome};
+    use warden_ports::{AuditError, AuditOutcome, AuditRejection};
 
     use super::*;
     use crate::testing;
@@ -386,6 +386,13 @@ mod tests {
         ) -> warden_ports::BoxFuture<'a, Result<(), AuditError>> {
             self.0.lock().unwrap().push(*event);
             Box::pin(std::future::pending())
+        }
+
+        fn record_rejection<'a>(
+            &'a self,
+            _event: &'a AuditRejection,
+        ) -> warden_ports::BoxFuture<'a, Result<(), AuditError>> {
+            Box::pin(async { Ok(()) })
         }
     }
 

@@ -16,8 +16,9 @@ use serde::Serialize;
 use time::OffsetDateTime;
 use warden_core::analysis::StatementKind;
 use warden_core::audit::AuditMode;
+use warden_core::connection::ConnectionName;
 use warden_core::fingerprint::QueryFingerprint;
-use warden_ports::{AuditAttempt, AuditOutcomeEvent};
+use warden_ports::{AuditAttempt, AuditOutcomeEvent, AuditRejection};
 
 /// The versioned name every persisted record carries.
 ///
@@ -57,6 +58,22 @@ pub(crate) const OUTCOME_FIELDS: &[&str] = &[
     "queue_wait_ms",
     "rows",
     "result_bytes",
+    "error_code",
+];
+
+/// Every key a rejection record has, in serialization order.
+#[cfg(test)]
+pub(crate) const REJECTION_FIELDS: &[&str] = &[
+    "schema",
+    "event",
+    "rejection_id",
+    "timestamp",
+    "request_id",
+    "principal_id",
+    "client",
+    "operation",
+    "stage",
+    "connection",
     "error_code",
 ];
 
@@ -192,6 +209,48 @@ impl OutcomeRecord {
     }
 }
 
+/// A rejection, projected to its allowlisted fields.
+///
+/// No dialect, environment, statement kind or fingerprint: none was resolved, and a
+/// record that invented one would be a record of something that did not happen
+/// (ADR-0054). `AuditMode` does not apply — there is no statement to redact.
+#[derive(Debug, Serialize)]
+pub(crate) struct RejectionRecord<'a> {
+    schema: &'static str,
+    event: &'static str,
+    rejection_id: String,
+    #[serde(with = "time::serde::rfc3339")]
+    timestamp: OffsetDateTime,
+    request_id: &'a str,
+    principal_id: &'a str,
+    client: &'a str,
+    operation: &'static str,
+    stage: &'static str,
+    connection: Option<&'a str>,
+    error_code: &'static str,
+}
+
+impl<'a> RejectionRecord<'a> {
+    /// Projects a rejection into its record. Unlike [`AttemptRecord::new`], there is
+    /// no `mode` parameter: `AuditMode` gates what a statement's record reveals, and a
+    /// rejection carries no statement to gate.
+    pub(crate) fn new(event: &'a AuditRejection) -> Self {
+        Self {
+            schema: RECORD_SCHEMA,
+            event: "rejection",
+            rejection_id: event.id.to_string(),
+            timestamp: event.timestamp,
+            request_id: event.request_id.as_str(),
+            principal_id: event.principal.as_str(),
+            client: event.client.as_str(),
+            operation: event.operation.as_str(),
+            stage: event.stage.as_str(),
+            connection: event.connection.as_ref().map(ConnectionName::as_str),
+            error_code: event.error_code.as_str(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -202,10 +261,12 @@ mod tests {
     use warden_core::analysis::StatementKind;
     use warden_core::connection::Environment;
     use warden_core::dialect::Dialect;
+    use warden_core::error::PublicErrorCode;
     use warden_core::fingerprint::QueryFingerprint;
     use warden_policy::{DenyCode, DenyReason};
     use warden_ports::{
         AuditAttempt, AuditEventId, AuditOperation, AuditOutcome, AuditOutcomeEvent,
+        AuditRejection, AuditRejectionStage,
     };
 
     use super::*;
@@ -244,8 +305,41 @@ mod tests {
     }
 
     #[test]
+    fn a_rejection_record_carries_exactly_its_allowlisted_fields_in_order() {
+        let event = rejection();
+        let record = RejectionRecord::new(&event);
+        // Reading the key order back out of the record's own JSON text, not out of a
+        // `serde_json::Value`: see the comment on `RecordKeys` below.
+        let json = serde_json::to_string(&record).unwrap();
+        let RecordKeys(keys) = serde_json::from_str(&json).unwrap();
+        let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+        assert_eq!(keys, REJECTION_FIELDS);
+
+        let value = serde_json::to_value(&record).unwrap();
+        assert_eq!(value["schema"], serde_json::json!(RECORD_SCHEMA));
+        assert_eq!(value["event"], serde_json::json!("rejection"));
+        assert_eq!(value["stage"], serde_json::json!("connection_resolution"));
+        assert_eq!(value["connection"], serde_json::json!("nowhere"));
+        assert_eq!(
+            value["error_code"],
+            serde_json::json!("connection_not_found")
+        );
+        for forbidden in FORBIDDEN_FIELDS {
+            assert!(value.get(forbidden).is_none(), "{forbidden}");
+        }
+    }
+
+    #[test]
+    fn a_rejection_without_a_validated_connection_writes_null_not_a_placeholder() {
+        let mut event = rejection();
+        event.connection = None;
+        let value = serde_json::to_value(RejectionRecord::new(&event)).unwrap();
+        assert_eq!(value["connection"], serde_json::Value::Null);
+    }
+
+    #[test]
     fn no_record_has_a_field_a_statement_or_a_secret_could_occupy() {
-        for fields in [ATTEMPT_FIELDS, OUTCOME_FIELDS] {
+        for fields in [ATTEMPT_FIELDS, OUTCOME_FIELDS, REJECTION_FIELDS] {
             for forbidden in FORBIDDEN_FIELDS {
                 assert!(!fields.contains(forbidden), "{forbidden}");
             }
@@ -321,6 +415,22 @@ mod tests {
             rows_returned: Some(2),
             result_bytes: Some(64),
             error_code: None,
+        }
+    }
+
+    /// One representative rejection: refused resolving a connection name that did not
+    /// match any configured connection.
+    fn rejection() -> AuditRejection {
+        AuditRejection {
+            id: AuditEventId::generate(),
+            timestamp: time::OffsetDateTime::UNIX_EPOCH,
+            request_id: "request-1".parse().unwrap(),
+            principal: "local-stdio".parse().unwrap(),
+            client: "example-client".parse().unwrap(),
+            operation: AuditOperation::Query,
+            stage: AuditRejectionStage::ConnectionResolution,
+            connection: Some("nowhere".parse().unwrap()),
+            error_code: PublicErrorCode::ConnectionNotFound,
         }
     }
 

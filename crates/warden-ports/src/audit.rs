@@ -264,6 +264,69 @@ pub struct AuditOutcomeEvent {
     pub error_code: Option<PublicErrorCode>,
 }
 
+/// Where a database-touching call was refused before any attempt existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AuditRejectionStage {
+    /// The arguments did not deserialize, or a value did not validate.
+    Input,
+    /// The connection name was valid and named no configured connection.
+    ConnectionResolution,
+    /// The connection exists and lacks the capability the tool needs.
+    Capability,
+}
+
+impl AuditRejectionStage {
+    /// The stable name used in audit records and trace fields.
+    ///
+    /// Exhaustive on purpose: a new stage must not compile until it has a documented
+    /// spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Input => "input",
+            Self::ConnectionResolution => "connection_resolution",
+            Self::Capability => "capability",
+        }
+    }
+}
+
+impl fmt::Display for AuditRejectionStage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// A refusal that precedes the attempt, recorded as a terminal event of its own.
+///
+/// Bad arguments, an unknown connection, or a missing capability are refused before
+/// [`AuditAttempt`] can be built at all — there is no statement, no dialect, and no
+/// environment to record. Without a record of its own that call left no trace. This
+/// is not a third phase of ADR-0022's two-phase flow: it is a separate terminal
+/// event for a call that never entered that flow to begin with, and no outcome ever
+/// follows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditRejection {
+    /// This rejection's identifier.
+    pub id: AuditEventId,
+    /// When the rejection was recorded.
+    pub timestamp: OffsetDateTime,
+    /// The request this rejection belongs to.
+    pub request_id: RequestId,
+    /// Who asked.
+    pub principal: PrincipalId,
+    /// Which client they asked through.
+    pub client: ClientName,
+    /// Which tool asked.
+    pub operation: AuditOperation,
+    /// Where the refusal happened.
+    pub stage: AuditRejectionStage,
+    /// The connection named, when the name at least validated. `None` means it did
+    /// not; a valid but unknown name is recorded.
+    pub connection: Option<ConnectionName>,
+    /// The code the agent received.
+    pub error_code: PublicErrorCode,
+}
+
 /// Where audit records go.
 ///
 /// The two methods differ in consequence, not in shape, and the caller enforces the
@@ -287,6 +350,14 @@ pub trait AuditSink: Send + Sync {
         &'a self,
         event: &'a AuditOutcomeEvent,
     ) -> BoxFuture<'a, Result<(), AuditError>>;
+
+    /// Records a refusal that precedes any attempt. It is the only record of that
+    /// call, so a durable sink writes it as it writes an attempt; its failure is an
+    /// alarm, because nothing was going to run either way.
+    fn record_rejection<'a>(
+        &'a self,
+        event: &'a AuditRejection,
+    ) -> BoxFuture<'a, Result<(), AuditError>>;
 }
 
 #[cfg(test)]
@@ -300,6 +371,39 @@ mod tests {
 
     use super::*;
     use crate::testing;
+
+    #[test]
+    fn every_rejection_stage_has_a_distinct_stable_spelling() {
+        let spellings: BTreeSet<&str> = [
+            AuditRejectionStage::Input,
+            AuditRejectionStage::ConnectionResolution,
+            AuditRejectionStage::Capability,
+        ]
+        .into_iter()
+        .map(AuditRejectionStage::as_str)
+        .collect();
+        assert_eq!(
+            spellings,
+            BTreeSet::from(["capability", "connection_resolution", "input"])
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sink_records_a_rejection_behind_a_trait_object() {
+        let sink: Arc<dyn AuditSink> = Arc::new(crate::testing::FakeAuditSink::new());
+        let rejection = AuditRejection {
+            id: AuditEventId::generate(),
+            timestamp: time::OffsetDateTime::now_utc(),
+            request_id: "req-1".parse().unwrap(),
+            principal: "alice@example.com".parse().unwrap(),
+            client: "Claude Code".parse().unwrap(),
+            operation: AuditOperation::Query,
+            stage: AuditRejectionStage::ConnectionResolution,
+            connection: Some("nowhere".parse().unwrap()),
+            error_code: PublicErrorCode::ConnectionNotFound,
+        };
+        sink.record_rejection(&rejection).await.unwrap();
+    }
 
     #[test]
     fn every_outcome_has_a_distinct_stable_spelling() {

@@ -636,6 +636,40 @@ into `warden.audit.v1` JSON Lines; `crates/warden-audit/src/tracing_sink.rs` emi
 Internal denial details are absent from both. Operations section 10.2 enumerates
 the envelope and payload fields, including their different denial-code encoding.
 
+A call refused before any attempt existed — bad arguments, an unknown connection, a
+missing capability — gets a third kind of record instead of none:
+
+```rust
+pub struct AuditRejection {
+    pub id: AuditEventId,
+    pub timestamp: OffsetDateTime,
+    pub request_id: RequestId,
+    pub principal: PrincipalId,
+    pub client: ClientName,
+    pub operation: AuditOperation,
+    pub stage: AuditRejectionStage,
+    pub connection: Option<ConnectionName>,   // null when the name did not validate.
+    pub error_code: PublicErrorCode,
+}
+
+pub enum AuditRejectionStage {
+    Input, ConnectionResolution, Capability,
+}
+```
+
+A rejection is terminal and self-contained: it is the only record a refused call
+leaves behind, no outcome ever follows it, and a call that produced an attempt never
+produces one. It carries no `dialect`, no `environment`, no `statement_kind`, and no
+`fingerprint` — none of the four was resolved before the refusal, and a record that
+invented one would describe execution that never happened (ADR-0054). `AuditMode`
+has no effect on it: there is no statement to redact. `connection` is `null` when the
+name itself did not validate, and the validated-but-unknown name otherwise, so an
+auditor can tell a malformed argument from a name nobody configured. Like
+`AuditAttempt`, it derives no `Serialize`; `crates/warden-audit/src/record.rs`
+projects the same allowlisted fields both sinks write, and a durable sink writes it
+as it writes an attempt, because its failure is an alarm — nothing was going to run
+either way.
+
 ### 11.3 SQL in audits
 
 ```text

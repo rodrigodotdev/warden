@@ -28,9 +28,9 @@ use warden_core::schema::{
 };
 use warden_policy::{AnalyzedQuery, AuthorizedQuery, ObjectFilter};
 use warden_ports::{
-    AnalyzeError, AuditAttempt, AuditError, AuditOutcomeEvent, AuditSink, BoxFuture,
-    ConnectionError, ConnectionRegistry, ConnectionRuntime, ExecuteError, ExplainError, Explainer,
-    QueryAnalyzer, QueryExecutor, QueryPermit, SchemaError, SchemaInspector,
+    AnalyzeError, AuditAttempt, AuditError, AuditOutcomeEvent, AuditRejection, AuditSink,
+    BoxFuture, ConnectionError, ConnectionRegistry, ConnectionRuntime, ExecuteError, ExplainError,
+    Explainer, QueryAnalyzer, QueryExecutor, QueryPermit, SchemaError, SchemaInspector,
 };
 
 /// The complete port inventory. Adding a port means adding it here and to
@@ -47,7 +47,7 @@ const PORTS: &[(&str, &str, &[&str])] = &[
     (
         "audit.rs",
         "AuditSink",
-        &["record_attempt", "record_outcome"],
+        &["record_attempt", "record_outcome", "record_rejection"],
     ),
     ("registry.rs", "ConnectionRegistry", &["get", "list"]),
 ];
@@ -402,6 +402,13 @@ impl AuditSink for Stub {
         _event: &'a AuditOutcomeEvent,
     ) -> BoxFuture<'a, Result<(), AuditError>> {
         Box::pin(async { Err(AuditError::Timeout) })
+    }
+
+    fn record_rejection<'a>(
+        &'a self,
+        _event: &'a AuditRejection,
+    ) -> BoxFuture<'a, Result<(), AuditError>> {
+        Box::pin(async { Ok(()) })
     }
 }
 

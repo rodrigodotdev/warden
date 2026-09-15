@@ -53,7 +53,8 @@ mod testing;
 
 pub use analyzer::QueryAnalyzer;
 pub use audit::{
-    AuditAttempt, AuditEventId, AuditOperation, AuditOutcome, AuditOutcomeEvent, AuditSink,
+    AuditAttempt, AuditEventId, AuditOperation, AuditOutcome, AuditOutcomeEvent, AuditRejection,
+    AuditRejectionStage, AuditSink,
 };
 pub use error::{
     AnalyzeError, AuditError, ConnectionError, ExecuteError, ExplainError, RuntimeError,

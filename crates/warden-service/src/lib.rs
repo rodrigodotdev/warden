@@ -69,7 +69,8 @@ pub use redaction::{REDACTED, RedactionRuleError, RedactionSettings, RedactionSt
 pub use registry::{RegistryError, StaticConnectionRegistry};
 pub use schema::SchemaService;
 pub use warden_ports::{
-    AuditSink, ConnectionRegistry, ConnectionRuntime, ConnectionRuntimeParts, RuntimeError,
+    AuditRejection, AuditSink, ConnectionRegistry, ConnectionRuntime, ConnectionRuntimeParts,
+    RuntimeError,
 };
 
 /// Everything the three services need, assembled by the composition root.

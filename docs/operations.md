@@ -915,15 +915,22 @@ output stays on stderr; stdout carries only MCP messages.
 `dialect`, `environment`, `operation`, `statement_kind`, `fingerprint`, and
 `deny_codes`. Each outcome contains: `schema`, `event`, `attempt_id`, `timestamp`,
 `outcome`, `duration_ms`, `queue_wait_ms`, `rows`, `result_bytes`, and `error_code`.
-`event` is `attempt` or `outcome`; timestamps are RFC 3339, with the attempt's
-creation time and the outcome's serialization time respectively. Missing optional
-values are JSON `null`. `deny_codes` is a JSON array of fixed code strings.
+Each rejection contains: `schema`, `event`, `rejection_id`, `timestamp`,
+`request_id`, `principal_id`, `client`, `operation`, `stage`, `connection`, and
+`error_code`. `event` is `attempt`, `outcome`, or `rejection`; `stage` is `input`,
+`connection_resolution`, or `capability`; `connection` is `null` when the name did
+not validate. A rejection is terminal: no outcome follows it, and a call that
+produced an attempt never produces one. Readers that select on `event` must ignore
+values they do not know. Timestamps are RFC 3339, with the attempt's and
+rejection's creation time and the outcome's serialization time respectively.
+Missing optional values are JSON `null`. `deny_codes` is a JSON array of fixed code
+strings.
 
 `crates/warden-audit/src/tracing_sink.rs` emits the same logical fields except `schema` and
 `timestamp`: the formatter supplies time, level, and the `warden.audit` target,
-plus the fixed message `audit attempt` or `audit outcome`. Tracing omits unset
-optional values and renders `deny_codes` as a comma-joined string. Tests cover
-both sinks' field sets and JSON wire order.
+plus the fixed message `audit attempt`, `audit outcome`, or `audit rejection`.
+Tracing omits unset optional values and renders `deny_codes` as a comma-joined
+string. Tests cover every sink's field set and JSON wire order.
 
 `attempt_id` correlates the phases; `client` is validated printable ASCII;
 `fingerprint` is a versioned digest of the normalized statement, never raw SQL.

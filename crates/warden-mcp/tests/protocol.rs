@@ -41,9 +41,9 @@ use warden_core::schema::{
 use warden_mcp::WardenServer;
 use warden_policy::{AnalyzedQuery, AuthorizedQuery, ObjectFilter, PolicyEngine, PolicySettings};
 use warden_ports::{
-    AnalyzeError, AuditAttempt, AuditError, AuditOutcomeEvent, AuditSink, ConnectionRegistry,
-    ConnectionRuntime, ConnectionRuntimeParts, ExecuteError, ExplainError, Explainer,
-    QueryAnalyzer, QueryExecutor, QueryPermit, SchemaError, SchemaInspector,
+    AnalyzeError, AuditAttempt, AuditError, AuditOutcomeEvent, AuditRejection, AuditSink,
+    ConnectionRegistry, ConnectionRuntime, ConnectionRuntimeParts, ExecuteError, ExplainError,
+    Explainer, QueryAnalyzer, QueryExecutor, QueryPermit, SchemaError, SchemaInspector,
 };
 use warden_service::{RedactionSettings, ServiceParts, Services, StaticConnectionRegistry};
 
@@ -283,6 +283,13 @@ impl AuditSink for NullAuditSink {
     fn record_outcome<'a>(
         &'a self,
         _event: &'a AuditOutcomeEvent,
+    ) -> warden_ports::BoxFuture<'a, Result<(), AuditError>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn record_rejection<'a>(
+        &'a self,
+        _event: &'a AuditRejection,
     ) -> warden_ports::BoxFuture<'a, Result<(), AuditError>> {
         Box::pin(async move { Ok(()) })
     }
