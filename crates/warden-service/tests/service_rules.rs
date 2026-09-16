@@ -507,7 +507,7 @@ impl<'ast> Visit<'ast> for SourceAnalysis {
         if node
             .trait_
             .as_ref()
-            .is_some_and(|(_, path, _)| path_ends_with(path, "PublicError"))
+            .is_some_and(|(path, _)| path_ends_with(path, "PublicError"))
             && type_ends_with(node.self_ty.as_ref(), "ServiceBuildError")
         {
             self.implements_public_error_for_service_build = true;
