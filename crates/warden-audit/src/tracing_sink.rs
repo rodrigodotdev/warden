@@ -21,7 +21,10 @@
 //! it describes but never switch it off).
 
 use warden_core::audit::AuditMode;
-use warden_ports::{AuditAttempt, AuditError, AuditOutcomeEvent, AuditSink, BoxFuture};
+use warden_core::connection::ConnectionName;
+use warden_ports::{
+    AuditAttempt, AuditError, AuditOutcomeEvent, AuditRejection, AuditSink, BoxFuture,
+};
 
 /// Every field [`TracingAuditSink::record_attempt`] emits, in the order it emits
 /// them: `record::ATTEMPT_FIELDS` minus `record::TRACING_OMITS`, which the module's
@@ -53,6 +56,21 @@ const OUTCOME_FIELDS: &[&str] = &[
     "queue_wait_ms",
     "rows",
     "result_bytes",
+    "error_code",
+];
+
+/// Every field [`TracingAuditSink::record_rejection`] emits, in the order it emits
+/// them: `record::REJECTION_FIELDS` minus `record::TRACING_OMITS`.
+#[cfg(test)]
+const REJECTION_FIELDS: &[&str] = &[
+    "event",
+    "rejection_id",
+    "request_id",
+    "principal_id",
+    "client",
+    "operation",
+    "stage",
+    "connection",
     "error_code",
 ];
 
@@ -145,6 +163,28 @@ impl AuditSink for TracingAuditSink {
             Ok(())
         })
     }
+
+    fn record_rejection<'a>(
+        &'a self,
+        event: &'a AuditRejection,
+    ) -> BoxFuture<'a, Result<(), AuditError>> {
+        Box::pin(async move {
+            tracing::info!(
+                target: AUDIT_TARGET,
+                event = "rejection",
+                rejection_id = %event.id,
+                request_id = %event.request_id,
+                principal_id = %event.principal,
+                client = %event.client,
+                operation = event.operation.as_str(),
+                stage = event.stage.as_str(),
+                connection = event.connection.as_ref().map(ConnectionName::as_str),
+                error_code = event.error_code.as_str(),
+                "audit rejection"
+            );
+            Ok(())
+        })
+    }
 }
 
 #[cfg(test)]
@@ -159,7 +199,8 @@ mod tests {
     use tracing::field::{Field, Visit};
     use tracing::span;
     use tracing::{Event, Metadata, Subscriber};
-    use warden_ports::AuditEventId;
+    use warden_core::error::PublicErrorCode;
+    use warden_ports::{AuditEventId, AuditRejectionStage};
 
     use super::super::record;
     use super::*;
@@ -203,6 +244,7 @@ mod tests {
         for forbidden in record::FORBIDDEN_FIELDS {
             assert!(!ATTEMPT_FIELDS.contains(forbidden), "{forbidden}");
             assert!(!OUTCOME_FIELDS.contains(forbidden), "{forbidden}");
+            assert!(!REJECTION_FIELDS.contains(forbidden), "{forbidden}");
         }
     }
 
@@ -214,6 +256,16 @@ mod tests {
             .copied()
             .collect();
         assert_eq!(ATTEMPT_FIELDS, expected.as_slice());
+    }
+
+    #[test]
+    fn the_stderr_sink_emits_the_rejection_format_minus_the_two_keys_it_does_not_repeat() {
+        let expected: Vec<&str> = record::REJECTION_FIELDS
+            .iter()
+            .filter(|field| !record::TRACING_OMITS.contains(field))
+            .copied()
+            .collect();
+        assert_eq!(REJECTION_FIELDS, expected.as_slice());
     }
 
     #[tokio::test]
@@ -247,6 +299,33 @@ mod tests {
                 assert!(!value.contains("app.secrets"), "{name} = {value}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn the_sink_emits_the_declared_rejection_fields() {
+        // The rejection carries its own field list: no `deny_codes`, no statement
+        // fields, and none of `record::TRACING_OMITS` either.
+        install_capture();
+        let id = AuditEventId::generate();
+        let sink = TracingAuditSink::new(AuditMode::Fingerprint);
+        sink.record_rejection(&rejection(id)).await.unwrap();
+        let recorded = events_for_rejection(id);
+
+        assert_eq!(recorded.len(), 1);
+        assert_eq!(recorded[0].target, AUDIT_TARGET);
+        assert_eq!(recorded[0].fields, REJECTION_FIELDS);
+        assert_eq!(
+            recorded[0].values.get("stage").map(String::as_str),
+            Some("connection_resolution")
+        );
+        assert_eq!(
+            recorded[0].values.get("connection").map(String::as_str),
+            Some("nowhere")
+        );
+        assert_eq!(
+            recorded[0].values.get("error_code").map(String::as_str),
+            Some("connection_not_found")
+        );
     }
 
     #[tokio::test]
@@ -296,6 +375,21 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
             .filter(|event| event.values.get("attempt_id") == Some(&wanted))
+            .cloned()
+            .collect()
+    }
+
+    /// The rejection events carrying `id`, in the order they were emitted.
+    ///
+    /// A rejection has no `attempt_id`; it has `rejection_id` instead, so it needs its
+    /// own lookup rather than sharing `events_for`'s filter.
+    fn events_for_rejection(id: AuditEventId) -> Vec<CapturedEvent> {
+        let wanted = id.to_string();
+        CAPTURED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|event| event.values.get("rejection_id") == Some(&wanted))
             .cloned()
             .collect()
     }
@@ -423,6 +517,22 @@ mod tests {
             rows_returned: Some(2),
             result_bytes: Some(64),
             error_code: None,
+        }
+    }
+
+    /// One representative rejection: refused resolving a connection name that did
+    /// not match any configured connection.
+    fn rejection(id: AuditEventId) -> AuditRejection {
+        AuditRejection {
+            id,
+            timestamp: time::OffsetDateTime::UNIX_EPOCH,
+            request_id: "request-1".parse().unwrap(),
+            principal: "local-stdio".parse().unwrap(),
+            client: "example-client".parse().unwrap(),
+            operation: warden_ports::AuditOperation::Query,
+            stage: AuditRejectionStage::ConnectionResolution,
+            connection: Some("nowhere".parse().unwrap()),
+            error_code: PublicErrorCode::ConnectionNotFound,
         }
     }
 }

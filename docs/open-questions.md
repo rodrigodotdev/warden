@@ -216,6 +216,13 @@ otherwise, none blocks M0–M5.
     unbounded wait. Milestone 14, where long-lived HTTP requests make it matter, should
     add the seam rather than the abort.
 
+    Milestone 13.3 closed the half of this question about a queued request outliving
+    shutdown: `ConnectionRuntime::close_gate` stops admitting queued callers at the start
+    of `Deployment::close`, so a request still waiting for a permit fails fast with
+    `connection_unavailable` instead of riding out `max_queue_wait` past the drain
+    deadline (ADR-0055). Propagating a client's own cancellation to a query already
+    running remains open.
+
 24. **Should `InputLimits` be configurable?** `warden-core` calls them configurable and no
     configuration key exposes them. Milestone 12 passes `InputLimits::default()` — the
     64 KiB statement and 100-parameter figures of `docs/data-model.md` section 2 —
@@ -224,22 +231,17 @@ otherwise, none blocks M0–M5.
     when a deployment needs a different one, not before; a limit with a key nobody sets
     is a limit nobody has reviewed.
 
-25. **Should a malformed tool argument reach the agent as a `PublicErrorCode`?** rmcp
-    refuses an argument that fails `serde` deserialization before any Warden code runs,
-    and turns it into an in-band `isError: true` result carrying rmcp's own text: a fixed
-    prefix plus the whole `serde` message, which can name a field from Warden's input
-    schema, a field name the agent invented, or the agent's own submitted value. None of
-    it is new to the agent, and none of it can be database content, a driver message, or
-    a DSN, so `docs/security.md` section 10's prohibitions hold — but it is the one
-    agent-visible failure that is not one of the fourteen public codes, which the global
-    rule otherwise makes universal. Closing it means every tool taking a raw
-    `serde_json::Value` and hand-rolling deserialization so the failure can be mapped, a
-    structural change Milestone 12 declined to make at its end. **Decision: defer this
-    to Milestone 14**, which reworks the tool signatures for HTTP anyway; intercepting
-    rmcp's deserialization refusal means every tool would have to take a raw
-    `serde_json::Value`. Until then,
-    `crates/warden-mcp/tests/protocol.rs` pins the current framing so an SDK change reads
-    as a decision point rather than a mystery failure.
+25. **Resolved in Milestone 13.3 by ADR-0054 — should a malformed tool argument reach
+    the agent as a `PublicErrorCode`?** rmcp refused an argument that failed `serde`
+    deserialization before any Warden code ran, and turned it into an in-band
+    `isError: true` result carrying rmcp's own text: a fixed prefix plus the whole
+    `serde` message, which could name a field from Warden's input schema, a field name
+    the agent invented, or the agent's own submitted value. The four database tools now
+    take their arguments as a raw `JsonObject` with an explicit `input_schema` derived
+    from the same typed DTO, deserialize them in `warden-mcp`'s own `input::parse`, and
+    answer a failure with `invalid_arguments` — one of the fifteen public codes — rather
+    than the SDK's free-text message, recording the refusal as an audit rejection before
+    `Services` ever sees the call.
 
 26. **Should Warden export OpenTelemetry metrics?** `docs/operations.md` section 10.3
     names eleven metrics and defers OpenTelemetry until after the first vertical slice.
@@ -273,6 +275,31 @@ otherwise, none blocks M0–M5.
     place. What was wrong was one line, `initialize` echoing `request.protocol_version`.
     ADR-0051 keeps the list, adds `WARDEN_HANDSHAKE_VERSION`, and answers every handshake
     with `2025-11-25`. rmcp is unpinned again at 3.2.0.
+
+28. **Should startup warn about domains with a `CHECK` and `pg_cast` entries backed by a
+    user function?** Both can run arbitrary code the same way a shadowing built-in
+    does (ADR-0053), but neither is named by the preflight
+    `PostgreSqlConnectionPools::verify_function_identity` adds in Milestone 13.2, which
+    reads `pg_proc` for functions matching the `SAFE` registry's names, not every
+    function the role could reach through a domain constraint or an implicit cast.
+    **Deferred.** Both already require the same `EXECUTE` privilege the role contract
+    now revokes from `PUBLIC` by default (`warden role`, `docs/security.md` §4.2), so
+    the same remediation that closes the shadowing gap closes this one without a
+    second check. A dedicated warning would need to walk `pg_constraint` and `pg_cast`
+    separately and explain a different failure mode than "a function shadows a
+    built-in," for a risk the role contract already mitigates. Revisit if a deployment
+    demonstrates a role that can execute such a function despite the revoke.
+
+29. **Does the startup preflight need to run more than once?** ADR-0053's
+    `verify_function_identity` proves its premise once, at startup and on `warden
+    check`, not per request. A function created after that moment by a privileged role
+    — one with `CREATEROLE` or superuser, since the Warden role itself no longer has
+    `EXECUTE` on `PUBLIC` by default — falls outside the proof until the process
+    restarts or `check` runs again. Re-checking per request would put catalog I/O and
+    a TOCTOU cache into the request path, the same shape ADR-0053 rejected for
+    per-query name resolution (ADR-0012, ADR-0023). Left as a documented boundary
+    rather than closed; a deployment that rotates privileged roles frequently should
+    restart Warden or re-run `check` after doing so.
 
 ## 3. Future work deliberately outside v0.x
 

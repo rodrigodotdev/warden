@@ -65,6 +65,7 @@ mod analyzer;
 mod bind;
 mod catalog;
 mod connection;
+mod decode_budget;
 mod error;
 mod execute;
 mod explain;
@@ -77,6 +78,7 @@ mod parse;
 mod plan;
 mod pool;
 mod query;
+mod scope;
 mod statement;
 mod visit;
 

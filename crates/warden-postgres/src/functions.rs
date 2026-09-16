@@ -14,7 +14,8 @@
 //! family) and a registry too narrow to cover them would deny plain queries.
 //!
 //! Names arrive already folded. `visit::record_function` calls the shared `folded()`
-//! helper — the same one CTE subtraction uses — before consulting this registry: an
+//! helper — the same one CTE resolution in `crate::scope` uses — before consulting
+//! this registry: an
 //! unquoted identifier is lowercased the way PostgreSQL itself folds it, and a quoted
 //! one is compared by its literal, unfolded characters (ASCII-only on purpose: Unicode
 //! folding would make a security comparison depend on locale data). Every entry below
@@ -356,6 +357,12 @@ pub(crate) fn classify(name: &str) -> (FunctionClassification, Option<RiskFlag>)
         FunctionClassification::Unknown,
         Some(RiskFlag::UserDefinedFunction),
     )
+}
+
+/// Every name the registry classifies as `KnownSafe`, for the startup check that
+/// proves no executable user function shadows one of them (ADR-0053).
+pub(crate) fn safe_names() -> &'static [&'static str] {
+    SAFE
 }
 
 #[cfg(test)]

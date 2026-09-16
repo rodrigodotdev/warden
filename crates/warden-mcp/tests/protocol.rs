@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt as _, AsyncWriteExt, BufReader};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use warden_core::analysis::{QueryAnalysis, QueryAnalysisParts, StatementKind};
@@ -41,9 +41,9 @@ use warden_core::schema::{
 use warden_mcp::WardenServer;
 use warden_policy::{AnalyzedQuery, AuthorizedQuery, ObjectFilter, PolicyEngine, PolicySettings};
 use warden_ports::{
-    AnalyzeError, AuditAttempt, AuditError, AuditOutcomeEvent, AuditSink, ConnectionRegistry,
-    ConnectionRuntime, ConnectionRuntimeParts, ExecuteError, ExplainError, Explainer,
-    QueryAnalyzer, QueryExecutor, QueryPermit, SchemaError, SchemaInspector,
+    AnalyzeError, AuditAttempt, AuditError, AuditOutcomeEvent, AuditRejection, AuditSink,
+    ConnectionRegistry, ConnectionRuntime, ConnectionRuntimeParts, ExecuteError, ExplainError,
+    Explainer, QueryAnalyzer, QueryExecutor, QueryPermit, SchemaError, SchemaInspector,
 };
 use warden_service::{RedactionSettings, ServiceParts, Services, StaticConnectionRegistry};
 
@@ -283,6 +283,13 @@ impl AuditSink for NullAuditSink {
     fn record_outcome<'a>(
         &'a self,
         _event: &'a AuditOutcomeEvent,
+    ) -> warden_ports::BoxFuture<'a, Result<(), AuditError>> {
+        Box::pin(async move { Ok(()) })
+    }
+
+    fn record_rejection<'a>(
+        &'a self,
+        _event: &'a AuditRejection,
     ) -> warden_ports::BoxFuture<'a, Result<(), AuditError>> {
         Box::pin(async move { Ok(()) })
     }
@@ -722,35 +729,43 @@ async fn a_denied_statement_is_an_error_result_the_agent_can_read() {
 }
 
 #[tokio::test]
-async fn a_malformed_argument_is_refused_loudly_and_not_a_silent_default() {
-    // Not a top-level JSON-RPC `error`: rmcp 3.1.4's `into_tool_argument_error`
-    // (`handler/server/router/tool.rs`) deliberately downgrades an INVALID_PARAMS
-    // deserialization failure into an in-band `CallToolResult` with `isError: true`
-    // instead of propagating it as a protocol error. Confirmed by reading that
-    // function directly; the brief's own assumption of a protocol-level error does
-    // not hold against the SDK actually vendored here. What this test can still pin
-    // is the invariant the name is really about: a missing required field is refused
-    // loudly, on whichever channel carries the refusal, rather than silently defaulted.
+async fn a_malformed_argument_is_refused_with_invalid_arguments_and_echoes_nothing() {
+    // The value is wrong-typed on purpose and looks like a secret: neither it nor the
+    // deserializer's text may travel back to the agent (ADR-0054).
+    let response = &exchange(&[
+        initialize(LATEST),
+        initialized(),
+        call(
+            "query",
+            json!({ "connection": "production-db", "sql": 42, "parameters": "hunter2" }),
+        ),
+    ])
+    .await[1];
+    assert!(response["error"].is_null(), "{response}");
+    assert_eq!(response["result"]["isError"], json!(true), "{response}");
+    assert_eq!(
+        response["result"]["structuredContent"]["error"]["code"],
+        json!("invalid_arguments"),
+        "{response}"
+    );
+    let rendered = response.to_string();
+    assert!(!rendered.contains("hunter2"), "{rendered}");
+    assert!(!rendered.contains("failed to deserialize"), "{rendered}");
+}
+
+#[tokio::test]
+async fn a_missing_required_field_is_still_refused_and_never_defaulted() {
     let response = &exchange(&[
         initialize(LATEST),
         initialized(),
         call("query", json!({ "connection": "production-db" })),
     ])
     .await[1];
-    assert!(response["error"].is_null(), "{response}");
-    assert_eq!(response["result"]["isError"], json!(true), "{response}");
-    let text = response["result"]["content"][0]["text"].as_str().unwrap();
-    // This pins rmcp's own free-text extractor message ("failed to deserialize
-    // parameters: missing field `sql`"), not a Warden `PublicErrorCode` — Warden does
-    // not intercept a `Parameters<T>` extraction failure before it reaches the agent.
-    // That is a deliberate, documented gap for this milestone (recorded in the task
-    // report): intercepting it would mean every tool taking a raw `Value` and
-    // hand-rolling deserialization, a structural change bigger than anything else M12
-    // takes on. The content is provably limited to Warden's own schema field names,
-    // already public in `tests/snapshots/tools.json`. If a future SDK change makes
-    // this assertion fail, that is a decision point (does the new message still
-    // satisfy "refused loudly, never defaulted"?), not a mystery regression.
-    assert!(text.contains("sql"), "{text}");
+    assert_eq!(
+        response["result"]["structuredContent"]["error"]["code"],
+        json!("invalid_arguments"),
+        "{response}"
+    );
 }
 
 #[tokio::test]
@@ -800,4 +815,108 @@ async fn no_response_ever_carries_a_connection_string() {
     for forbidden in ["://", "password", "dsn", "@localhost"] {
         assert!(!transcript.contains(forbidden), "{forbidden} in transcript");
     }
+}
+
+#[tokio::test]
+async fn an_oversized_parameter_is_refused_as_query_too_large_over_the_wire() {
+    for tool in ["query", "explain"] {
+        let response = &exchange(&[
+            initialize(LATEST),
+            initialized(),
+            call(
+                tool,
+                json!({
+                    "connection": "production-db",
+                    "sql": "SELECT ?",
+                    "parameters": ["a".repeat(64 * 1024 + 1)],
+                }),
+            ),
+        ])
+        .await[1];
+        assert_eq!(
+            response["result"]["isError"],
+            json!(true),
+            "{tool}: {response}"
+        );
+        assert_eq!(
+            response["result"]["structuredContent"]["error"]["code"],
+            json!("query_too_large"),
+            "{tool}: {response}"
+        );
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn a_frame_over_one_mebibyte_ends_the_session_and_runs_no_tool() {
+    let (server_side, client_side) = tokio::io::duplex(1 << 20);
+    let (read_half, mut write_half) = tokio::io::split(client_side);
+    let shutdown = CancellationToken::new();
+    let serving = tokio::spawn(warden_mcp::serve_duplex(
+        WardenServer::new(services()),
+        server_side,
+        shutdown.clone(),
+    ));
+
+    // A real session first, so the budget is proven on an initialized transport.
+    for request in [initialize(LATEST), initialized()] {
+        let mut line = serde_json::to_string(&request).unwrap();
+        line.push('\n');
+        write_half.write_all(line.as_bytes()).await.unwrap();
+    }
+    let mut reader = BufReader::new(read_half);
+    let mut handshake = String::new();
+    reader.read_line(&mut handshake).await.unwrap();
+    assert!(handshake.contains("protocolVersion"), "{handshake}");
+
+    // One byte over the budget and never a newline: the SDK would otherwise buffer
+    // this forever. `write_all` may see the far end close under it; the assertion
+    // that matters is the one on `serving`.
+    let oversized = vec![b'{'; 1024 * 1024 + 1];
+    let _ = write_half.write_all(&oversized).await;
+    let _ = write_half.flush().await;
+
+    let outcome = tokio::time::timeout(Duration::from_secs(30), serving)
+        .await
+        .expect("the session did not end after an oversized frame")
+        .expect("the serving task panicked");
+    assert!(outcome.is_ok(), "{outcome:?}");
+
+    // The server closed its end: the client reads EOF and no tool response.
+    let mut rest = String::new();
+    reader.read_to_string(&mut rest).await.unwrap();
+    assert!(!rest.contains("\"result\""), "{rest}");
+}
+
+#[tokio::test]
+async fn a_large_frame_under_the_budget_is_served_and_the_next_frame_starts_fresh() {
+    let responses = exchange(&[
+        initialize(LATEST),
+        initialized(),
+        call(
+            "query",
+            json!({
+                "connection": "production-db",
+                "sql": "SELECT ?",
+                // 700 KiB: past the parameter budget (Task 1), under the frame budget.
+                "parameters": ["a".repeat(700 * 1024)],
+            }),
+        ),
+        call(
+            "query",
+            json!({ "connection": "production-db", "sql": "SELECT 1" }),
+        ),
+    ])
+    .await;
+    assert_eq!(
+        responses[1]["result"]["structuredContent"]["error"]["code"],
+        json!("query_too_large"),
+        "{}",
+        responses[1]
+    );
+    assert_eq!(
+        responses[2]["result"]["isError"],
+        json!(false),
+        "{}",
+        responses[2]
+    );
 }

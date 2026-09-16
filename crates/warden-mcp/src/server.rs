@@ -6,6 +6,33 @@
 //! `sqlx` type — SPEC section 6, invariants 26 and 27, and the reason `warden-mcp` may
 //! not depend on either adapter.
 //!
+//! # Raw arguments, deserialized here
+//!
+//! The four database tools declare `input_schema = input::schema_for::<T>()` and take a
+//! raw [`rmcp::model::JsonObject`] rather than `Parameters<T>`. Extracting a `JsonObject`
+//! cannot fail, so `rmcp` never classifies a bad argument on Warden's behalf: the
+//! deserialization happens here, where its failure can be audited. Each tool method
+//! delegates to a `*_from_arguments` runner, which calls `input::parse::<T>` and, on
+//! failure, [`WardenServer::reject`]: the call is answered with `invalid_arguments`
+//! (never the `serde` text, which can quote the agent's own submitted value) and
+//! recorded as an audit rejection at `AuditRejectionStage::Input` before `Services` ever
+//! sees the call. The schema an agent reads is unchanged — `input::schema_for` derives
+//! it from the same typed DTO `#[tool]` would have used for `Parameters<T>` — so this is
+//! a change in who classifies a bad argument, not in what the agent is told to send
+//! (ADR-0054).
+//!
+//! # One tool span, whichever way the call leaves
+//!
+//! `docs/operations.md` section 10.1 promises that a refusal the adapter catches —
+//! malformed arguments, a validation failure — records its `audit.rejection` directly
+//! under the tool span `mcp.tool.<name>`, so an operator reading the shipped
+//! `warn,warden=info` filter sees one root per refused call and a failed rejection
+//! write is alarmed with the `request_id` in scope. [`tool_span`] is the one place the
+//! four tool spans are built, and every adapter-caught [`WardenServer::reject`] runs
+//! instrumented with one: the `*_from_arguments` runner opens it for a parse failure,
+//! and the `run_*` runner opens it for everything after — so each call opens exactly
+//! one tool span, and the two runners never nest one inside the other.
+//!
 //! # One task per request
 //!
 //! `docs/architecture.md` section 8 and ADR-0038 both assign this to Milestone 12: a
@@ -21,11 +48,12 @@
 //! answer. It does not read the panic payload: a payload can contain a row value, and
 //! Milestone 13 owns the payload-free hook that records the location instead.
 //!
-//! What the spawn buys is containment, not a complete record of the request that
-//! panicked. ADR-0038's consequences say so directly: it keeps an ordinary request on
-//! the path that writes its outcome *and* contains a panic to the one request that
-//! raised it, but a task that panics still leaves its audit attempt without a terminal
-//! outcome. Closing that last gap is not this milestone's.
+//! What the spawn buys is containment and, since Milestone 13.3, a place in the
+//! services' task tracker, so shutdown waits for it — not a complete record of the
+//! request that panicked. ADR-0038's consequences say so directly: it keeps an
+//! ordinary request on the path that writes its outcome *and* contains a panic to the
+//! one request that raised it, but a task that panics still leaves its audit attempt
+//! without a terminal outcome. Closing that last gap is not this milestone's.
 //!
 //! # Client cancellation is not wired through, deliberately
 //!
@@ -48,20 +76,20 @@ use std::future::Future;
 use std::sync::Arc;
 
 use rmcp::handler::server::router::tool::ToolRouter;
-use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{
     CallToolResult, ErrorData, Implementation, InitializeRequestParams, InitializeResult,
-    ProtocolVersion, ServerCapabilities, ServerInfo,
+    JsonObject, ProtocolVersion, ServerCapabilities, ServerInfo,
 };
 use rmcp::service::RequestContext as McpRequestContext;
 use rmcp::{RoleServer, ServerHandler, tool, tool_router};
 use tracing::Instrument as _;
+use warden_core::connection::ConnectionName;
 use warden_core::context::RequestContext;
 use warden_core::error::{PublicError, PublicErrorCode};
-use warden_service::Services;
+use warden_service::{AuditOperation, AuditRejectionStage, Services};
 
 use crate::error::failure;
-use crate::input::{DescribeInput, ExplainInput, QueryInput, SearchInput};
+use crate::input::{self, DescribeInput, ExplainInput, QueryInput, SearchInput};
 use crate::output::ToolResponse;
 use crate::{identity, output};
 
@@ -144,15 +172,16 @@ impl WardenServer {
             idempotent_hint = true,
             open_world_hint = false
         ),
+        input_schema = input::schema_for::<SearchInput>(),
         output_schema = rmcp::handler::server::tool::schema_for_output::<output::SearchOutput>()
     )]
     async fn search_schema(
         &self,
-        Parameters(input): Parameters<SearchInput>,
+        arguments: JsonObject,
         context: McpRequestContext<RoleServer>,
     ) -> CallToolResult {
         match identity::for_request(&context) {
-            Ok(identity) => self.run_search_schema(identity, input).await,
+            Ok(identity) => self.search_schema_from_arguments(identity, arguments).await,
             Err(code) => failure(code),
         }
     }
@@ -171,15 +200,19 @@ impl WardenServer {
             idempotent_hint = true,
             open_world_hint = false
         ),
+        input_schema = input::schema_for::<DescribeInput>(),
         output_schema = rmcp::handler::server::tool::schema_for_output::<output::DescribeOutput>()
     )]
     async fn describe_schema(
         &self,
-        Parameters(input): Parameters<DescribeInput>,
+        arguments: JsonObject,
         context: McpRequestContext<RoleServer>,
     ) -> CallToolResult {
         match identity::for_request(&context) {
-            Ok(identity) => self.run_describe_schema(identity, input).await,
+            Ok(identity) => {
+                self.describe_schema_from_arguments(identity, arguments)
+                    .await
+            }
             Err(code) => failure(code),
         }
     }
@@ -201,15 +234,16 @@ impl WardenServer {
             idempotent_hint = false,
             open_world_hint = false
         ),
+        input_schema = input::schema_for::<QueryInput>(),
         output_schema = rmcp::handler::server::tool::schema_for_output::<output::QueryOutput>()
     )]
     async fn query(
         &self,
-        Parameters(input): Parameters<QueryInput>,
+        arguments: JsonObject,
         context: McpRequestContext<RoleServer>,
     ) -> CallToolResult {
         match identity::for_request(&context) {
-            Ok(identity) => self.run_query(identity, input).await,
+            Ok(identity) => self.query_from_arguments(identity, arguments).await,
             Err(code) => failure(code),
         }
     }
@@ -227,28 +261,29 @@ impl WardenServer {
             idempotent_hint = true,
             open_world_hint = false
         ),
+        input_schema = input::schema_for::<ExplainInput>(),
         output_schema = rmcp::handler::server::tool::schema_for_output::<output::ExplainOutput>()
     )]
     async fn explain(
         &self,
-        Parameters(input): Parameters<ExplainInput>,
+        arguments: JsonObject,
         context: McpRequestContext<RoleServer>,
     ) -> CallToolResult {
         match identity::for_request(&context) {
-            Ok(identity) => self.run_explain(identity, input).await,
+            Ok(identity) => self.explain_from_arguments(identity, arguments).await,
             Err(code) => failure(code),
         }
     }
 }
 
 impl WardenServer {
-    /// Runs one future in its own task and maps a lost task to `internal_error`.
-    async fn run_in_task<T, F>(future: F) -> Result<T, PublicErrorCode>
+    /// Runs one future in its own tracked task and maps a lost task to `internal_error`.
+    async fn run_in_task<T, F>(&self, future: F) -> Result<T, PublicErrorCode>
     where
         F: Future<Output = T> + Send + 'static,
         T: Send + 'static,
     {
-        match tokio::spawn(future).await {
+        match self.services.tasks().spawn(future).await {
             Ok(value) => Ok(value),
             Err(join) => {
                 // No payload: it can contain a row value, and Milestone 13 owns the
@@ -282,21 +317,125 @@ impl WardenServer {
         output::ConnectionsOutput::from_metadata(&self.services.registry().list()).into_result()
     }
 
+    /// Deserializes `query`'s arguments, auditing a refusal, then runs the statement.
+    async fn query_from_arguments(
+        &self,
+        identity: RequestContext,
+        arguments: JsonObject,
+    ) -> CallToolResult {
+        let connection = input::connection_name(&arguments);
+        match input::parse::<QueryInput>(arguments) {
+            Ok(input) => self.run_query(identity, input).await,
+            Err(code) => {
+                let span = tool_span(AuditOperation::Query, &identity);
+                self.reject(identity, AuditOperation::Query, connection, code)
+                    .instrument(span)
+                    .await
+            }
+        }
+    }
+
+    /// Deserializes `explain`'s arguments, auditing a refusal, then plans the statement.
+    async fn explain_from_arguments(
+        &self,
+        identity: RequestContext,
+        arguments: JsonObject,
+    ) -> CallToolResult {
+        let connection = input::connection_name(&arguments);
+        match input::parse::<ExplainInput>(arguments) {
+            Ok(input) => self.run_explain(identity, input).await,
+            Err(code) => {
+                let span = tool_span(AuditOperation::Explain, &identity);
+                self.reject(identity, AuditOperation::Explain, connection, code)
+                    .instrument(span)
+                    .await
+            }
+        }
+    }
+
+    /// Deserializes `search_schema`'s arguments, auditing a refusal, then searches.
+    async fn search_schema_from_arguments(
+        &self,
+        identity: RequestContext,
+        arguments: JsonObject,
+    ) -> CallToolResult {
+        let connection = input::connection_name(&arguments);
+        match input::parse::<SearchInput>(arguments) {
+            Ok(input) => self.run_search_schema(identity, input).await,
+            Err(code) => {
+                let span = tool_span(AuditOperation::SearchSchema, &identity);
+                self.reject(identity, AuditOperation::SearchSchema, connection, code)
+                    .instrument(span)
+                    .await
+            }
+        }
+    }
+
+    /// Deserializes `describe_schema`'s arguments, auditing a refusal, then describes.
+    async fn describe_schema_from_arguments(
+        &self,
+        identity: RequestContext,
+        arguments: JsonObject,
+    ) -> CallToolResult {
+        let connection = input::connection_name(&arguments);
+        match input::parse::<DescribeInput>(arguments) {
+            Ok(input) => self.run_describe_schema(identity, input).await,
+            Err(code) => {
+                let span = tool_span(AuditOperation::DescribeSchema, &identity);
+                self.reject(identity, AuditOperation::DescribeSchema, connection, code)
+                    .instrument(span)
+                    .await
+            }
+        }
+    }
+
+    /// Records a refusal that happened before the service saw the call, then answers it.
+    ///
+    /// Every pre-resolution refusal in this crate leaves through here, so none can skip
+    /// the audit trail (ADR-0054). The connection is recorded only when it validated.
+    ///
+    /// Callers instrument the returned future with the tool span: `audit.rejection`
+    /// is a `debug` span, so without an `info` tool span above it a refused call would
+    /// leave no trace at the shipped filter, and the alarm for a rejection write that
+    /// failed would carry no `request_id` (`docs/operations.md` section 10.1).
+    async fn reject(
+        &self,
+        identity: RequestContext,
+        operation: AuditOperation,
+        connection: Option<ConnectionName>,
+        code: PublicErrorCode,
+    ) -> CallToolResult {
+        self.services
+            .reject_request(
+                &identity,
+                operation,
+                AuditRejectionStage::Input,
+                connection,
+                code,
+            )
+            .await;
+        failure(code)
+    }
+
     /// Answers `query`: validate the arguments, then run one statement in its own task.
     async fn run_query(&self, identity: RequestContext, input: QueryInput) -> CallToolResult {
-        let span = tracing::info_span!(
-            "mcp.tool.query",
-            request_id = %identity.request_id(),
-        );
+        let span = tool_span(AuditOperation::Query, &identity);
+        let connection = input.connection.parse::<ConnectionName>().ok();
         let request = match span.in_scope(|| input.into_request()) {
             Ok(request) => request,
-            Err(code) => return failure(code),
+            Err(code) => {
+                return self
+                    .reject(identity, AuditOperation::Query, connection, code)
+                    .instrument(span)
+                    .await;
+            }
         };
         let services = Arc::clone(&self.services);
-        let outcome = Self::run_in_task(
-            async move { services.query().execute(&identity, request).await }.instrument(span),
-        )
-        .await;
+        let outcome = self
+            .run_in_task(
+                async move { services.query().execute(&identity, request).await }.instrument(span),
+            )
+            .await;
         match outcome {
             Ok(Ok(result)) => output::QueryOutput::from(&result).into_result(),
             Ok(Err(error)) => failure(error.public_code()),
@@ -306,19 +445,24 @@ impl WardenServer {
 
     /// Answers `explain`: the same validation and containment, without execution.
     async fn run_explain(&self, identity: RequestContext, input: ExplainInput) -> CallToolResult {
-        let span = tracing::info_span!(
-            "mcp.tool.explain",
-            request_id = %identity.request_id(),
-        );
+        let span = tool_span(AuditOperation::Explain, &identity);
+        let connection = input.connection.parse::<ConnectionName>().ok();
         let request = match span.in_scope(|| input.into_request()) {
             Ok(request) => request,
-            Err(code) => return failure(code),
+            Err(code) => {
+                return self
+                    .reject(identity, AuditOperation::Explain, connection, code)
+                    .instrument(span)
+                    .await;
+            }
         };
         let services = Arc::clone(&self.services);
-        let outcome = Self::run_in_task(
-            async move { services.explain().explain(&identity, request).await }.instrument(span),
-        )
-        .await;
+        let outcome = self
+            .run_in_task(
+                async move { services.explain().explain(&identity, request).await }
+                    .instrument(span),
+            )
+            .await;
         match outcome {
             Ok(Ok(plan)) => output::ExplainOutput::from(&plan).into_result(),
             Ok(Err(error)) => failure(error.public_code()),
@@ -332,19 +476,23 @@ impl WardenServer {
         identity: RequestContext,
         input: SearchInput,
     ) -> CallToolResult {
-        let span = tracing::info_span!(
-            "mcp.tool.search_schema",
-            request_id = %identity.request_id(),
-        );
+        let span = tool_span(AuditOperation::SearchSchema, &identity);
+        let connection = input.connection.parse::<ConnectionName>().ok();
         let request = match span.in_scope(|| input.into_request()) {
             Ok(request) => request,
-            Err(code) => return failure(code),
+            Err(code) => {
+                return self
+                    .reject(identity, AuditOperation::SearchSchema, connection, code)
+                    .instrument(span)
+                    .await;
+            }
         };
         let services = Arc::clone(&self.services);
-        let outcome = Self::run_in_task(
-            async move { services.schema().search(&identity, request).await }.instrument(span),
-        )
-        .await;
+        let outcome = self
+            .run_in_task(
+                async move { services.schema().search(&identity, request).await }.instrument(span),
+            )
+            .await;
         match outcome {
             Ok(Ok(found)) => output::SearchOutput::from(&found).into_result(),
             Ok(Err(error)) => failure(error.public_code()),
@@ -358,23 +506,48 @@ impl WardenServer {
         identity: RequestContext,
         input: DescribeInput,
     ) -> CallToolResult {
-        let span = tracing::info_span!(
-            "mcp.tool.describe_schema",
-            request_id = %identity.request_id(),
-        );
+        let span = tool_span(AuditOperation::DescribeSchema, &identity);
+        let connection = input.connection.parse::<ConnectionName>().ok();
         let request = match span.in_scope(|| input.into_request()) {
             Ok(request) => request,
-            Err(code) => return failure(code),
+            Err(code) => {
+                return self
+                    .reject(identity, AuditOperation::DescribeSchema, connection, code)
+                    .instrument(span)
+                    .await;
+            }
         };
         let services = Arc::clone(&self.services);
-        let outcome = Self::run_in_task(
-            async move { services.schema().describe(&identity, request).await }.instrument(span),
-        )
-        .await;
+        let outcome = self
+            .run_in_task(
+                async move { services.schema().describe(&identity, request).await }
+                    .instrument(span),
+            )
+            .await;
         match outcome {
             Ok(Ok(described)) => output::DescribeOutput::from(&described).into_result(),
             Ok(Err(error)) => failure(error.public_code()),
             Err(code) => failure(code),
+        }
+    }
+}
+
+/// The root span of one database tool call, named for the tool that is answering.
+///
+/// The four names are literals in one place so `tests/architecture.rs` can keep them
+/// synchronized with `docs/operations.md` section 10.1, and so the span a refused call
+/// is recorded under is the same span a served call is. The name is chosen by the audit
+/// operation rather than passed alongside it: the two cannot then disagree.
+fn tool_span(operation: AuditOperation, identity: &RequestContext) -> tracing::Span {
+    let request_id = identity.request_id();
+    match operation {
+        AuditOperation::Query => tracing::info_span!("mcp.tool.query", %request_id),
+        AuditOperation::Explain => tracing::info_span!("mcp.tool.explain", %request_id),
+        AuditOperation::SearchSchema => {
+            tracing::info_span!("mcp.tool.search_schema", %request_id)
+        }
+        AuditOperation::DescribeSchema => {
+            tracing::info_span!("mcp.tool.describe_schema", %request_id)
         }
     }
 }
@@ -470,9 +643,11 @@ impl ServerHandler for WardenServer {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::thread::ThreadId;
+    use std::time::Duration;
 
     use tracing::field::{Field, Visit};
     use tracing::instrument::WithSubscriber as _;
@@ -495,14 +670,26 @@ mod tests {
 
     #[derive(Debug)]
     struct CapturedSpan {
+        id: Id,
         name: &'static str,
+        parent: Option<Id>,
         field_names: Vec<String>,
         field_values: BTreeMap<String, String>,
     }
 
+    /// The spans seen so far and, per thread, the ones currently entered.
+    ///
+    /// The stack is what gives a contextually parented span its parent: `tracing`
+    /// leaves that to the subscriber, and the one in `service_rules.rs` does the same.
+    #[derive(Debug, Default)]
+    struct CaptureState {
+        spans: Vec<CapturedSpan>,
+        stacks: HashMap<ThreadId, Vec<Id>>,
+    }
+
     #[derive(Debug, Clone)]
     struct CapturingSubscriber {
-        spans: Arc<Mutex<Vec<CapturedSpan>>>,
+        state: Arc<Mutex<CaptureState>>,
         next_id: Arc<AtomicU64>,
     }
 
@@ -520,11 +707,20 @@ mod tests {
         }
 
         fn new_span(&self, attributes: &span::Attributes<'_>) -> Id {
+            let id = Id::from_u64(self.next_id.fetch_add(1, Ordering::Relaxed));
             let mut visitor = FieldVisitor::default();
             attributes.record(&mut visitor);
             let metadata = attributes.metadata();
-            self.spans.lock().unwrap().push(CapturedSpan {
+            let mut state = self.state.lock().unwrap();
+            let contextual_parent = state
+                .stacks
+                .get(&std::thread::current().id())
+                .and_then(|stack| stack.last())
+                .cloned();
+            state.spans.push(CapturedSpan {
+                id: id.clone(),
                 name: metadata.name(),
+                parent: attributes.parent().cloned().or(contextual_parent),
                 field_names: metadata
                     .fields()
                     .iter()
@@ -532,7 +728,7 @@ mod tests {
                     .collect(),
                 field_values: visitor.values,
             });
-            Id::from_u64(self.next_id.fetch_add(1, Ordering::Relaxed))
+            id
         }
 
         fn record(&self, _span: &Id, _values: &span::Record<'_>) {}
@@ -541,9 +737,25 @@ mod tests {
 
         fn event(&self, _event: &Event<'_>) {}
 
-        fn enter(&self, _span: &Id) {}
+        fn enter(&self, id: &Id) {
+            self.state
+                .lock()
+                .unwrap()
+                .stacks
+                .entry(std::thread::current().id())
+                .or_default()
+                .push(id.clone());
+        }
 
-        fn exit(&self, _span: &Id) {}
+        fn exit(&self, id: &Id) {
+            let mut state = self.state.lock().unwrap();
+            let Some(stack) = state.stacks.get_mut(&std::thread::current().id()) else {
+                return;
+            };
+            if let Some(position) = stack.iter().rposition(|entered| entered == id) {
+                stack.remove(position);
+            }
+        }
     }
 
     #[derive(Debug, Default)]
@@ -565,26 +777,45 @@ mod tests {
 
     #[derive(Debug)]
     struct SpanCapture {
-        spans: Arc<Mutex<Vec<CapturedSpan>>>,
+        state: Arc<Mutex<CaptureState>>,
         dispatch: tracing::Dispatch,
     }
 
     impl SpanCapture {
         fn new() -> Self {
             warden_testing::tracing_interest::ask_every_callsite();
-            let spans = Arc::new(Mutex::new(Vec::new()));
+            let state = Arc::new(Mutex::new(CaptureState::default()));
             let subscriber = CapturingSubscriber {
-                spans: Arc::clone(&spans),
+                state: Arc::clone(&state),
                 next_id: Arc::new(AtomicU64::new(1)),
             };
             Self {
-                spans,
+                state,
                 dispatch: tracing::Dispatch::new(subscriber),
             }
         }
 
         fn dispatch(&self) -> tracing::Dispatch {
             self.dispatch.clone()
+        }
+
+        /// Each span's name paired with its parent's, in creation order.
+        fn tree(&self) -> Vec<(&'static str, Option<&'static str>)> {
+            let state = self.state.lock().unwrap();
+            state
+                .spans
+                .iter()
+                .map(|span| {
+                    let parent = span.parent.as_ref().and_then(|parent| {
+                        state
+                            .spans
+                            .iter()
+                            .find(|candidate| candidate.id == *parent)
+                            .map(|candidate| candidate.name)
+                    });
+                    (span.name, parent)
+                })
+                .collect()
         }
     }
 
@@ -627,12 +858,60 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn a_tool_task_is_tracked_by_the_services_it_runs_against() {
+        let services = testing::services_from(testing::FakeParts {
+            executor: Arc::new(testing::FakeExecutor::taking(Duration::from_secs(10))),
+            ..testing::FakeParts::new()
+        });
+        let server = Arc::new(WardenServer::new(Arc::clone(&services)));
+        let call = tokio::spawn({
+            let server = Arc::clone(&server);
+            async move {
+                server
+                    .run_query(identity(), query_input(testing::CONNECTION, "SELECT 1"))
+                    .await
+            }
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(services.tasks().len(), 1);
+        call.await.unwrap();
+        services.tasks().close();
+        services.tasks().wait().await;
+        assert_eq!(services.tasks().len(), 0);
+    }
+
+    /// Arguments of the right shape whose `sql`, `query`, or `tables` is the wrong type.
+    ///
+    /// Every value is a number so nothing here could be mistaken for a statement, and
+    /// each fails `input::parse` for the DTO named rather than any validation after it.
+    fn wrong_typed(connection: &str) -> JsonObject {
+        serde_json::from_value(serde_json::json!({
+            "connection": connection, "sql": 1, "query": 1, "tables": 1
+        }))
+        .unwrap()
+    }
+
     #[tokio::test]
     async fn invalid_inputs_still_create_their_mcp_root_spans() {
         let capture = SpanCapture::new();
         let server = WardenServer::new(testing::services());
         let results = async {
             [
+                // The parse-failure path: the `*_from_arguments` runner refuses these.
+                server
+                    .query_from_arguments(identity(), wrong_typed("hunter2"))
+                    .await,
+                server
+                    .explain_from_arguments(identity(), wrong_typed("hunter2"))
+                    .await,
+                server
+                    .search_schema_from_arguments(identity(), wrong_typed("hunter2"))
+                    .await,
+                server
+                    .describe_schema_from_arguments(identity(), wrong_typed("hunter2"))
+                    .await,
+                // The validation path: `into_request` refuses these inside `run_*`.
                 server
                     .run_query(identity(), query_input("bad connection", "SELECT hunter2"))
                     .await,
@@ -667,17 +946,29 @@ mod tests {
         .await;
         assert!(results.iter().all(|result| result.is_error == Some(true)));
 
-        let spans = capture.spans.lock().unwrap();
+        // Both paths leave through `reject`, and both run it under the tool span, so
+        // every "audit.rejection" (`warden_service::audit::record_rejection`) has the
+        // tool root as its parent and there is no service root between them —
+        // exactly the tree `docs/operations.md` section 10.1 promises for a refusal
+        // the adapter catches. Recording the parent is what tells a span opened
+        // *around* the rejection apart from one merely opened *before* it.
+        let refused = |tool: &'static str| [(tool, None), ("audit.rejection", Some(tool))];
         assert_eq!(
-            spans.iter().map(|span| span.name).collect::<Vec<_>>(),
+            capture.tree(),
             [
-                "mcp.tool.query",
-                "mcp.tool.explain",
-                "mcp.tool.search_schema",
-                "mcp.tool.describe_schema",
+                refused("mcp.tool.query"),
+                refused("mcp.tool.explain"),
+                refused("mcp.tool.search_schema"),
+                refused("mcp.tool.describe_schema"),
+                refused("mcp.tool.query"),
+                refused("mcp.tool.explain"),
+                refused("mcp.tool.search_schema"),
+                refused("mcp.tool.describe_schema"),
             ]
+            .concat()
         );
-        for span in spans.iter() {
+        let state = capture.state.lock().unwrap();
+        for span in &state.spans {
             for name in &span.field_names {
                 assert!(!FORBIDDEN_SPAN_FIELDS.contains(&name.as_str()), "{name}");
             }
@@ -686,6 +977,85 @@ mod tests {
                 assert!(!value.contains("SELECT"), "{value}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn each_tool_records_a_parse_failure_under_its_own_operation() {
+        // The four `*_from_arguments` runners are written out by hand, and the audit
+        // operation is the only thing that tells their rejections apart: a copied
+        // constant left unchanged would file one tool's refusals under another's.
+        let (services, sink) = testing::services_observed(testing::FakeParts::new());
+        let server = WardenServer::new(services);
+        let results = [
+            server
+                .query_from_arguments(identity(), wrong_typed(testing::CONNECTION))
+                .await,
+            server
+                .explain_from_arguments(identity(), wrong_typed(testing::CONNECTION))
+                .await,
+            server
+                .search_schema_from_arguments(identity(), wrong_typed(testing::CONNECTION))
+                .await,
+            server
+                .describe_schema_from_arguments(identity(), wrong_typed(testing::CONNECTION))
+                .await,
+        ];
+        for result in results {
+            assert_eq!(
+                result.structured_content.unwrap()["error"]["code"],
+                "invalid_arguments"
+            );
+        }
+        let rejections = sink.rejections();
+        assert_eq!(
+            rejections.iter().map(|r| r.operation).collect::<Vec<_>>(),
+            [
+                AuditOperation::Query,
+                AuditOperation::Explain,
+                AuditOperation::SearchSchema,
+                AuditOperation::DescribeSchema,
+            ]
+        );
+        assert!(
+            rejections
+                .iter()
+                .all(|r| r.stage == AuditRejectionStage::Input),
+            "{rejections:?}"
+        );
+        assert!(
+            rejections
+                .iter()
+                .all(|r| r.connection.as_ref().map(|c| c.as_str()) == Some(testing::CONNECTION)),
+            "{rejections:?}"
+        );
+        assert!(sink.attempts().is_empty());
+        assert!(sink.outcomes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_unknown_connection_on_explain_is_rejected_as_an_explain() {
+        // The service's `preflight` takes the operation from its caller; this is the
+        // one place the `explain` service's choice reaches an audit rejection.
+        let (services, sink) = testing::services_observed(testing::FakeParts::new());
+        let server = WardenServer::new(services);
+        let result = server
+            .run_explain(identity(), explain_input("nowhere", "SELECT 1"))
+            .await;
+        assert_eq!(
+            result.structured_content.unwrap()["error"]["code"],
+            "connection_not_found"
+        );
+        let rejections = sink.rejections();
+        assert_eq!(rejections.len(), 1, "{rejections:?}");
+        assert_eq!(rejections[0].operation, AuditOperation::Explain);
+        assert_eq!(
+            rejections[0].stage,
+            AuditRejectionStage::ConnectionResolution
+        );
+        assert_eq!(
+            rejections[0].connection.as_ref().map(|c| c.as_str()),
+            Some("nowhere")
+        );
     }
 
     #[tokio::test]
@@ -714,6 +1084,30 @@ mod tests {
             .await;
         assert_eq!(result.is_error, Some(false));
         assert!(result.structured_content.unwrap()["rows"].is_array());
+    }
+
+    #[tokio::test]
+    async fn an_oversized_parameter_never_reaches_the_executor() {
+        use warden_ports::QueryExecutor;
+        let executor = Arc::new(testing::FakeExecutor::new());
+        let services = testing::services_from(testing::FakeParts {
+            executor: Arc::clone(&executor) as Arc<dyn QueryExecutor>,
+            ..testing::FakeParts::new()
+        });
+        let server = WardenServer::new(services);
+        let input: QueryInput = serde_json::from_value(serde_json::json!({
+            "connection": testing::CONNECTION,
+            "sql": "SELECT ?",
+            "parameters": ["a".repeat(64 * 1024 + 1)],
+        }))
+        .unwrap();
+        let result = server.run_query(identity(), input).await;
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            result.structured_content.unwrap()["error"]["code"],
+            serde_json::json!("query_too_large")
+        );
+        assert_eq!(executor.calls(), 0);
     }
 
     #[tokio::test]
@@ -895,6 +1289,98 @@ mod tests {
             info.instructions
                 .is_some_and(|text| text.contains("list_connections"))
         );
+    }
+
+    #[tokio::test]
+    async fn every_pre_resolution_refusal_is_one_rejection_and_nothing_else() {
+        let (services, sink) = testing::services_observed(testing::FakeParts::new());
+        let server = WardenServer::new(services);
+
+        // 1. Wrong type: an input rejection with no validated connection.
+        let arguments: JsonObject = serde_json::from_value(serde_json::json!({
+            "connection": "bad connection", "sql": 1
+        }))
+        .unwrap();
+        let result = server.query_from_arguments(identity(), arguments).await;
+        assert_eq!(
+            result.structured_content.unwrap()["error"]["code"],
+            "invalid_arguments"
+        );
+
+        // 2. Valid shape, invalid connection name: input stage, connection absent.
+        let result = server
+            .run_query(identity(), query_input("bad connection", "SELECT 1"))
+            .await;
+        assert_eq!(
+            result.structured_content.unwrap()["error"]["code"],
+            "connection_not_found"
+        );
+
+        // 3. Valid name, no such connection: the service records it (resolution stage).
+        let result = server
+            .run_query(identity(), query_input("nowhere", "SELECT 1"))
+            .await;
+        assert_eq!(
+            result.structured_content.unwrap()["error"]["code"],
+            "connection_not_found"
+        );
+
+        // 4. Oversized parameter: input stage, connection present.
+        let input: QueryInput = serde_json::from_value(serde_json::json!({
+            "connection": testing::CONNECTION, "sql": "SELECT ?",
+            "parameters": ["a".repeat(64 * 1024 + 1)],
+        }))
+        .unwrap();
+        let result = server.run_query(identity(), input).await;
+        assert_eq!(
+            result.structured_content.unwrap()["error"]["code"],
+            "query_too_large"
+        );
+
+        let rejections = sink.rejections();
+        assert_eq!(rejections.len(), 4, "{rejections:?}");
+        assert!(sink.attempts().is_empty());
+        assert!(sink.outcomes().is_empty());
+        let stages: Vec<_> = rejections.iter().map(|r| r.stage).collect();
+        assert_eq!(
+            stages,
+            [
+                AuditRejectionStage::Input,
+                AuditRejectionStage::Input,
+                AuditRejectionStage::ConnectionResolution,
+                AuditRejectionStage::Input,
+            ]
+        );
+        assert!(rejections[0].connection.is_none());
+        assert!(rejections[1].connection.is_none());
+        assert_eq!(
+            rejections[2].connection.as_ref().map(|c| c.as_str()),
+            Some("nowhere")
+        );
+        assert_eq!(
+            rejections[3].connection.as_ref().map(|c| c.as_str()),
+            Some(testing::CONNECTION)
+        );
+        assert!(
+            rejections
+                .iter()
+                .all(|r| r.operation == AuditOperation::Query)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_executed_and_a_denied_call_record_no_rejection() {
+        let (services, sink) = testing::services_observed(testing::FakeParts::writing());
+        let server = WardenServer::new(services);
+        let _ = server
+            .run_query(
+                identity(),
+                query_input(testing::CONNECTION, "DELETE FROM t"),
+            )
+            .await;
+        assert_eq!(sink.attempts().len(), 1);
+        assert_eq!(sink.outcomes().len(), 1);
+        assert!(sink.rejections().is_empty());
     }
 
     #[test]

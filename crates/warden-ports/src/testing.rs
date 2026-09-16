@@ -14,7 +14,7 @@
 // editing happens not to use is not dead code.
 #![allow(dead_code)]
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use time::OffsetDateTime;
@@ -41,7 +41,9 @@ use warden_policy::{
 
 use crate::BoxFuture;
 use crate::analyzer::QueryAnalyzer;
-use crate::audit::{AuditAttempt, AuditEventId, AuditOperation, AuditOutcomeEvent, AuditSink};
+use crate::audit::{
+    AuditAttempt, AuditEventId, AuditOperation, AuditOutcomeEvent, AuditRejection, AuditSink,
+};
 use crate::error::{
     AnalyzeError, AuditError, ConnectionError, ExecuteError, ExplainError, RuntimeError,
     SchemaError,
@@ -415,12 +417,26 @@ pub(crate) fn attempt(deny_reasons: Vec<DenyReason>) -> AuditAttempt {
 #[derive(Debug, Default)]
 pub(crate) struct FakeAuditSink {
     broken: bool,
+    rejections: Mutex<Vec<AuditRejection>>,
 }
 
 impl FakeAuditSink {
+    /// A sink that accepts everything.
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
     /// A sink that cannot accept a record, so the caller must fail closed.
     pub(crate) fn broken() -> Self {
-        Self { broken: true }
+        Self {
+            broken: true,
+            ..Self::default()
+        }
+    }
+
+    /// The rejections this sink recorded.
+    pub(crate) fn rejections(&self) -> Vec<AuditRejection> {
+        self.rejections.lock().unwrap().clone()
     }
 
     fn result(&self) -> Result<(), AuditError> {
@@ -446,6 +462,16 @@ impl AuditSink for FakeAuditSink {
         _event: &'a AuditOutcomeEvent,
     ) -> BoxFuture<'a, Result<(), AuditError>> {
         Box::pin(async move { self.result() })
+    }
+
+    fn record_rejection<'a>(
+        &'a self,
+        event: &'a AuditRejection,
+    ) -> BoxFuture<'a, Result<(), AuditError>> {
+        Box::pin(async move {
+            self.rejections.lock().unwrap().push(event.clone());
+            self.result()
+        })
     }
 }
 

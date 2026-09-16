@@ -21,13 +21,14 @@
 //! ```text
 //! in :  JSON arguments ─▶ input.rs ─▶ warden-core request types (already size-validated)
 //! out:  service result  ─▶ output.rs ─▶ structured_content + a summary line
-//! err:  typed error     ─▶ PublicErrorCode ─▶ error.rs ─▶ one of fourteen fixed codes
+//! err:  typed error     ─▶ PublicErrorCode ─▶ error.rs ─▶ one of fifteen fixed codes
 //! ```
 //!
 //! Nothing else. A raw `sqlx` message, a DSN, a hostname, or a SQL fragment reaching a
 //! model would violate `docs/security.md` section 10, so `error` is the only module that
 //! builds a failed [`rmcp::model::CallToolResult`] and it takes a code, not a message.
 
+mod bounded_read;
 mod error;
 mod identity;
 mod input;

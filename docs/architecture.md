@@ -231,6 +231,8 @@ pub trait AuditSink: Send + Sync {
         -> BoxFuture<'a, Result<(), AuditError>>;
     fn record_outcome<'a>(&'a self, e: &'a AuditOutcomeEvent)
         -> BoxFuture<'a, Result<(), AuditError>>;
+    fn record_rejection<'a>(&'a self, e: &'a AuditRejection)
+        -> BoxFuture<'a, Result<(), AuditError>>;
 }
 ```
 
@@ -278,6 +280,7 @@ impl ConnectionRuntime {
     pub fn explainer(&self) -> &dyn Explainer;
     pub async fn acquire_query_permit(&self) -> Result<QueryPermit, ConnectionError>;
     pub fn available_permits(&self) -> usize;
+    pub fn close_gate(&self);
 }
 
 pub trait ConnectionRegistry: Send + Sync {
@@ -461,5 +464,12 @@ Use one root Tokio cancellation token.
 
 ## 13. Graceful shutdown
 
-Stop accepting requests; signal cancellation to in-flight operations; bound the wait;
-close pools; and drain audit and telemetry where practical. Never wait indefinitely.
+The sequence, in order: the SDK drains its own handler tasks first (up to 5 s after EOF,
+2 s after cancellation); then `Deployment::close` runs, under one 30-second deadline —
+cancel the root token every service child descends from; close every connection's query
+gate, so a queued request fails fast instead of waiting out the deadline; wait for every
+tracked task in `Services`' `TaskTracker` (tool calls and detached audit writes) until
+that same deadline; then close the pools with whatever time is left, each additionally
+bounded by its own cleanup budget. `Deployment::close` returns a `DrainReport`. Nothing
+is aborted, and nothing is claimed finished that was not: an incomplete report logs an
+alarm and `serve` exits non-zero (ADR-0055).

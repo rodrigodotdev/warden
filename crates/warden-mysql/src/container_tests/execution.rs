@@ -499,6 +499,75 @@ async fn the_analyzed_statement_is_the_executed_one() {
 }
 
 #[tokio::test]
+async fn a_cte_sharing_the_real_tables_name_still_reads_the_real_table() {
+    // Milestone 13.2: `scope.rs` resolves CTE names the way the server does. A
+    // non-`RECURSIVE` body cannot see its own alias, so the inner `orders` here is
+    // the real base table, both in the server's own resolution and in the
+    // analyzer's. This proves it against a real server, not only against the
+    // corpus's synthetic expectations.
+    let container = start_mysql().await;
+    let pools = Arc::new(
+        MySqlConnectionPools::connect(config(dsn(&container).await, tls()))
+            .await
+            .unwrap(),
+    );
+    sqlx::query(AssertSqlSafe(
+        "CREATE TABLE orders (id BIGINT PRIMARY KEY)".to_owned(),
+    ))
+    .execute(pools.control())
+    .await
+    .unwrap();
+    for id in 1..=3i64 {
+        sqlx::query(AssertSqlSafe(format!("INSERT INTO orders VALUES ({id})")))
+            .execute(pools.control())
+            .await
+            .unwrap();
+    }
+
+    let executor = Arc::new(MySqlQueryExecutor::new(Arc::clone(&pools)));
+    let runtime = runtime(Arc::clone(&executor), ExecutionLimits::default());
+    let permit = runtime.acquire_query_permit().await.unwrap();
+
+    let sql = "WITH orders AS (SELECT * FROM orders) SELECT COUNT(*) AS n FROM orders";
+    let request = QueryRequest::new(
+        "production-db".parse().unwrap(),
+        sql.to_owned(),
+        Vec::new(),
+        &InputLimits::default(),
+    )
+    .unwrap();
+    let analyzed = MySqlAnalyzer::new().analyze(request).unwrap();
+    let objects: Vec<String> = analyzed
+        .analysis()
+        .objects()
+        .iter()
+        .map(|object| object.qualified_name())
+        .collect();
+    assert_eq!(objects, ["orders"]);
+
+    let query = engine()
+        .authorize(
+            &context(),
+            &metadata(),
+            analyzed,
+            ExecutionLimits::default(),
+        )
+        .unwrap();
+
+    let result = run(&executor, &permit, &query).await.unwrap();
+
+    let direct: i64 = sqlx::query("SELECT COUNT(*) FROM orders")
+        .fetch_one(pools.control())
+        .await
+        .unwrap()
+        .try_get(0)
+        .unwrap();
+
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0][0], ResultValue::I64(direct));
+}
+
+#[tokio::test]
 async fn null_survives_whatever_the_columns_type_is() {
     let container = start_mysql().await;
     let pools = Arc::new(

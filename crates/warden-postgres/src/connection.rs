@@ -12,6 +12,7 @@ use warden_core::secret::Dsn;
 use warden_core::tls::TlsSettings;
 
 use crate::error::ConnectError;
+use crate::functions;
 use crate::options::{self, PoolRole};
 use crate::pool;
 use crate::query::agent_query;
@@ -151,6 +152,39 @@ pub struct PostgreSqlConnectionConfig {
     /// The schemas unqualified names resolve against.
     pub search_path: SearchPath,
 }
+
+/// Functions the role can execute, in schemas on the effective `search_path`, whose
+/// name is one the built-in registry would classify as safe.
+///
+/// `current_schemas(false)` is the session's effective path without the implicit
+/// system schemas, and both pools connect with the same pinned `search_path` and the
+/// same role, so the control pool's answer is the agent pool's. The two-argument
+/// `has_function_privilege` evaluates for `current_user`: the Warden role itself.
+///
+/// Excludes functions owned by an extension (`pg_depend.deptype = 'e'`): those are
+/// installed by a superuser through the trusted-extension mechanism, not planted by
+/// the adversary this preflight targets, and `CREATE EXTENSION citext` (or `orafce`,
+/// or pre-13 `pgcrypto`) legitimately overloads names such as `replace`, `strpos` and
+/// `min`/`max` that the built-in registry classifies as safe. All comparison
+/// operators are schema-qualified so a same-named operator on the search path cannot
+/// change this query's meaning.
+const SHADOWED_BUILTINS_SQL: &str = "\
+    SELECT n.nspname AS schema, \
+           p.proname AS name, \
+           pg_catalog.pg_get_function_identity_arguments(p.oid) AS arguments \
+    FROM pg_catalog.pg_proc p \
+    JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace \
+    WHERE n.nspname OPERATOR(pg_catalog.<>) 'pg_catalog' \
+      AND n.nspname OPERATOR(pg_catalog.=) ANY(pg_catalog.current_schemas(false)) \
+      AND p.proname OPERATOR(pg_catalog.=) ANY($1) \
+      AND pg_catalog.has_function_privilege(p.oid, 'EXECUTE') \
+      AND NOT EXISTS ( \
+        SELECT 1 FROM pg_catalog.pg_depend d \
+        WHERE d.classid OPERATOR(pg_catalog.=) 'pg_catalog.pg_proc'::pg_catalog.regclass \
+          AND d.objid OPERATOR(pg_catalog.=) p.oid \
+          AND d.deptype OPERATOR(pg_catalog.=) 'e' \
+      ) \
+    ORDER BY 1, 2, 3";
 
 /// One PostgreSQL connection's two pools (ADR-0025).
 #[derive(Debug)]
@@ -293,6 +327,54 @@ impl PostgreSqlConnectionPools {
             }
         }
         Ok(())
+    }
+
+    /// Refuses a session in which an unqualified call to a trusted built-in could run
+    /// a user function instead.
+    ///
+    /// ADR-0029 trusts an unqualified call by its bare name. PostgreSQL resolves that
+    /// name across every schema on the `search_path`, and a user function of the same
+    /// name and a *different* signature competes with the built-in on equal terms —
+    /// so `lower(1)` runs `app.lower(integer)` if the role may execute it. That is the
+    /// one case in which the analyzer's `KnownSafe` would be a false statement, and it
+    /// is decidable once, here, rather than per query (ADR-0053).
+    ///
+    /// Runs on `control_pool` at startup and from `warden check`. It is not repeated per
+    /// request: a function created later by a privileged role is that role's action.
+    ///
+    /// # Errors
+    ///
+    /// [`ConnectError::ShadowedBuiltins`] naming every such function; otherwise
+    /// [`ConnectError::Timeout`] or [`ConnectError::Driver`] as for
+    /// [`PostgreSqlConnectionPools::health_check`].
+    pub async fn verify_function_identity(&self, deadline: Instant) -> Result<(), ConnectError> {
+        let names: Vec<String> = functions::safe_names()
+            .iter()
+            .map(|name| (*name).to_owned())
+            .collect();
+        let read = agent_query(SHADOWED_BUILTINS_SQL)
+            .bind(names)
+            .fetch_all(self.control());
+        let rows = match timeout_at(deadline, read).await {
+            Ok(Ok(rows)) => rows,
+            Ok(Err(error)) => return Err(ConnectError::driver(&error)),
+            Err(_elapsed) => return Err(ConnectError::Timeout),
+        };
+        let mut functions = Vec::with_capacity(rows.len());
+        for row in &rows {
+            let schema: String =
+                sqlx::Row::try_get(row, "schema").map_err(|error| ConnectError::driver(&error))?;
+            let name: String =
+                sqlx::Row::try_get(row, "name").map_err(|error| ConnectError::driver(&error))?;
+            let arguments: String = sqlx::Row::try_get(row, "arguments")
+                .map_err(|error| ConnectError::driver(&error))?;
+            functions.push(format!("{schema}.{name}({arguments})"));
+        }
+        if functions.is_empty() {
+            Ok(())
+        } else {
+            Err(ConnectError::ShadowedBuiltins { functions })
+        }
     }
 
     /// Closes both pools, waiting for in-flight connections to return.

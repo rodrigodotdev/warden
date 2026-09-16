@@ -239,6 +239,155 @@ work); and client cancellation reaching a running query (open question 23, also 
 
 ---
 
+## M13.1 — Resource bounds
+
+**Three inputs Warden accepted without a size check of their own now have one.**
+`InputLimits` gained `max_parameter_bytes` (64 KiB) and `max_total_parameter_bytes`
+(256 KiB), measured by `ParameterValue::input_bytes` — UTF-8 bytes for text, eight
+per number, one per boolean, zero per null — and enforced in `QueryRequest::new`
+before a query reaches analysis; an oversized parameter is refused as
+`query_too_large`. The stdio transport wraps its read half in `BoundedRead`
+(`crates/warden-mcp/src/bounded_read.rs`), which counts bytes since the last
+newline and fails a frame over 1 MiB with `io::ErrorKind::InvalidData` ahead of
+rmcp's own reader; the session ends without a JSON-RPC error and without a byte of
+the oversized frame ever being logged. PostgreSQL's `json`, `jsonb`, and array
+values are measured on the wire before SQLx decodes them: the raw size must fit
+`min(max_value_bytes × factor + 64, 16 MiB)`, factor 2 for JSON and 16 for arrays,
+or the value is refused as `ResultBuildError::ValueTooLarge` carrying the raw
+budget as `limit`, before the decode allocates anything. All three budgets are
+constants with no configuration key (ADR-0026), and the `ResultBuilder` remains
+the sole authority on normalized bytes. See ADR-0052.
+
+Deliberately left: none of these budgets claims an absolute memory ceiling. The
+driver still materializes a full row before Warden's own checks run, and the
+frame budget resets at every newline, so it bounds one frame, not a session.
+
+---
+
+## M13.2 — SQL analysis precision
+
+**Two gaps between what the analyzer proves and what the server actually runs are
+closed.** PostgreSQL resolves an unqualified call across every schema on the
+`search_path` and picks an exact match regardless of path position, so a function the
+Warden role can execute — which PostgreSQL grants to `PUBLIC` by default — can shadow
+a built-in the analyzer trusts by name alone (ADR-0029). `PostgreSqlConnectionPools::
+verify_function_identity` closes it by proving the premise once, at startup, on the
+control pool: it reads `pg_proc` for functions the role can execute, in schemas on the
+effective `search_path`, whose name is in the `SAFE` registry, and fails the connection
+with every offending `schema.name(arguments)` and its remediation when a row exists.
+`warden check` runs the same preflight and fails the same way; there is no
+configuration key to skip it. See ADR-0053, `docs/security.md` §4.2 and §7.3, and
+`docs/operations.md`. The container test
+`an_unqualified_call_resolves_to_the_shadowing_function_and_startup_refuses_it`
+(`crates/warden-postgres/src/container_tests/identity.rs`) measures the resolution
+rule directly, and `a_shadowing_function_outside_the_search_path_is_not_reachable_and_
+not_reported` confirms the preflight names only what a query could actually reach. The
+end-to-end test `a_shadowing_function_fails_serve_and_check_until_execute_is_revoked`
+(`tests/mcp_database.rs`) drives both `serve` and `check` against a real shadowing
+function and confirms both refuse until `EXECUTE` is revoked. `warden role`'s
+PostgreSQL script now revokes the default `EXECUTE` grant from `PUBLIC` for the schema
+and for future functions (`ALTER DEFAULT PRIVILEGES`), which is also what stops a
+domain `CHECK` or a user-defined cast from running code — the reason no static cast
+allowlist was added instead (`crates/warden-postgres/src/visit.rs`,
+`docs/security.md` §5 item 7).
+
+The second gap was CTE scope. Both dialect analyzers previously subtracted every CTE
+name declared anywhere in a statement from `deny_tables`/`allow_tables` evidence,
+global to the whole walk rather than scoped to where each name is actually visible —
+so a CTE named after a denied table, or an alias declared inside an unrelated
+subquery, could hide a real table reference from the policy engine. `scope.rs`
+(`crates/warden-postgres/src/scope.rs`, `crates/warden-mysql/src/scope.rs`) tracks a
+stack of per-query scopes during the single visitor walk instead, resolving each
+unqualified name against only the CTEs actually visible at that point in the
+document, the way each server resolves it. The two dialects differ on `RECURSIVE`:
+PostgreSQL makes every alias of a `WITH` visible to every body in it, while MySQL
+8.4 limits a body to itself and the siblings declared before it, never one declared
+after. The corpus case set `CTE_SCOPES` and the regression case
+`a_cte_named_after_a_denied_table_no_longer_hides_it` exist in both adapters'
+`tests/corpus.rs`, and the container tests
+`a_cte_sharing_the_real_tables_name_still_reads_the_real_table` (in
+`crates/warden-postgres/src/container_tests/execution.rs` and
+`crates/warden-mysql/src/container_tests/execution.rs`) confirm the real servers
+resolve a CTE named after a real table the same way the corpus predicts.
+
+Deliberately left: operator precedence and implicit casts that change a value's
+apparent type, views, and row-level security remain outside static analysis — they
+are the database role's job (`GRANT`, `REVOKE`, `CREATE POLICY`), not the analyzer's,
+and Warden's read-scope boundary has always been the role plus the allowlist, not
+static inference over arbitrary SQL (`docs/security.md` §5). The startup preflight is
+not repeated per request: a function created after startup by a privileged role is
+outside its proof, which ADR-0053 documents rather than closes.
+
+**Fix wave:** the preflight now excludes extension-owned functions (`citext`,
+`orafce`, pre-13 `pgcrypto`, …), since those are installed by a superuser through the
+trusted-extension mechanism rather than planted by the adversary it targets.
+
+---
+
+## M13.3 — Audit rejections and drained shutdown
+
+**A call refused before any attempt exists now leaves an audit trace, and shutdown
+waits for admitted work instead of racing it.** `AuditRejection`/`AuditRejectionStage`
+join `warden-ports`'s audit port as a third terminal record kind alongside the
+two-phase attempt/outcome pair (ADR-0022): readers must now accept a third `event`
+value, `rejection`, in the same `warden.audit.v1` schema, and both sinks project it —
+the JSONL file sink durably, the tracing sink as a fixed `"audit rejection"` message,
+inside a new `audit.rejection` debug span documented in `docs/operations.md` §10.1.
+`Services::reject_request` and `ServiceCore::reject` give `warden-service` its one
+entry point: connection resolution (`ServiceCore::preflight`, `SchemaService::search`/
+`::describe`) and a missing `schema_search` capability now record exactly one
+rejection and build no fabricated attempt. The MCP adapter closes the last gap
+(ADR-0054, resolves open question 25): the four database tools take a raw
+`JsonObject` with an explicit `input_schema` derived from the same typed DTO,
+deserialize it themselves through `input::parse` — which discards the SDK's own
+deserialization text — and answer a failure with a new public code,
+`invalid_arguments`, recording the refusal at `AuditRejectionStage::Input` before
+`Services` ever sees the call. The tool schema an agent reads is unchanged
+(`crates/warden-mcp/tests/snapshots/tools.json` is unmodified by this milestone).
+
+Shutdown changed to match: `Services` owns a `tokio_util::task::TaskTracker`, every
+tool call is spawned on it, and the outcome guard's previously-detached `abandoned`
+write now spawns on the same tracker via `spawn_on`, which still accepts work after
+`close()`, so a request dropped mid-drain still leaves its record.
+`ConnectionRuntime::close_gate` closes the query semaphore so a queued caller wakes
+at once as `Unavailable` instead of waiting out `max_queue_wait`.
+`Services::drain(deadline)` closes every connection's gate, closes the tracker, and
+waits under the deadline without aborting anything, returning a `DrainReport` that
+says whether every task ended and how many were still running if not. The
+composition root wires this in (ADR-0055): `Deployment::close` cancels the root
+shutdown token, drains `Services` under one 30-second `DRAIN_DEADLINE`, then closes
+pools with whatever time is left, so the number of connections can no longer
+multiply the shutdown wait. An incomplete drain logs an alarm naming the pending
+count, and `run_serve` now exits non-zero when that happens instead of reporting
+success over an incomplete audit trail; `warden check` discards its report since it
+admits no request.
+
+Measured by `warden-ports`'s `runtime::tests::closing_the_gate_wakes_a_queued_caller_as_unavailable`;
+`warden-service`'s `query::tests::{an_unknown_connection_records_one_rejection_and_no_attempt,
+a_denied_statement_records_attempt_and_outcome_and_no_rejection,
+a_slow_rejection_write_keeps_the_original_error_and_alarms,
+a_dropped_request_completes_its_audit_record_too}`,
+`schema::tests::a_connection_without_schema_search_records_a_capability_rejection`, and
+`lib.rs::drain_tests::{drain_reports_incomplete_when_admitted_work_outlives_the_deadline,
+drain_completes_once_every_tracked_task_has_ended,
+drain_closes_every_gate_so_queued_requests_stop_waiting}`; `warden-mcp`'s
+`input::tests::the_raw_argument_schema_is_the_derived_one_for_every_tool`,
+`server::tests::{every_pre_resolution_refusal_is_one_rejection_and_nothing_else,
+an_executed_and_a_denied_call_record_no_rejection,
+a_tool_task_is_tracked_by_the_services_it_runs_against}`, and
+`tests/protocol.rs`'s `{a_malformed_argument_is_refused_with_invalid_arguments_and_echoes_nothing,
+a_missing_required_field_is_still_refused_and_never_defaulted}`; and the end-to-end
+`tests/mcp_database.rs::stdout_carries_protocol_only_and_the_process_exits_on_eof`,
+which now also asserts stderr never carries the drain-deadline alarm. See ADR-0054
+and ADR-0055.
+
+Deliberately left: a client-sent cancellation reaching a running query (open question
+23, second half — `close_gate` only stops a queued request from outliving shutdown,
+not a running one); cancelling the token at EOF ahead of the SDK's own drain, which
+ADR-0055 records as a refinement rather than closing; and the HTTP transport (M14).
+
+---
+
 ## M14 — Streamable HTTP
 
 Use rmcp's HTTP transport with `2026-07-28` semantics, authentication integration,

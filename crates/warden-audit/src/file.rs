@@ -17,9 +17,11 @@ use std::io::{Read as _, Seek as _};
 use std::path::{Path, PathBuf};
 
 use warden_core::audit::AuditMode;
-use warden_ports::{AuditAttempt, AuditError, AuditOutcomeEvent, AuditSink, BoxFuture};
+use warden_ports::{
+    AuditAttempt, AuditError, AuditOutcomeEvent, AuditRejection, AuditSink, BoxFuture,
+};
 
-use crate::record::{AttemptRecord, OutcomeRecord};
+use crate::record::{AttemptRecord, OutcomeRecord, RejectionRecord};
 
 mod writer;
 use writer::Writer;
@@ -236,6 +238,22 @@ impl AuditSink for FileAuditSink {
             self.write(line, false).await
         })
     }
+
+    fn record_rejection<'a>(
+        &'a self,
+        event: &'a AuditRejection,
+    ) -> BoxFuture<'a, Result<(), AuditError>> {
+        Box::pin(async move {
+            let record = RejectionRecord::new(event);
+            let mut line =
+                serde_json::to_string(&record).map_err(|error| AuditError::Unavailable {
+                    detail: error.to_string(),
+                })?;
+            line.push('\n');
+            // Durable like an attempt: this line is the only record of the call.
+            self.write(line, true).await
+        })
+    }
 }
 
 #[cfg(test)]
@@ -251,8 +269,10 @@ mod tests {
     use warden_core::connection::Environment;
     use warden_core::dialect::Dialect;
     #[cfg(unix)]
-    use warden_ports::AuditOutcome;
+    use warden_core::error::PublicErrorCode;
     use warden_ports::{AuditEventId, AuditOperation};
+    #[cfg(unix)]
+    use warden_ports::{AuditOutcome, AuditRejectionStage};
 
     use super::*;
     #[cfg(unix)]
@@ -314,6 +334,30 @@ mod tests {
         assert_eq!(lines[0]["event"], serde_json::json!("attempt"));
         assert_eq!(lines[0]["schema"], serde_json::json!(RECORD_SCHEMA));
         assert_eq!(lines[1]["attempt_id"], lines[0]["attempt_id"]);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_rejection_lands_as_one_durable_json_line() {
+        let file = TempPath::new("rejection");
+        let sink = FileAuditSink::open(file.path().to_owned(), AuditMode::Fingerprint)
+            .await
+            .unwrap();
+        sink.record_rejection(&rejection()).await.unwrap();
+
+        let lines: Vec<serde_json::Value> = std::fs::read_to_string(file.path())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["event"], serde_json::json!("rejection"));
+        assert_eq!(lines[0]["schema"], serde_json::json!(RECORD_SCHEMA));
+        assert_eq!(
+            lines[0]["stage"],
+            serde_json::json!("connection_resolution")
+        );
+        assert_eq!(lines[0]["connection"], serde_json::json!("nowhere"));
     }
 
     #[cfg(unix)]
@@ -463,6 +507,23 @@ mod tests {
             fingerprint: None,
             statement_kind: Some(StatementKind::Select),
             deny_reasons: Vec::new(),
+        }
+    }
+
+    /// One representative rejection: refused resolving a connection name that did
+    /// not match any configured connection.
+    #[cfg(unix)]
+    fn rejection() -> AuditRejection {
+        AuditRejection {
+            id: AuditEventId::generate(),
+            timestamp: time::OffsetDateTime::UNIX_EPOCH,
+            request_id: "request-1".parse().unwrap(),
+            principal: "local-stdio".parse().unwrap(),
+            client: "example-client".parse().unwrap(),
+            operation: AuditOperation::Query,
+            stage: AuditRejectionStage::ConnectionResolution,
+            connection: Some("nowhere".parse().unwrap()),
+            error_code: PublicErrorCode::ConnectionNotFound,
         }
     }
 

@@ -11,6 +11,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 mod execution;
+mod identity;
 mod inspection;
 mod planning;
 mod privileges;

@@ -13,6 +13,48 @@ implementation details before `1.0` and change without notice (`SPEC.md` section
 
 Nothing yet.
 
+## [0.3.0] - 2026-09-15
+
+A hardening release. Warden now bounds the size of what it reads before it parses or
+decodes it, refuses to start a PostgreSQL connection whose role could make a trusted
+built-in resolve to somebody else's function, and audits a tool call it refuses before
+any attempt exists. Neither the MCP tool schemas nor the configuration format changed,
+so a 0.2.0 deployment upgrades in place; two things are worth checking first. A
+PostgreSQL role that can execute a function named after a built-in the analyzer trusts
+now fails startup and `warden check` until that `EXECUTE` is revoked — the script
+`warden role` prints revokes it. And readers of the `warden.audit.v1` file must accept
+`rejection` as a third `event` value.
+
+### Added
+
+- Audit `rejection` records for database-tool calls refused before an attempt exists:
+  malformed or oversized arguments, unknown connections, missing capabilities. Same
+  `warden.audit.v1` schema; readers must accept the third `event` value.
+- `invalid_arguments`: the public code for tool arguments that do not match the input
+  schema. Warden no longer relays the SDK's deserialization text.
+
+### Changed
+
+- `query` and `explain` refuse a parameter over 64 KiB or parameters totalling over
+  256 KiB with `query_too_large`; previously only their count was bounded.
+- The stdio transport ends the session on any frame that exceeds 1 MiB before its
+  newline arrives, before any of it is parsed.
+- PostgreSQL `json`, `jsonb` and array values are measured on the wire before they are
+  decoded; a value far over `max_value_bytes` is refused without building it.
+- A PostgreSQL connection fails to start when a function the Warden role can execute,
+  in a schema on its `search_path`, shares a name with a built-in the analyzer trusts;
+  the failure names the functions. `warden check` reports the same.
+- `warden role` now revokes the default `EXECUTE` grant from `PUBLIC` for the schema
+  and for future functions.
+- Shutdown waits up to 30 seconds for in-flight tool calls and their audit outcomes,
+  wakes queued requests immediately, and exits non-zero if anything was still running.
+
+### Fixed
+
+- CTE names are resolved in scope on both dialects. A CTE that reads a table of its own
+  name, or an alias declared inside a subquery, no longer hides the real table from
+  `deny_tables`/`allow_tables`.
+
 ## [0.2.0] - 2026-09-09
 
 Warden becomes installable and startable without hand-written files. Three new
@@ -130,6 +172,7 @@ These are documented deliberately, not oversights; `SPEC.md` section 7 and
 - A JSON document's integers above 2^53 reach a JavaScript client unquoted, and a
   PostgreSQL `time` of `24:00:00` reads back as `00:00:00`.
 
-[Unreleased]: https://github.com/rodrigodotdev/warden/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/rodrigodotdev/warden/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/rodrigodotdev/warden/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/rodrigodotdev/warden/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/rodrigodotdev/warden/releases/tag/v0.1.0

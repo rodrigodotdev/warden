@@ -110,11 +110,17 @@ async fn run_serve(config: &Path, transport: Transport) -> Result<ExitCode> {
     // The signal task has nothing left to cancel, and its handle is dropped here rather
     // than left to outlive the runtime it was spawned on.
     signals.abort();
-    // `docs/architecture.md` section 13: cancel, then close both pools per connection
-    // under a bounded wait. This runs whether the session ended at EOF or in failure.
-    deployment.close().await;
+    // `docs/architecture.md` section 13: cancel, drain the tracked tasks, then close both
+    // pools per connection under one bounded deadline. This runs whether the session
+    // ended at EOF or in failure.
+    let report = deployment.close().await;
 
     session.context("the MCP session did not complete")?;
+    if !report.complete {
+        // The alarm was already logged by `close`; the exit status is what a supervisor
+        // reads. A shutdown that could not prove its audit trail complete is a failure.
+        return Ok(ExitCode::FAILURE);
+    }
     Ok(ExitCode::SUCCESS)
 }
 

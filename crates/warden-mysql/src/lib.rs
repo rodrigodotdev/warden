@@ -58,6 +58,7 @@ mod options;
 mod parse;
 mod plan;
 mod pool;
+mod scope;
 mod statement;
 mod tokens;
 mod visit;

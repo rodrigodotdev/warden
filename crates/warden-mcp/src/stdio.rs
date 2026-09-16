@@ -13,12 +13,17 @@
 //! ordinary end of a local session. The cancellation token means the process was asked to
 //! stop; `rmcp`'s `serve_with_ct` already threads it through the service loop, so an
 //! in-flight request sees the same root token every service child token descends from.
+//!
+//! Both entry points wrap the read half in [`BoundedRead`] before it ever reaches rmcp,
+//! capping a single newline-delimited frame at [`MAX_MCP_FRAME_BYTES`] (`docs/mcp.md`
+//! section 5.1, ADR-0052).
 
 use rmcp::service::ServerInitializeError;
 use rmcp::transport::IntoTransport;
 use rmcp::{RoleServer, ServiceExt};
 use tokio_util::sync::CancellationToken;
 
+use crate::bounded_read::{BoundedRead, MAX_MCP_FRAME_BYTES};
 use crate::server::WardenServer;
 
 /// Why a stdio session could not start or could not be shut down.
@@ -46,7 +51,13 @@ pub async fn serve_stdio(
     server: WardenServer,
     shutdown: CancellationToken,
 ) -> Result<(), StdioError> {
-    serve(server, rmcp::transport::stdio(), shutdown).await
+    let (stdin, stdout) = rmcp::transport::stdio();
+    serve(
+        server,
+        (BoundedRead::new(stdin, MAX_MCP_FRAME_BYTES), stdout),
+        shutdown,
+    )
+    .await
 }
 
 /// Serves the same session over an in-memory duplex stream.
@@ -76,7 +87,15 @@ pub async fn serve_duplex<S>(
 where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Send + 'static,
 {
-    serve(server, stream, shutdown).await
+    // Split here so the budget wraps only the half the peer writes to; the SDK gets
+    // the same `(read, write)` pair `serve_stdio` hands it.
+    let (read, write) = tokio::io::split(stream);
+    serve(
+        server,
+        (BoundedRead::new(read, MAX_MCP_FRAME_BYTES), write),
+        shutdown,
+    )
+    .await
 }
 
 /// Runs one session on `transport`, ending on EOF or on the root cancellation token.

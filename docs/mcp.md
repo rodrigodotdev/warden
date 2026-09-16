@@ -134,6 +134,10 @@ sentence from `docs/security.md` section 10 — no database content at all — s
 in both `structured_content` and `content`, which costs nothing and still serves a client
 that reads only text.
 
+A call whose arguments do not match the tool's input schema is answered with
+`invalid_arguments` and recorded as an audit rejection; Warden no longer relays the
+SDK's deserialization text (ADR-0054).
+
 ### `list_connections`
 
 Return only safe public metadata.
@@ -187,6 +191,10 @@ Initial limit: **20 tables per call**. Object policy applies.
 
 The tool schema is generic; SQL is dialect-native.
 
+Each parameter is limited to 64 KiB and all parameters together to 256 KiB; exceeding
+either is `query_too_large`. Arguments that do not match this schema — a missing field,
+a wrong type — are `invalid_arguments`.
+
 ### `explain`
 
 ```json
@@ -199,6 +207,9 @@ The tool schema is generic; SQL is dialect-native.
 
 **Do not invent a universal cost metric.** MySQL and PostgreSQL cost units are not
 comparable.
+
+Each parameter is limited to 64 KiB and all parameters together to 256 KiB; exceeding
+either is `query_too_large`.
 
 ## 3. EXPLAIN semantics
 
@@ -266,6 +277,14 @@ The first transport and shortest path to a local vertical slice.
 - Do not print a startup banner to stdout.
 - Handle signals during shutdown.
 - Malformed messages do not expose internal errors.
+- A tool call whose arguments do not match its input schema is answered with
+  `invalid_arguments`, recorded as an audit rejection, and never with the SDK's own
+  deserialization text (ADR-0054).
+- Each newline-delimited frame is limited to 1 MiB, counted before the SDK parses it. A
+  frame that grows past the limit without a newline ends the session with a fixed
+  stderr diagnostic; no JSON-RPC error is sent, because nothing was decoded to
+  correlate one with, and no byte of the frame is logged (ADR-0052). The limit is per
+  frame, not per session.
 
 ### 5.2 Streamable HTTP
 

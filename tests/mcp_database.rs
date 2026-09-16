@@ -1198,6 +1198,57 @@ async fn a_startup_failure_leaks_no_dsn_and_leaves_stdout_untouched() {
 }
 
 #[tokio::test]
+async fn a_shadowing_function_fails_serve_and_check_until_execute_is_revoked() {
+    let fixture = Fixture::start(Engine::PostgreSql).await;
+    let admin = PgPool::connect(&format!(
+        "postgres://postgres:postgres@{}:{}/postgres",
+        fixture.host, fixture.port
+    ))
+    .await
+    .unwrap();
+    // `public` is the fixture's whole `search_path`; EXECUTE stays at PostgreSQL's
+    // default grant to PUBLIC.
+    sqlx::query(AssertSqlSafe(
+        "CREATE FUNCTION public.lower(integer) RETURNS text LANGUAGE sql IMMUTABLE \
+         AS $$ SELECT 'custom-overload' $$"
+            .to_owned(),
+    ))
+    .execute(&admin)
+    .await
+    .unwrap();
+
+    for arguments in [&["serve", "--transport", "stdio"][..], &["check"][..]] {
+        let output = fixture.run(arguments).await;
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            !output.status.success(),
+            "warden {arguments:?} started: {stderr}"
+        );
+        assert!(output.stdout.is_empty(), "{:?}", output.stdout);
+        for leaked in fixture.dsn_tokens() {
+            assert!(!stderr.contains(&leaked), "leaked {leaked}: {stderr}");
+        }
+        assert!(stderr.contains("public.lower(integer)"), "{stderr}");
+        assert!(stderr.contains(NAME), "{stderr}");
+    }
+
+    sqlx::query(AssertSqlSafe(
+        "REVOKE EXECUTE ON FUNCTION public.lower(integer) FROM PUBLIC".to_owned(),
+    ))
+    .execute(&admin)
+    .await
+    .unwrap();
+    admin.close().await;
+
+    let output = fixture.run_check().await;
+    assert!(
+        output.status.success(),
+        "check still fails after the revoke: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
 async fn a_redacted_column_is_redacted_on_the_wire() {
     let fixture = Fixture::start(Engine::MySql).await;
     let response = fixture.call_query("SELECT id, password FROM orders").await;
@@ -1224,6 +1275,12 @@ async fn stdout_carries_protocol_only_and_the_process_exits_on_eof() {
     assert!(
         stderr.contains("warden starting"),
         "the startup log line is missing from stderr: {stderr}"
+    );
+    // A normal EOF shutdown has nothing outstanding to drain; the alarm `Deployment::close`
+    // logs for an incomplete drain must not fire on the ordinary path.
+    assert!(
+        !stderr.contains("outlived the drain deadline"),
+        "an ordinary shutdown logged a drain-deadline alarm: {stderr}"
     );
 }
 

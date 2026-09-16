@@ -1,6 +1,6 @@
 //! The one place an internal failure becomes something a model may see.
 //!
-//! `docs/security.md` section 10 fixes a closed set of fourteen codes and says raw SQLx
+//! `docs/security.md` section 10 fixes a closed set of fifteen codes and says raw SQLx
 //! errors — which can carry hostnames, users, database names, SQL, and server details —
 //! must never reach the model. Every service error already knows its own
 //! [`warden_core::error::PublicErrorCode`], so this module takes a *code* and never a
@@ -11,8 +11,10 @@
 //! A denied statement, a busy connection, and a truncated-too-large result are things the
 //! agent should read and act on — refine the query, retry shortly, narrow the projection.
 //! MCP carries those as a tool result with `is_error`, leaving JSON-RPC errors for
-//! protocol faults, which is what rmcp itself does for malformed arguments and an
-//! unsupported protocol version.
+//! protocol faults such as an unsupported protocol version. Malformed arguments are on
+//! the first side of that line: they are something the agent can fix and resend, so they
+//! come back in-band as `invalid_arguments` — and since the tools take their arguments
+//! raw, it is Warden that classifies them and audits the refusal, not rmcp (ADR-0054).
 //!
 //! # Why this result repeats itself and a successful one does not
 //!
@@ -48,6 +50,9 @@ pub(crate) fn public_message(code: PublicErrorCode) -> &'static str {
         }
         PublicErrorCode::QueryTooLarge => {
             "the statement or its parameter list exceeds the accepted size"
+        }
+        PublicErrorCode::InvalidArguments => {
+            "the tool arguments do not match the tool's input schema; check the field names and types"
         }
         PublicErrorCode::QueryParseError => {
             "the statement could not be parsed in this connection's dialect"
@@ -105,6 +110,13 @@ mod tests {
             }
             assert!(message.is_ascii(), "{code}: {message}");
         }
+    }
+
+    #[test]
+    fn invalid_arguments_tells_the_agent_what_to_fix_without_echoing_anything() {
+        let message = public_message(PublicErrorCode::InvalidArguments);
+        assert!(message.contains("input schema"), "{message}");
+        assert!(message.contains("field names and types"), "{message}");
     }
 
     #[test]

@@ -788,6 +788,81 @@ async fn the_per_value_bound_fails_the_whole_result() {
 }
 
 #[tokio::test]
+async fn an_oversized_jsonb_is_refused_on_its_raw_size_before_it_is_decoded() {
+    let container = start_postgres().await;
+    let pools = Arc::new(
+        PostgreSqlConnectionPools::connect(config(dsn(&container).await))
+            .await
+            .unwrap(),
+    );
+    let limits = ExecutionLimits {
+        max_value_bytes: 64 * 1024,
+        ..ExecutionLimits::default()
+    };
+    let (executor, runtime) = harness(Arc::clone(&pools), limits).await;
+    let permit = runtime.acquire_query_permit().await.unwrap();
+
+    // 200 KB of jsonb is past the raw budget (2 × 64 KiB + 64 = 131 136), so the
+    // refusal carries the raw figure, not the normalized 65 536.
+    let query = authorized(
+        "SELECT jsonb_build_object('k', repeat('a', 200000)) AS payload",
+        Vec::new(),
+        limits,
+    );
+    let error = run(&executor, &permit, &query).await.unwrap_err();
+    assert!(
+        matches!(error, ExecuteError::ResultTooLarge { limit: 131_136 }),
+        "{error:?}"
+    );
+    assert_eq!(error.public_code(), PublicErrorCode::QueryResultTooLarge);
+
+    pools.close().await;
+}
+
+#[tokio::test]
+async fn an_array_larger_on_the_wire_than_in_json_still_reaches_the_normalized_check() {
+    let container = start_postgres().await;
+    let pools = Arc::new(
+        PostgreSqlConnectionPools::connect(config(dsn(&container).await))
+            .await
+            .unwrap(),
+    );
+    let limits = ExecutionLimits {
+        max_value_bytes: 256,
+        ..ExecutionLimits::default()
+    };
+    let (executor, runtime) = harness(Arc::clone(&pools), limits).await;
+    let permit = runtime.acquire_query_permit().await.unwrap();
+
+    // 100 int4 elements: 820 raw bytes, under the raw budget of 16 × 256 + 64 =
+    // 4 160, but 293 normalized bytes, over 256. The builder, not the raw guard,
+    // must be the one that refuses it — proven by the `limit` it reports.
+    let query = authorized(
+        "SELECT array_agg(g) AS counts FROM generate_series(1, 100) AS g",
+        Vec::new(),
+        limits,
+    );
+    let error = run(&executor, &permit, &query).await.unwrap_err();
+    assert!(
+        matches!(error, ExecuteError::ResultTooLarge { limit: 256 }),
+        "{error:?}"
+    );
+
+    // And the same array under the default budget is simply returned.
+    let (executor, runtime) = harness(Arc::clone(&pools), ExecutionLimits::default()).await;
+    let permit = runtime.acquire_query_permit().await.unwrap();
+    let query = authorized(
+        "SELECT array_agg(g) AS counts FROM generate_series(1, 100) AS g",
+        Vec::new(),
+        ExecutionLimits::default(),
+    );
+    let result = run(&executor, &permit, &query).await.unwrap();
+    assert_eq!(result.rows.len(), 1);
+
+    pools.close().await;
+}
+
+#[tokio::test]
 async fn nothing_fits_fails_rather_than_truncates_to_empty() {
     let container = start_postgres().await;
     let pools = Arc::new(
@@ -1338,6 +1413,74 @@ async fn the_analyzed_statement_is_the_executed_one() {
 
     let result = run(&executor, &permit, &query).await.unwrap();
     assert_eq!(result.rows[0][0], ResultValue::I64(2));
+
+    pools.close().await;
+}
+
+#[tokio::test]
+async fn a_cte_sharing_the_real_tables_name_still_reads_the_real_table() {
+    // Milestone 13.2: `scope.rs` resolves CTE names the way the server does. A
+    // non-`RECURSIVE` body cannot see its own alias, so the inner `orders` here is
+    // the real base table, both in the server's own resolution and in the
+    // analyzer's. This proves it against a real server, not only against the
+    // corpus's synthetic expectations.
+    let container = start_postgres().await;
+    let pools = Arc::new(
+        PostgreSqlConnectionPools::connect(config(dsn(&container).await))
+            .await
+            .unwrap(),
+    );
+    let mut connection = pools.control().acquire().await.unwrap();
+    let mut transaction = connection.begin_with("BEGIN READ WRITE").await.unwrap();
+    for statement in [
+        "CREATE TABLE orders (id bigint PRIMARY KEY)".to_owned(),
+        "INSERT INTO orders VALUES (1), (2), (3)".to_owned(),
+    ] {
+        sqlx::query(AssertSqlSafe(statement))
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+    }
+    transaction.commit().await.unwrap();
+    // Returned to the pool before the query path runs, exactly as `fixture` does:
+    // the fixture connection has no further reason to stay checked out.
+    drop(connection);
+
+    let (executor, runtime) = harness(Arc::clone(&pools), ExecutionLimits::default()).await;
+    let permit = runtime.acquire_query_permit().await.unwrap();
+
+    let sql = "WITH orders AS (SELECT * FROM orders) SELECT count(*) AS n FROM orders";
+    let request = QueryRequest::new(
+        "production-db".parse().unwrap(),
+        sql.to_owned(),
+        Vec::new(),
+        &InputLimits::default(),
+    )
+    .unwrap();
+    let analyzed = PostgreSqlAnalyzer::new().analyze(request).unwrap();
+    let objects: Vec<String> = analyzed
+        .analysis()
+        .objects()
+        .iter()
+        .map(|object| object.qualified_name())
+        .collect();
+    assert_eq!(objects, ["orders"]);
+
+    let query = engine()
+        .authorize(
+            &context(),
+            &metadata(),
+            analyzed,
+            ExecutionLimits::default(),
+        )
+        .unwrap();
+
+    let result = run(&executor, &permit, &query).await.unwrap();
+
+    // The real table has exactly three rows: the count the executor returns is the
+    // server's own resolution of `orders`, not the CTE being defined.
+    assert_eq!(result.rows.len(), 1);
+    assert_eq!(result.rows[0][0], ResultValue::I64(3));
 
     pools.close().await;
 }

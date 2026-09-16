@@ -18,6 +18,7 @@
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -34,9 +35,9 @@ use warden_core::schema::{
 };
 use warden_policy::{AnalyzedQuery, AuthorizedQuery, ObjectFilter, PolicyEngine, PolicySettings};
 use warden_ports::{
-    AnalyzeError, AuditAttempt, AuditError, AuditOutcomeEvent, AuditSink, ConnectionRegistry,
-    ConnectionRuntime, ConnectionRuntimeParts, ExecuteError, ExplainError, Explainer,
-    QueryAnalyzer, QueryExecutor, QueryPermit, SchemaError, SchemaInspector,
+    AnalyzeError, AuditAttempt, AuditError, AuditOutcomeEvent, AuditRejection, AuditSink,
+    ConnectionRegistry, ConnectionRuntime, ConnectionRuntimeParts, ExecuteError, ExplainError,
+    Explainer, QueryAnalyzer, QueryExecutor, QueryPermit, SchemaError, SchemaInspector,
 };
 use warden_service::{RedactionSettings, ServiceParts, Services, StaticConnectionRegistry};
 pub(crate) use warden_testing::{capabilities, result_set};
@@ -176,9 +177,10 @@ impl QueryAnalyzer for FakeAnalyzer {
     }
 }
 
-/// An executor with a fixed outcome and an observable call count.
+/// An executor with a fixed outcome, an optional delay, and an observable call count.
 #[derive(Debug)]
 pub(crate) struct FakeExecutor {
+    duration: Duration,
     failure: Option<ExecuteError>,
     calls: AtomicUsize,
 }
@@ -193,8 +195,17 @@ impl FakeExecutor {
     /// Creates an executor that returns the fixture result.
     pub(crate) fn new() -> Self {
         Self {
+            duration: Duration::ZERO,
             failure: None,
             calls: AtomicUsize::new(0),
+        }
+    }
+
+    /// Creates an executor that takes the given duration before returning the fixture.
+    pub(crate) fn taking(duration: Duration) -> Self {
+        Self {
+            duration,
+            ..Self::new()
         }
     }
 
@@ -202,7 +213,7 @@ impl FakeExecutor {
     pub(crate) fn failing(error: ExecuteError) -> Self {
         Self {
             failure: Some(error),
-            calls: AtomicUsize::new(0),
+            ..Self::new()
         }
     }
 
@@ -222,6 +233,7 @@ impl QueryExecutor for FakeExecutor {
     ) -> warden_ports::BoxFuture<'a, Result<ResultSet, ExecuteError>> {
         Box::pin(async move {
             self.calls.fetch_add(1, Ordering::Relaxed);
+            tokio::time::sleep(self.duration).await;
             match &self.failure {
                 Some(error) => Err(error.clone()),
                 None => Ok(result_set()),
@@ -291,15 +303,16 @@ impl SchemaInspector for FakeInspector {
     }
 }
 
-/// An audit sink that records both phases in memory.
+/// An audit sink that records every phase in memory.
 #[derive(Debug, Default)]
 pub(crate) struct FakeAuditSink {
     attempts: Mutex<Vec<AuditAttempt>>,
     outcomes: Mutex<Vec<AuditOutcomeEvent>>,
+    rejections: Mutex<Vec<AuditRejection>>,
 }
 
 impl FakeAuditSink {
-    /// Creates a sink that records both phases.
+    /// Creates a sink that records every phase.
     pub(crate) fn new() -> Self {
         Self::default()
     }
@@ -312,6 +325,11 @@ impl FakeAuditSink {
     /// The outcomes this sink recorded.
     pub(crate) fn outcomes(&self) -> Vec<AuditOutcomeEvent> {
         self.outcomes.lock().unwrap().clone()
+    }
+
+    /// The rejections this sink recorded.
+    pub(crate) fn rejections(&self) -> Vec<AuditRejection> {
+        self.rejections.lock().unwrap().clone()
     }
 }
 
@@ -332,6 +350,16 @@ impl AuditSink for FakeAuditSink {
     ) -> warden_ports::BoxFuture<'a, Result<(), AuditError>> {
         Box::pin(async move {
             self.outcomes.lock().unwrap().push(*event);
+            Ok(())
+        })
+    }
+
+    fn record_rejection<'a>(
+        &'a self,
+        event: &'a AuditRejection,
+    ) -> warden_ports::BoxFuture<'a, Result<(), AuditError>> {
+        Box::pin(async move {
+            self.rejections.lock().unwrap().push(event.clone());
             Ok(())
         })
     }
@@ -410,7 +438,15 @@ pub(crate) fn services() -> Arc<Services> {
 
 /// The same services with exactly one port replaced.
 pub(crate) fn services_from(parts: FakeParts) -> Arc<Services> {
-    services_over(vec![parts])
+    services_over(vec![parts], Arc::new(FakeAuditSink::new()))
+}
+
+/// The same services with exactly one port replaced, plus the audit sink watching
+/// them — for a test that needs to inspect what the sink recorded.
+pub(crate) fn services_observed(parts: FakeParts) -> (Arc<Services>, Arc<FakeAuditSink>) {
+    let audit = Arc::new(FakeAuditSink::new());
+    let services = services_over(vec![parts], Arc::clone(&audit));
+    (services, audit)
 }
 
 /// Services whose [`CONNECTION`] panics and whose [`HEALTHY_CONNECTION`] does not.
@@ -424,11 +460,15 @@ pub(crate) fn services_with_a_panicking_connection() -> Arc<Services> {
         metadata: connection_named(HEALTHY_CONNECTION, Dialect::MySql),
         ..FakeParts::new()
     };
-    services_over(vec![FakeParts::panicking(), healthy])
+    services_over(
+        vec![FakeParts::panicking(), healthy],
+        Arc::new(FakeAuditSink::new()),
+    )
 }
 
-/// Builds the services over one registry holding every supplied connection.
-fn services_over(connections: Vec<FakeParts>) -> Arc<Services> {
+/// Builds the services over one registry holding every supplied connection, recording
+/// through the given audit sink.
+fn services_over(connections: Vec<FakeParts>, audit: Arc<FakeAuditSink>) -> Arc<Services> {
     let runtimes = connections
         .into_iter()
         .map(|parts| Arc::new(runtime_from(parts)))
@@ -439,7 +479,7 @@ fn services_over(connections: Vec<FakeParts>) -> Arc<Services> {
         Services::new(ServiceParts {
             registry,
             engine: Arc::new(PolicyEngine::with_defaults(&PolicySettings::default()).unwrap()),
-            audit: Arc::new(FakeAuditSink::new()),
+            audit,
             redaction: RedactionSettings::default(),
             shutdown: CancellationToken::new(),
         })

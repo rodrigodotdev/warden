@@ -44,3 +44,5 @@ particular `public` is **not** trusted, even though it is on the default
 
 This does not change the read-scope boundary. The dedicated role's `GRANT` remains
 it (ADR-0023 and ADR-0016); classification reduces attack surface.
+
+**Refined by ADR-0053**, which makes the startup prove the premise this decision relies on.

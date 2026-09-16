@@ -289,6 +289,11 @@ an attempt synchronized between the copy and truncate can be erased. Renaming a 
 file also leaves Warden writing its old open handle. Coordinated reopening is not
 implemented (ADR-0043).
 
+Warden waits up to 30 seconds after the session ends for in-flight tool calls and their
+audit outcomes, then closes the pools within the same deadline. If anything is still
+running, it logs `admitted work outlived the drain deadline` and exits non-zero; treat
+that exit as an incomplete audit trail, not as a crash.
+
 ### 3.1 Structural rules
 
 **`allow_multiple_statements` does not exist.** One statement is an invariant (SPEC
@@ -885,6 +890,19 @@ mcp.tool.describe_schema
 mcp.tool.list_connections
 ```
 
+```text
+mcp.tool.query
+└── warden.query
+    └── audit.rejection
+```
+
+An unknown connection or a missing capability is refused inside the service, after
+`warden.query` (or `warden.explain`, `warden.search_schema`, `warden.describe_schema`)
+has already opened, so its rejection nests under that root span as a sibling of
+`connection.resolve` rather than preceding it. A call the adapter refuses before it
+ever reaches the service — malformed arguments, a validation failure — records its
+rejection directly under the tool span instead, with no service root beneath it.
+
 Tool and service roots are `info`; phase children are `debug`. The shipped
 `warn,warden=info` filter therefore records one root per participating layer: two
 for each database-backed tool and one for `list_connections`. An operator opts into
@@ -915,15 +933,22 @@ output stays on stderr; stdout carries only MCP messages.
 `dialect`, `environment`, `operation`, `statement_kind`, `fingerprint`, and
 `deny_codes`. Each outcome contains: `schema`, `event`, `attempt_id`, `timestamp`,
 `outcome`, `duration_ms`, `queue_wait_ms`, `rows`, `result_bytes`, and `error_code`.
-`event` is `attempt` or `outcome`; timestamps are RFC 3339, with the attempt's
-creation time and the outcome's serialization time respectively. Missing optional
-values are JSON `null`. `deny_codes` is a JSON array of fixed code strings.
+Each rejection contains: `schema`, `event`, `rejection_id`, `timestamp`,
+`request_id`, `principal_id`, `client`, `operation`, `stage`, `connection`, and
+`error_code`. `event` is `attempt`, `outcome`, or `rejection`; `stage` is `input`,
+`connection_resolution`, or `capability`; `connection` is `null` when the name did
+not validate. A rejection is terminal: no outcome follows it, and a call that
+produced an attempt never produces one. Readers that select on `event` must ignore
+values they do not know. Timestamps are RFC 3339, with the attempt's and
+rejection's creation time and the outcome's serialization time respectively.
+Missing optional values are JSON `null`. `deny_codes` is a JSON array of fixed code
+strings.
 
 `crates/warden-audit/src/tracing_sink.rs` emits the same logical fields except `schema` and
 `timestamp`: the formatter supplies time, level, and the `warden.audit` target,
-plus the fixed message `audit attempt` or `audit outcome`. Tracing omits unset
-optional values and renders `deny_codes` as a comma-joined string. Tests cover
-both sinks' field sets and JSON wire order.
+plus the fixed message `audit attempt`, `audit outcome`, or `audit rejection`.
+Tracing omits unset optional values and renders `deny_codes` as a comma-joined
+string. Tests cover every sink's field set and JSON wire order.
 
 `attempt_id` correlates the phases; `client` is validated printable ASCII;
 `fingerprint` is a versioned digest of the normalized statement, never raw SQL.
@@ -997,8 +1022,11 @@ not serve.
 
 `warden check` is everything `warden serve` would do, minus serving. It loads and
 validates the configuration, resolves every secret reference, opens and drops the
-configured audit destination to prove it is writable, opens every connection with the
-same eager connect `serve` performs, runs each adapter's fixed readiness probe on
+configured audit destination to prove it is writable, and opens every connection with
+the same eager connect `serve` performs — for PostgreSQL, that connect already checks
+function identity before returning: no executable function on the `search_path`
+shadows a trusted built-in (PostgreSQL only; fails startup with the names), ahead of
+any of `check`'s own probes. It then runs each adapter's fixed readiness probe on
 `control_pool` (section 10.4), reads the session settings back on **both** pools to catch
 a pooler or proxy that discarded the connection-time options (section 5.2), and closes
 every pool it opened before it returns. It **never executes arbitrary user SQL**: it takes
@@ -1294,7 +1322,7 @@ a download takes both steps:
 
 ```bash
 sha256sum --check --ignore-missing SHA256SUMS
-gh attestation verify warden-v0.2.0-x86_64-unknown-linux-gnu.tar.gz \
+gh attestation verify warden-v0.3.0-x86_64-unknown-linux-gnu.tar.gz \
   --repo rodrigodotdev/warden
 ```
 

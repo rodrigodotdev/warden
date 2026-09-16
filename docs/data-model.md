@@ -55,9 +55,15 @@ pub struct QueryRequest {
 The public constructor validates hard, configurable size limits **before parsing**:
 
 ```text
-maximum SQL bytes:  64 KiB
-maximum parameters: 100
+maximum SQL bytes:               64 KiB
+maximum parameters:              100
+maximum bytes per parameter:     64 KiB   (UTF-8 bytes of text; 8 for a number; 1 for a boolean; 0 for null)
+maximum bytes, all parameters:   256 KiB
 ```
+
+The parameter figures measure the domain payload (`ParameterValue::input_bytes`), not
+JSON or the driver's wire encoding. All four are checked before parsing and reported
+as `query_too_large` (ADR-0052).
 
 ## 3. Parameters
 
@@ -240,6 +246,14 @@ truncates it. One MiB remains the maximum configurable ceiling.
 is not constrained by `max_rows` or incremental result-byte accounting. This limit
 only bounds what **leaves** Warden; the driver still materializes the incoming value.
 Database `GRANT`s or views are the real mitigation for giant values.
+
+**Compound PostgreSQL values are measured twice.** Before SQLx decodes a `json`,
+`jsonb` or array value, its raw wire size must fit `min(max_value_bytes × factor + 64,
+16 MiB)` — factor 2 for JSON, 16 for arrays. This bounds the decoded structure Warden
+would otherwise build only to refuse it; the `ResultBuilder` still measures the
+normalized bytes afterwards and remains the authority. A `json` value padded with
+whitespace can therefore be refused on its raw size even though its compact form
+would fit (ADR-0052).
 
 **`max_queue_wait` is necessary** because `timeout` measures execution, not waiting.
 Without it, 50 concurrent calls with `max_concurrent_queries = 3` leave 47 tasks

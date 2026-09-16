@@ -17,21 +17,25 @@ use warden_core::analysis::{
 };
 
 use crate::functions;
+use crate::scope::CteScopes;
 use crate::statement::kind_of;
 
 /// Everything one walk of the tree saw.
 ///
 /// Not a `QueryAnalysis`: the analyzer still has to add the statement count, the
-/// fingerprint, and the token-guard risks, and to subtract the CTE names. Keeping
-/// those steps outside the visitor keeps the visitor a pure observer.
+/// fingerprint, and the token-guard risks. CTE resolution is not a step outside the
+/// visitor either — `scopes` tracks, at every point in the walk, which aliases the
+/// server would resolve there (`crate::scope`), so a relation that names a CTE in
+/// scope is never recorded as an object to begin with.
 #[derive(Debug, Default)]
 pub(crate) struct Evidence {
     /// Statement kinds in visit order. The first is the root.
     pub(crate) kinds: Vec<StatementKind>,
-    /// Relations, before CTE names are subtracted.
+    /// Relations that did not resolve to a CTE where they appeared.
     pub(crate) objects: Vec<ObjectRef>,
-    /// CTE aliases the query declared.
-    pub(crate) cte_names: Vec<String>,
+    /// CTE visibility for every query scope currently open — the whole nesting
+    /// stack, not only the innermost query.
+    scopes: CteScopes,
     /// Functions the statement invokes.
     pub(crate) functions: Vec<FunctionRef>,
     /// Risks, deduplicated in insertion order.
@@ -161,6 +165,14 @@ impl Evidence {
             classification,
         });
     }
+
+    /// Whether an unqualified relation name resolves to a CTE where it appears.
+    fn names_a_cte_in_scope(&self, name: &ObjectName) -> bool {
+        match identifiers(name).as_deref() {
+            Some([single]) => self.scopes.resolves_cte(single.value()),
+            Some(_) | None => false,
+        }
+    }
 }
 
 /// Every part of a name as a [`SqlIdentifier`], or `None` if one is not an
@@ -204,14 +216,18 @@ impl Visitor for Evidence {
     }
 
     fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
-        if let Some(with) = &query.with {
-            for cte in &with.cte_tables {
-                self.cte_names.push(cte.alias.name.value.clone());
-            }
-        }
+        self.scopes.enter(query);
         if !query.locks.is_empty() {
             self.has_locking_clause = true;
             self.flag(RiskFlag::LockingRead);
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &Query) -> ControlFlow<()> {
+        if self.scopes.leave().is_err() {
+            // A walk whose scopes do not pair is a walk this analyzer cannot describe.
+            self.flag(RiskFlag::UnknownConstruct);
         }
         ControlFlow::Continue(())
     }
@@ -232,6 +248,12 @@ impl Visitor for Evidence {
     fn pre_visit_table_factor(&mut self, factor: &TableFactor) -> ControlFlow<()> {
         match factor {
             TableFactor::Table { name, args, .. } => {
+                if args.is_none() && self.names_a_cte_in_scope(name) {
+                    // The server would resolve this to the CTE, so it is not a
+                    // relation (`docs/security.md` section 5.1). Only an unqualified
+                    // single-part name can be one; `app.x` and `x(1)` never are.
+                    return ControlFlow::Continue(());
+                }
                 // An analyzer sees names, not catalog entries: it cannot tell a table
                 // from a view, and claiming otherwise would be wrong about every
                 // view. Only a relation called with arguments is provably a function.
@@ -283,18 +305,22 @@ impl Visitor for Evidence {
     }
 }
 
-/// Walks the statements and returns what the walk saw, with CTE names subtracted.
+/// Walks the statements and returns what the walk saw, with CTE names resolved in
+/// scope.
 ///
-/// **The CTE subtraction is deliberately blunt.** `docs/security.md` section 5.1
-/// requires that CTE names and subquery aliases are not `ObjectRef` values, and this
-/// analyzer implements it by dropping every *unqualified* relation whose name folds
-/// equal to any CTE alias anywhere in the input — it does not track which
-/// subquery each alias is visible in. A query that declares a CTE named `orders` and
-/// also reads a real table `orders` in a different scope therefore loses the real
-/// reference from the object list. That errs toward reporting fewer objects, which
-/// weakens the allowlist and not the boundary: ADR-0023 makes the role's
-/// `GRANT SELECT` the read boundary, and the allowlist reduces attack surface.
-/// Scope-accurate resolution needs name resolution the analyzer does not have.
+/// `docs/security.md` section 5.1 requires that CTE names and subquery aliases are not
+/// `ObjectRef` values. This analyzer meets that by tracking, at every point in the
+/// walk, which aliases the server would actually resolve there (`scope.rs`): a name is
+/// omitted only where it resolves to a CTE visible at the point it was written. A
+/// non-recursive body does not see its own alias, so `WITH orders AS (SELECT * FROM
+/// orders)` keeps `orders` as a real relation; a subquery's alias is invisible outside
+/// it, so a CTE named `secrets` inside an `EXISTS` no longer hides the real `secrets`
+/// read elsewhere; and MySQL's `WITH RECURSIVE` makes a body see itself and the
+/// siblings declared before it, so a forward reference among recursive siblings is
+/// still a real relation, not the CTE declared after it — unlike PostgreSQL, where
+/// `RECURSIVE` makes every alias of the list visible to every body. The global
+/// subtraction this replaced dropped every homonym anywhere in the statement,
+/// case-insensitively; that is gone.
 pub(crate) fn collect(statements: &[Statement]) -> Evidence {
     let mut evidence = Evidence::default();
     for statement in statements {
@@ -333,15 +359,10 @@ pub(crate) fn collect(statements: &[Statement]) -> Evidence {
         evidence.flag(RiskFlag::DataModifyingCte);
     }
 
-    let cte_names = std::mem::take(&mut evidence.cte_names);
-    evidence.objects.retain(|object| {
-        let unqualified = object.catalog.is_none() && object.schema.is_none();
-        let is_cte = cte_names
-            .iter()
-            .any(|alias| alias.eq_ignore_ascii_case(object.name.value()));
-        !(unqualified && is_cte)
-    });
-    evidence.cte_names = cte_names;
+    if std::mem::take(&mut evidence.scopes).finish().is_err() {
+        evidence.flag(RiskFlag::UnknownConstruct);
+    }
+
     evidence
 }
 

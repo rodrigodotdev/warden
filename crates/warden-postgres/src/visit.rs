@@ -21,6 +21,7 @@ use warden_core::dialect::Dialect;
 use warden_policy::folding::rule_matches;
 
 use crate::functions;
+use crate::scope::CteScopes;
 use crate::statement::kind_of;
 
 /// The one schema whose functions may be classified against the built-in registry.
@@ -34,16 +35,19 @@ const TRUSTED_FUNCTION_SCHEMA: &str = "pg_catalog";
 /// Everything one walk of the tree saw.
 ///
 /// Not a `QueryAnalysis`: the analyzer still has to add the statement count and the
-/// fingerprint, and to subtract the CTE names. Keeping those steps outside the
-/// visitor keeps the visitor a pure observer.
+/// fingerprint. CTE resolution is not a step outside the visitor either — `scopes`
+/// tracks, at every point in the walk, which aliases the server would resolve there
+/// (`crate::scope`), so a relation that names a CTE in scope is never recorded as an
+/// object to begin with.
 #[derive(Debug, Default)]
 pub(crate) struct Evidence {
     /// Statement kinds in visit order. The first is the root.
     pub(crate) kinds: Vec<StatementKind>,
-    /// Relations, before CTE names are subtracted.
+    /// Relations that did not resolve to a CTE where they appeared.
     pub(crate) objects: Vec<ObjectRef>,
-    /// CTE aliases the query declared, with the quoting each was written under.
-    cte_aliases: Vec<SqlIdentifier>,
+    /// CTE visibility for every query scope currently open — the whole nesting
+    /// stack, not only the innermost query.
+    scopes: CteScopes,
     /// Functions the statement invokes.
     pub(crate) functions: Vec<FunctionRef>,
     /// Risks, deduplicated in insertion order.
@@ -94,7 +98,7 @@ fn is_write_kind(kind: StatementKind) -> bool {
 /// This is **not** `warden_policy::folding::rule_matches`, and cannot be: that
 /// comparison is asymmetric between an operator-written rule, which has no quoting,
 /// and an identifier a statement wrote. Here both sides came from the statement.
-fn folded(identifier: &SqlIdentifier) -> Cow<'_, str> {
+pub(crate) fn folded(identifier: &SqlIdentifier) -> Cow<'_, str> {
     match identifier.quoting() {
         IdentifierQuoting::Unquoted => Cow::Owned(identifier.value().to_ascii_lowercase()),
         IdentifierQuoting::Quoted => Cow::Borrowed(identifier.value()),
@@ -209,8 +213,8 @@ impl Evidence {
     /// way: `FunctionSafetyPolicy::qualified()` renders `schema.name` in its audit
     /// detail.
     ///
-    /// The bare name is folded by [`folded`] — the same helper CTE subtraction uses —
-    /// before it reaches the registry. Without this, `"Count"(1)` would be lowercased
+    /// The bare name is folded by [`folded`] — the same helper CTE resolution in
+    /// `crate::scope` uses — before it reaches the registry. Without this, `"Count"(1)` would be lowercased
     /// on its way into `functions::classify` and match the `count` entry despite
     /// being a different, quoted identifier: exactly the laundering ADR-0029 exists to
     /// close, achieved with quote characters instead of a schema qualifier.
@@ -243,6 +247,14 @@ impl Evidence {
             schema,
             classification,
         });
+    }
+
+    /// Whether an unqualified relation name resolves to a CTE where it appears.
+    fn names_a_cte_in_scope(&self, name: &ObjectName) -> bool {
+        match identifiers(name).as_deref() {
+            Some([single]) => self.scopes.resolves_cte(single),
+            Some(_) | None => false,
+        }
     }
 }
 
@@ -277,18 +289,18 @@ impl Visitor for Evidence {
     }
 
     fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<()> {
-        if let Some(with) = &query.with {
-            for cte in &with.cte_tables {
-                let alias = &cte.alias.name;
-                self.cte_aliases.push(match alias.quote_style {
-                    Some(_) => SqlIdentifier::quoted(alias.value.clone()),
-                    None => SqlIdentifier::unquoted(alias.value.clone()),
-                });
-            }
-        }
+        self.scopes.enter(query);
         if !query.locks.is_empty() {
             self.has_locking_clause = true;
             self.flag(RiskFlag::LockingRead);
+        }
+        ControlFlow::Continue(())
+    }
+
+    fn post_visit_query(&mut self, _query: &Query) -> ControlFlow<()> {
+        if self.scopes.leave().is_err() {
+            // A walk whose scopes do not pair is a walk this analyzer cannot describe.
+            self.flag(RiskFlag::UnknownConstruct);
         }
         ControlFlow::Continue(())
     }
@@ -312,6 +324,12 @@ impl Visitor for Evidence {
                 self.flag(RiskFlag::UnknownConstruct);
             }
             TableFactor::Table { name, args, .. } => {
+                if args.is_none() && self.names_a_cte_in_scope(name) {
+                    // The server would resolve this to the CTE, so it is not a relation
+                    // (`docs/security.md` section 5.1). Only an unqualified single-part
+                    // name can be one; `app.x` and `x(1)` never are.
+                    return ControlFlow::Continue(());
+                }
                 // An analyzer sees names, not catalog entries: it cannot tell a table
                 // from a view, and claiming otherwise would be wrong about every
                 // view. Only a relation called with arguments is provably a function.
@@ -366,29 +384,35 @@ impl Visitor for Evidence {
             // `lib.rs`. Side effects reach a PostgreSQL expression through three
             // classified shapes — a function call, a custom operator, or a nested
             // statement the visitor descends into — all of which are classified
-            // above. A fourth shape is known and left unclassified: a user-defined
-            // cast reaches `Expr::Cast`, not this arm, so `'x'::evil_type` is never
-            // classified here; that is acceptable because creating the cast, or the
-            // type it casts to, requires DDL, which this tool denies. PostgreSQL has
-            // no expression-level assignment operator in SQL: `f(a := 1)` is
-            // argument naming inside a call that is itself classified, not session
-            // mutation the way MySQL's `@x := 1` is.
+            // above. A fourth shape is known and left unclassified: a user-defined cast
+            // reaches `Expr::Cast`, not this arm, so `'x'::evil_type` is never
+            // classified here. That is not because DDL is denied — the cast and the
+            // type can predate the session — but because the code such a cast runs
+            // (a `CREATE CAST … WITH FUNCTION` body or a domain `CHECK`) executes as
+            // the caller, and the role contract revokes `EXECUTE` from `PUBLIC`
+            // (`docs/security.md` section 4.2, ADR-0053). A static allowlist of cast
+            // targets would refuse enums, `citext`, `vector`, ranges and every
+            // extension type while closing nothing the grant does not already close.
             _ => {}
         }
         ControlFlow::Continue(())
     }
 }
 
-/// Walks the statements and returns what the walk saw, with CTE names subtracted.
+/// Walks the statements and returns what the walk saw, with CTE names resolved in
+/// scope.
 ///
-/// **The CTE subtraction is not scope-aware.** `docs/security.md` section 5.1
-/// requires that CTE names and subquery aliases are not `ObjectRef` values, and this
-/// analyzer implements it by dropping every *unqualified* relation whose folded name
-/// equals a folded CTE alias anywhere in the input. A query that declares a CTE named
-/// `orders` and also reads a real table `orders` in a different scope therefore loses
-/// the real reference. That errs toward reporting fewer objects, which weakens the
-/// allowlist and not the boundary: ADR-0023 makes the role's `GRANT SELECT` the read
-/// boundary, and the allowlist reduces attack surface.
+/// `docs/security.md` section 5.1 requires that CTE names and subquery aliases are not
+/// `ObjectRef` values. This analyzer meets that by tracking, at every point in the
+/// walk, which aliases the server would actually resolve there (`scope.rs`): a name is
+/// omitted only where it resolves to a CTE visible at the point it was written. A
+/// non-recursive body does not see its own alias, so `WITH orders AS (SELECT * FROM
+/// orders)` keeps `orders` as a real relation; a subquery's alias is invisible outside
+/// it, so a CTE named `secrets` inside an `EXISTS` no longer hides the real `secrets`
+/// read elsewhere; and `WITH RECURSIVE` makes every alias of the list visible to every
+/// body, so a forward reference among recursive siblings is still the CTE. The global
+/// subtraction this replaced dropped every homonym anywhere in the statement; that is
+/// gone.
 ///
 /// The folding *is* accurate, unlike `warden-mysql`'s case-insensitive comparison:
 /// PostgreSQL's rule is fixed, so `WITH "Report" AS (...) SELECT * FROM report` keeps
@@ -432,15 +456,10 @@ pub(crate) fn collect(statements: &[Statement]) -> Evidence {
         evidence.flag(RiskFlag::DataModifyingCte);
     }
 
-    let aliases = std::mem::take(&mut evidence.cte_aliases);
-    evidence.objects.retain(|object| {
-        let unqualified = object.catalog.is_none() && object.schema.is_none();
-        let is_cte = aliases
-            .iter()
-            .any(|alias| folded(alias) == folded(&object.name));
-        !(unqualified && is_cte)
-    });
-    evidence.cte_aliases = aliases;
+    if std::mem::take(&mut evidence.scopes).finish().is_err() {
+        evidence.flag(RiskFlag::UnknownConstruct);
+    }
+
     evidence
 }
 
@@ -489,7 +508,7 @@ mod tests {
     }
 
     #[test]
-    fn cte_subtraction_folds_each_side_by_its_own_quoting() {
+    fn cte_resolution_folds_each_side_by_its_own_quoting() {
         // An unquoted alias folds, so a differently cased reference is the CTE.
         assert_eq!(
             names(&evidence(

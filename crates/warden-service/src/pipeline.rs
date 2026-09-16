@@ -27,8 +27,10 @@ use std::time::Duration;
 
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::Instrument as _;
 use warden_core::analysis::StatementKind;
+use warden_core::connection::ConnectionName;
 use warden_core::context::RequestContext;
 use warden_core::error::{PublicError as _, PublicErrorCode};
 use warden_core::explain::QueryPlan;
@@ -37,8 +39,8 @@ use warden_core::result::ResultSet;
 use warden_policy::{AuthorizedQuery, PolicyEngine, PolicyRejection};
 use warden_ports::{
     AnalyzeError, AuditAttempt, AuditError, AuditOperation, AuditOutcome, AuditOutcomeEvent,
-    AuditSink, ConnectionError, ConnectionRegistry, ConnectionRuntime, ExecuteError, ExplainError,
-    QueryPermit,
+    AuditRejectionStage, AuditSink, ConnectionError, ConnectionRegistry, ConnectionRuntime,
+    ExecuteError, ExplainError, QueryPermit,
 };
 
 use crate::audit::{self, StatementFacts};
@@ -65,6 +67,8 @@ pub(crate) struct ServiceCore {
     audit: Arc<dyn AuditSink>,
     redactor: Arc<Redactor>,
     shutdown: CancellationToken,
+    /// Where every detached outcome write is spawned, so a drain can wait for it.
+    tasks: TaskTracker,
 }
 
 /// Prints only non-secret configuration state.
@@ -135,6 +139,7 @@ impl ServiceCore {
         audit: Arc<dyn AuditSink>,
         redactor: Arc<Redactor>,
         shutdown: CancellationToken,
+        tasks: TaskTracker,
     ) -> Self {
         Self {
             registry,
@@ -142,6 +147,7 @@ impl ServiceCore {
             audit,
             redactor,
             shutdown,
+            tasks,
         }
     }
 
@@ -165,12 +171,30 @@ impl ServiceCore {
         self.engine.as_ref()
     }
 
+    /// The task tracker, for the schema service's own outcome guards.
+    pub(crate) fn tasks(&self) -> &TaskTracker {
+        &self.tasks
+    }
+
     /// A token that cancels when the process shuts down.
     ///
     /// A child token, never the parent: cancelling one request must not cancel the
     /// others, while a shutdown still reaches every one of them.
     pub(crate) fn child_token(&self) -> CancellationToken {
         self.shutdown.child_token()
+    }
+
+    /// Records a refusal that happened in this layer before any attempt existed.
+    pub(crate) async fn reject(
+        &self,
+        context: &RequestContext,
+        operation: AuditOperation,
+        stage: AuditRejectionStage,
+        connection: Option<ConnectionName>,
+        error_code: PublicErrorCode,
+    ) {
+        let event = audit::rejection(context, operation, stage, connection, error_code);
+        audit::record_rejection(self.audit.as_ref(), &event).await;
     }
 
     /// Resolve, analyse, authorise, and build the attempt — in ADR-0022's order.
@@ -188,10 +212,24 @@ impl ServiceCore {
         request: QueryRequest,
         operation: AuditOperation,
     ) -> Result<Preflight, PreflightError> {
-        let runtime = {
+        let resolved = {
             let _entered = tracing::debug_span!("connection.resolve").entered();
             self.registry.get(request.connection())
-        }?;
+        };
+        let runtime = match resolved {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                self.reject(
+                    context,
+                    operation,
+                    AuditRejectionStage::ConnectionResolution,
+                    Some(request.connection().clone()),
+                    error.public_code(),
+                )
+                .await;
+                return Err(error.into());
+            }
+        };
 
         let analysis_result = {
             let _entered = tracing::debug_span!("sql.analyze").entered();
@@ -284,6 +322,7 @@ impl ServiceCore {
             authorized,
             self.shutdown.child_token(),
             outcome_parent,
+            self.tasks.clone(),
         )
         .await
     }
@@ -392,11 +431,12 @@ impl<'a> ExecutionGate<'a> {
         query: AuthorizedQuery,
         cancel: CancellationToken,
         outcome_parent: tracing::Span,
+        tasks: TaskTracker,
     ) -> Result<(Self, audit::OutcomeGuard), GateError> {
         audit::record_attempt(sink.as_ref(), attempt)
             .await
             .map_err(GateError::Audit)?;
-        let guard = audit::OutcomeGuard::arm(sink, attempt.id, outcome_parent);
+        let guard = audit::OutcomeGuard::arm(sink, attempt.id, outcome_parent, tasks);
         let queued_at = Instant::now();
         let span = tracing::debug_span!("concurrency.acquire");
         let permit = match runtime.acquire_query_permit().instrument(span).await {
@@ -493,6 +533,7 @@ mod tests {
             testing::authorized(runtime),
             cancel,
             tracing::Span::none(),
+            TaskTracker::new(),
         )
         .await
         .unwrap()
@@ -506,6 +547,7 @@ mod tests {
             testing::authorized(runtime),
             CancellationToken::new(),
             tracing::Span::none(),
+            TaskTracker::new(),
         )
         .await
         .unwrap()
@@ -534,6 +576,7 @@ mod tests {
             testing::authorized(&runtime),
             CancellationToken::new(),
             tracing::Span::none(),
+            TaskTracker::new(),
         )
         .await
         .unwrap();
@@ -561,6 +604,7 @@ mod tests {
             testing::authorized(&runtime),
             CancellationToken::new(),
             tracing::Span::none(),
+            TaskTracker::new(),
         )
         .await
         .unwrap_err();
@@ -591,6 +635,7 @@ mod tests {
             testing::authorized(&runtime),
             CancellationToken::new(),
             tracing::Span::none(),
+            TaskTracker::new(),
         )
         .await
         .unwrap();
@@ -601,6 +646,7 @@ mod tests {
             testing::authorized(&runtime),
             CancellationToken::new(),
             tracing::Span::none(),
+            TaskTracker::new(),
         )
         .await
         .unwrap_err();
@@ -841,6 +887,7 @@ mod tests {
             testing::authorized(&runtime),
             cancel.clone(),
             tracing::Span::none(),
+            TaskTracker::new(),
         ));
         tokio::select! {
             result = &mut waiting => panic!("permit acquired while held: {result:?}"),
@@ -883,6 +930,7 @@ mod tests {
             testing::authorized(&runtime),
             cancel.clone(),
             tracing::Span::none(),
+            TaskTracker::new(),
         ));
         tokio::select! {
             result = &mut waiting => panic!("permit acquired while held: {result:?}"),

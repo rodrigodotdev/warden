@@ -12,12 +12,14 @@
 // editing happens not to use is not dead code.
 #![allow(dead_code)]
 
+use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::time::{Instant, sleep, sleep_until};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use warden_core::analysis::{
     ObjectKind, ObjectRef, QueryAnalysis, QueryAnalysisParts, SqlIdentifier, StatementKind,
 };
@@ -37,15 +39,16 @@ use warden_policy::{
 };
 use warden_ports::{
     AnalyzeError, AuditAttempt, AuditError, AuditEventId, AuditOperation, AuditOutcomeEvent,
-    AuditSink, ConnectionRegistry, ConnectionRuntime, ConnectionRuntimeParts, ExecuteError,
-    ExplainError, Explainer, QueryAnalyzer, QueryExecutor, QueryPermit, SchemaError,
+    AuditRejection, AuditSink, ConnectionRegistry, ConnectionRuntime, ConnectionRuntimeParts,
+    ExecuteError, ExplainError, Explainer, QueryAnalyzer, QueryExecutor, QueryPermit, SchemaError,
     SchemaInspector,
 };
 
+use crate::error::QueryServiceError;
 use crate::explain::ExplainService;
 use crate::query::QueryService;
 use crate::schema::SchemaService;
-use crate::{RedactionSettings, Redactor, StaticConnectionRegistry};
+use crate::{RedactionSettings, Redactor, ServiceParts, Services, StaticConnectionRegistry};
 pub(crate) use warden_testing::{capabilities, connection, parts, request_context, result_set};
 
 /// The statement every fixture uses.
@@ -673,12 +676,15 @@ pub(crate) enum FakeAuditEvent {
     Attempt(AuditAttempt),
     /// An outcome write that was issued, including a write that then failed.
     Outcome(AuditOutcomeEvent),
+    /// A rejection write that succeeded.
+    Rejection(AuditRejection),
 }
 
 #[derive(Debug, Default)]
 struct FakeAuditRecords {
     attempts: Vec<AuditAttempt>,
     outcomes: Vec<AuditOutcomeEvent>,
+    rejections: Vec<AuditRejection>,
     history: Vec<FakeAuditEvent>,
 }
 
@@ -725,6 +731,10 @@ impl FakeAuditSink {
     pub(crate) fn outcomes(&self) -> Vec<AuditOutcomeEvent> {
         self.records.lock().unwrap().outcomes.clone()
     }
+    /// Returns recorded rejection events.
+    pub(crate) fn rejections(&self) -> Vec<AuditRejection> {
+        self.records.lock().unwrap().rejections.clone()
+    }
     /// Returns every recorded phase in the order the sink observed it.
     pub(crate) fn history(&self) -> Vec<FakeAuditEvent> {
         self.records.lock().unwrap().history.clone()
@@ -765,6 +775,20 @@ impl AuditSink for FakeAuditSink {
             if self.broken_outcomes {
                 return Err(Self::failure());
             }
+            Ok(())
+        })
+    }
+    fn record_rejection<'a>(
+        &'a self,
+        event: &'a AuditRejection,
+    ) -> warden_ports::BoxFuture<'a, Result<(), AuditError>> {
+        Box::pin(async move {
+            sleep(self.duration).await;
+            let mut records = self.records.lock().unwrap();
+            records.rejections.push(event.clone());
+            records
+                .history
+                .push(FakeAuditEvent::Rejection(event.clone()));
             Ok(())
         })
     }
@@ -914,6 +938,8 @@ pub(crate) struct ServiceFakes {
     pub(crate) redactor: Arc<Redactor>,
     /// Root shutdown signal.
     pub(crate) shutdown: CancellationToken,
+    /// The tracker every detached outcome write is spawned on.
+    pub(crate) tasks: TaskTracker,
 }
 
 impl Default for ServiceFakes {
@@ -928,6 +954,7 @@ impl Default for ServiceFakes {
             audit: Arc::new(FakeAuditSink::new()),
             redactor: redactor(&[]),
             shutdown: CancellationToken::new(),
+            tasks: TaskTracker::new(),
         }
     }
 }
@@ -950,6 +977,7 @@ pub(crate) fn query_service(fakes: ServiceFakes) -> QueryService {
         fakes.audit,
         fakes.redactor,
         fakes.shutdown,
+        fakes.tasks,
     )
 }
 
@@ -971,6 +999,7 @@ pub(crate) fn explain_service(fakes: ServiceFakes) -> ExplainService {
         fakes.audit,
         fakes.redactor,
         fakes.shutdown,
+        fakes.tasks,
     )
 }
 
@@ -989,6 +1018,7 @@ pub(crate) fn schema_service(fakes: ServiceFakes) -> SchemaService {
         fakes.audit,
         fakes.redactor,
         fakes.shutdown,
+        fakes.tasks,
     )
 }
 
@@ -1011,6 +1041,7 @@ pub(crate) async fn saturated_query_service() -> (QueryService, Arc<FakeAuditSin
         Arc::clone(&sink) as Arc<dyn AuditSink>,
         redactor(&[]),
         CancellationToken::new(),
+        TaskTracker::new(),
     );
     (service, sink, held)
 }
@@ -1035,8 +1066,64 @@ pub(crate) async fn saturated_explain_service() -> (ExplainService, Arc<FakeAudi
         Arc::clone(&sink) as Arc<dyn AuditSink>,
         redactor(&[]),
         CancellationToken::new(),
+        TaskTracker::new(),
     );
     (service, sink, held)
+}
+
+/// Builds the full `Services` over one MySQL connection with a single query slot,
+/// recording through `sink`.
+///
+/// One slot, so a test can hold the permit and queue a second request behind it —
+/// which is what `Services::drain` has to wake.
+pub(crate) fn services_with_sink(sink: FakeAuditSink) -> (Arc<Services>, Arc<FakeAuditSink>) {
+    let sink = Arc::new(sink);
+    let mut parts = FakeParts::new(Dialect::MySql);
+    parts.limits = ExecutionLimits {
+        max_concurrent_queries: 1,
+        ..ExecutionLimits::default()
+    };
+    let registry: Arc<dyn ConnectionRegistry> =
+        Arc::new(StaticConnectionRegistry::new(vec![Arc::new(runtime_from(parts))]).unwrap());
+    let services = Services::new(ServiceParts {
+        registry,
+        engine: engine(),
+        audit: Arc::clone(&sink) as Arc<dyn AuditSink>,
+        redaction: RedactionSettings::default(),
+        shutdown: CancellationToken::new(),
+    })
+    .unwrap();
+    (Arc::new(services), sink)
+}
+
+/// Takes the fixture connection's only permit, then drives a query request up to
+/// the point where it is waiting for that permit.
+///
+/// The request is returned still pending, with its attempt on record and no outcome
+/// yet: exactly the state a request is in when a shutdown finds it in the queue.
+pub(crate) async fn hold_one_permit_and_queue_a_request(
+    services: &Services,
+) -> (
+    QueryPermit,
+    impl Future<Output = Result<ResultSet, QueryServiceError>> + '_,
+) {
+    let runtime = services
+        .registry()
+        .get(&"production-db".parse().unwrap())
+        .unwrap();
+    let held = runtime.acquire_query_permit().await.unwrap();
+    let mut queued = Box::pin(async move {
+        let context = request_context();
+        services.query().execute(&context, request()).await
+    });
+    // A timer rather than `yield_now`: the sink's own zero-length `sleep` needs the
+    // time driver to turn before the request reaches the permit. Instant under paused
+    // time, and one millisecond otherwise.
+    tokio::select! {
+        result = &mut queued => panic!("the request did not queue: {result:?}"),
+        () = sleep(Duration::from_millis(1)) => {}
+    }
+    (held, queued)
 }
 
 /// Keeps every callsite's cached interest dynamic for the rest of this process.

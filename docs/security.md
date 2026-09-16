@@ -98,6 +98,30 @@ own unsafe-function set while preserving safe reporting functions. RLS restricts
 within a granted table; grants remain the boundary for whether the role can read that
 table or a granted view at all.
 
+PostgreSQL also grants `EXECUTE` on every function to `PUBLIC` by default, so the
+Warden role can call any user function unless that default is revoked. Revoke it per
+schema and for future functions, then grant `EXECUTE` back to the application roles
+that need it:
+
+```sql
+REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA app FROM PUBLIC;
+ALTER DEFAULT PRIVILEGES IN SCHEMA app REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC;
+```
+
+This is what stops a domain `CHECK`, a `CREATE CAST … WITH FUNCTION`, or a function
+that shadows a built-in from running code on an agent's behalf: all of them execute as
+the caller. Warden verifies the last case itself at startup — a function the role can
+execute, in a schema on the connection's `search_path`, named like a built-in the
+analyzer trusts, fails the connection with the offending names (ADR-0053). That check
+excludes functions owned by an extension (`citext`, `hstore`, PostGIS, `pg_trgm`, …):
+those are installed by a superuser through the trusted-extension mechanism, not by the
+adversary the check targets, and several extensions legitimately overload names the
+analyzer trusts (`citext` alone adds `replace`, `strpos`, `min`/`max`, …). `warden
+role` prints both statements above; because the `REVOKE` is schema-wide rather than
+author-scoped, it also withdraws `PUBLIC`'s `EXECUTE` on any extension function
+installed in that schema, so re-grant `EXECUTE` to the application roles that need
+those functions, or install extensions in a schema of their own.
+
 ## 5. Real read-scope boundary
 
 **The table allowlist does not bound what the agent can read.** It operates on AST
@@ -112,17 +136,15 @@ Seven structural bypasses exist:
 4. **Identifier folding.** PostgreSQL folds unquoted identifiers to lowercase, so a
    deny-list entry named `Users` would never match. MySQL case sensitivity depends on
    `lower_case_table_names` and the file system.
-5. **CTE-name shadowing (both analyzers).** `visit::collect` subtracts every
-   unqualified relation whose name matches a declared CTE alias anywhere in the
-   statement, not only within that alias's own scope. `WITH orders AS (SELECT * FROM
-   orders) SELECT * FROM orders` self-references the real base table — MySQL resolves
-   a non-`RECURSIVE` CTE's own body to a table of that name — but the analyzer drops
-   it along with the alias, so `TableAllowDenyPolicy` never evaluates it.
-
-   The PostgreSQL analyzer folds each side by its own quoting rather than comparing
-   case-insensitively, which is accurate for that dialect, but it is equally
-   scope-blind: `WITH orders AS (SELECT * FROM orders) SELECT * FROM orders` loses
-   the real base table there too.
+5. **CTE-name shadowing (both analyzers).** Closed in Milestone 13.2. Each
+   analyzer's `scope.rs` tracks, at every point in the walk, which CTE aliases the
+   server would actually resolve there, so `WITH orders AS (SELECT * FROM orders)
+   SELECT * FROM orders` now keeps `orders` as the real base table — a
+   non-`RECURSIVE` body cannot see its own alias — and `TableAllowDenyPolicy`
+   evaluates it. The dialects differ on what `RECURSIVE` exposes: PostgreSQL makes
+   every alias of the `WITH` visible to every body, including one declared later;
+   MySQL 8.4 makes a body see itself and the siblings declared before it, never one
+   declared after.
 
 6. **`INSERT`, `COPY`, and DDL target relations (both analyzers).** `INSERT INTO t`,
    `COPY t FROM/TO`, and every DDL target (`CREATE TABLE`, `ALTER TABLE`, `DROP`,
@@ -134,12 +156,7 @@ Seven structural bypasses exist:
    or `RiskFlag::Ddl`, and policy denies it on that evidence alone. It becomes
    load-bearing the moment a write-permitting profile exists, at which point
    `TableAllowDenyPolicy` would not see the relation being written.
-7. **User-defined casts on PostgreSQL.** `'x'::evil_type` and
-   `CAST('x' AS evil_type)` reach `Expr::Cast`, never `Expr::Function`, so the
-   function classification in section 7.3 never sees them. `CREATE CAST ... WITH
-   FUNCTION` and a type's input function both run arbitrary code. This does not
-   need a wildcard-to-`Unknown` `Expr` arm to close: creating the cast, or the type
-   it casts to, is DDL, and DDL is denied outright.
+7. **User-defined casts on PostgreSQL.** `'x'::evil_type` and `CAST('x' AS evil_type)` reach `Expr::Cast`, never `Expr::Function`, so function classification never sees them. `CREATE CAST ... WITH FUNCTION` and a domain's `CHECK` run code — as the **caller**. Denying DDL does not close this: both objects can predate the session. What closes it is the role contract of section 4.2: with `EXECUTE` revoked from `PUBLIC`, the cast fails with `insufficient_privilege` instead of running. A static allowlist of cast targets was considered and rejected (ADR-0053): it would refuse enums, `citext`, `vector`, ranges and every extension type — none of which runs user SQL — while adding nothing the grant does not provide.
 
 **Design consequence:** the dedicated role's `GRANT SELECT` bounds read scope. The
 allowlist remains useful for reducing attack surface and improving error messages,
@@ -165,18 +182,24 @@ but public material does not present it as a security boundary.
   cannot build an `ObjectRef`.
 
   **Shipped in Milestone 5.** `warden-postgres` applies the same rule to its own CTE
-  subtraction: an unquoted alias folds to lowercase, a quoted one does not, so
+  resolution: an unquoted alias folds to lowercase, a quoted one does not, so
   `WITH "Report" AS (…) SELECT * FROM report` correctly reports `report` as a base
   table. It also refuses to describe `SELECT * FROM ONLY t`, which sqlparser 0.62
   parses as a relation named `ONLY`; recording that name would make the object rules
   evaluate a relation that does not exist.
-- **CTE names and subquery aliases are not `ObjectRef`.** The shipped MySQL analyzer
-  does not track scope to distinguish them precisely; it approximates by dropping any
-  unqualified relation whose name matches a declared CTE alias anywhere in the
-  statement. That correctly removes the alias from `WITH x AS (SELECT * FROM secrets)
-  SELECT * FROM x`, but it also removes a real relation that happens to share a CTE's
-  name (bypass 5, above). Precise scope resolution needs a name resolver the analyzer
-  does not have.
+- **CTE names and subquery aliases are not `ObjectRef`.** A CTE alias must never be
+  reported as if it were a real relation, and a real relation that happens to share a
+  CTE's name must never be dropped for it (bypass 5, above). Getting both right needs
+  scope: which aliases the server would actually resolve at the point a name appears,
+  not merely whether that name matches an alias declared anywhere in the statement.
+
+  **Resolved in scope since Milestone 13.2, for both analyzers:** a name is omitted
+  only where the server would resolve it to a CTE — a non-recursive body does not see
+  its own alias, a subquery's alias is invisible outside it, and `RECURSIVE` makes
+  more of the list visible to a body (every alias on PostgreSQL, itself and earlier
+  siblings only on MySQL 8.4). The global subtraction that dropped every homonym
+  anywhere in the statement, and let `WITH secrets AS (SELECT 1)` inside a subquery
+  hide the real `secrets`, is gone.
 
 ### 5.2 Object policy applies to every tool
 
@@ -376,7 +399,9 @@ nextval  setval  pg_notify
 unverified user-defined functions
 ```
 
-Function classification is conservative by definition.
+Function classification is conservative by definition. Trusting an unqualified name
+(ADR-0029) is conditioned on the startup preflight of ADR-0053; a function created
+after startup by a privileged role is outside that proof.
 
 **How each one is detected (Milestone 5).** Data-modifying CTEs, locking clauses,
 `SELECT INTO`, `COPY`, `CALL`, and every function above come from the AST.
@@ -495,7 +520,11 @@ query_parse_error           query_normalization_error
 query_rejected              query_execution_error
 server_busy                 schema_lookup_error
 explain_error               internal_error
+invalid_arguments
 ```
+
+`invalid_arguments`: the arguments of a tool call did not match its input schema; the
+schema field names are the only detail an agent needs, and it already has the schema.
 
 **Shipped in Milestone 12.** `crates/warden-mcp/src/error.rs` is the single boundary:
 every failed tool call in `warden-mcp` leaves through its `failure` function, and so does
@@ -514,18 +543,16 @@ for `{error}`-style interpolation; it is a name-based heuristic backstop and its
 comment says so, because the structural guarantee is `failure`'s signature rather than
 anything a syntactic scan can prove.
 
-One documented gap: an argument that fails `serde` deserialization is refused by rmcp
-before Warden sees it, and the agent reads rmcp's own wording ("failed to deserialize
-parameters: missing field `sql`") rather than a `PublicErrorCode`. rmcp forwards the whole
-`serde` message after its fixed prefix, so that text can name a field from Warden's own
-input schema, a field name the agent invented, or the agent's own submitted value
-(`invalid type: string "oops", expected a sequence`). None of it is new to the agent: the
-schema is already public in the tool-schema snapshot, and the rest is what the agent just
-sent. The refusal fires before any Warden code runs, so no database content, driver
-message, or DSN can be in it, and this section's prohibitions hold. Intercepting it would
-mean every tool taking a raw `Value` and hand-rolling deserialization; open question 25
-carries it, and `crates/warden-mcp/tests/protocol.rs` pins the current framing with a
-comment saying it pins the SDK's behaviour, not a Warden invariant.
+**Milestone 13.3 closed the deserialization gap (ADR-0054, resolves open question 25).**
+The four database tools take their arguments as a raw `JsonObject` with an explicit
+`input_schema` derived from the same typed DTO the tool already advertised, deserialize
+them in `warden-mcp`'s own `input::parse`, and answer a failure with `invalid_arguments`
+and the fixed sentence above — never the `serde` message, so neither the deserializer's
+wording nor the agent's own submitted value travels back to it. The refusal is recorded
+as an audit rejection (section 11.2) at `AuditRejectionStage::Input` before `Services`
+ever sees the call; the connection name is recorded only when it validated. The schema
+an agent reads does not change. An oversized frame is still refused before identity or a
+public code exists; the only trace is a fixed transport diagnostic.
 
 ## 11. Auditing
 
@@ -604,6 +631,47 @@ to a tool response by accident. `crates/warden-audit/src/record.rs` projects the
 into `warden.audit.v1` JSON Lines; `crates/warden-audit/src/tracing_sink.rs` emits its tracing form.
 Internal denial details are absent from both. Operations section 10.2 enumerates
 the envelope and payload fields, including their different denial-code encoding.
+
+A call refused before any attempt existed — bad arguments, an unknown connection, a
+missing capability — gets a third kind of record instead of none:
+
+```rust
+pub struct AuditRejection {
+    pub id: AuditEventId,
+    pub timestamp: OffsetDateTime,
+    pub request_id: RequestId,
+    pub principal: PrincipalId,
+    pub client: ClientName,
+    pub operation: AuditOperation,
+    pub stage: AuditRejectionStage,
+    pub connection: Option<ConnectionName>,   // null when the name did not validate.
+    pub error_code: PublicErrorCode,
+}
+
+pub enum AuditRejectionStage {
+    Input, ConnectionResolution, Capability,
+}
+```
+
+A rejection is terminal and self-contained: it is the only record a refused call
+leaves behind, no outcome ever follows it, and a call that produced an attempt never
+produces one. It carries no `dialect`, no `environment`, no `statement_kind`, and no
+`fingerprint` — none of the four was resolved before the refusal, and a record that
+invented one would describe execution that never happened (ADR-0054). `AuditMode`
+has no effect on it: there is no statement to redact. `connection` is `null` when the
+name itself did not validate, and the validated-but-unknown name otherwise, so an
+auditor can tell a malformed argument from a name nobody configured. Like
+`AuditAttempt`, it derives no `Serialize`; `crates/warden-audit/src/record.rs`
+projects the same allowlisted fields both sinks write, and a durable sink writes it
+as it writes an attempt, because its failure is an alarm — nothing was going to run
+either way.
+
+`warden_service::audit::record_rejection` is the only writer: `warden-mcp`'s four
+database tools call `Services::reject_request` at `AuditRejectionStage::Input` when
+their own argument deserialization fails, and the service calls the same writer
+internally at `ConnectionResolution` and `Capability`, so a refusal at any stage
+reaches the sink through one function and no adapter writes to `AuditSink` itself
+(ADR-0054).
 
 ### 11.3 SQL in audits
 

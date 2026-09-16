@@ -56,6 +56,10 @@ supersedes it; never change it silently.
 | [0049](0049-shared-test-fixtures-live-in-a-dev-only-crate.md) | Shared test fixtures live in a dev-only crate |
 | [0050](0050-mit-license.md) | MIT is the project license |
 | [0051](0051-the-handshake-answers-a-legacy-version.md) | An `initialize` handshake is answered with a legacy version |
+| [0052](0052-input-and-decode-budgets.md) | Input and decode budgets are separate from the response budget |
+| [0053](0053-shadowed-builtins-fail-startup.md) | A shadowed built-in fails the connection at startup |
+| [0054](0054-audit-rejections-before-resolution.md) | A refusal before the attempt is audited as a rejection |
+| [0055](0055-drain-tracked-work-before-runtime-exit.md) | Tracked work is drained under one deadline before the runtime exits |
 
 ADRs 0021–0026 are new in v0.3. ADR-0002 supersedes the v0.2 MSRV definition;
 ADR-0022 supersedes the single-event audit model; ADR-0023 resolves v0.2 open
