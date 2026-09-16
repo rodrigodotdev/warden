@@ -1324,6 +1324,14 @@ Publishing by hand is never the answer — a hand-published tarball carries no p
 attestation, which is the property the whole pipeline exists to give. If the job fails
 because the token expired, replace `NPM_TOKEN` and re-run.
 
+**npm finishes a publish after `npm publish` returns.** The registry now processes a
+publish asynchronously ("Your package is being processed and may take a few minutes to
+become available") and refuses a write against a version it is still processing with
+`422 Unprocessable Entity`. The v0.3.0 release published all seven packages and then
+failed on `npm deprecate` half a second later; the same command succeeded unchanged on
+re-run. The step now retries for up to three minutes, which the idempotency above makes
+safe.
+
 **Every published file carries signed build provenance.** `SHA256SUMS` is a subject
 too, so the list of hashes cannot be swapped independently of what it lists. Verifying
 a download takes both steps:
