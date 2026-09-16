@@ -253,8 +253,12 @@ mise install
 mise run ci
 ```
 
-`mise run ci` runs the local checks, including formatting, Clippy, workspace tests,
-and independent crate builds. To run database integration tests with Docker:
+`mise install` also points this clone's `core.hooksPath` at `.githooks`, so
+[committed](https://github.com/crate-ci/committed) checks every commit message against
+`committed.toml` as you write it — Conventional Commits, the same check CI runs on a
+pull request. `mise run ci` runs the local checks, including formatting, Clippy,
+workspace tests, independent crate builds, and the branch's commit messages. To run
+database integration tests with Docker:
 
 ```bash
 mise run test:docker

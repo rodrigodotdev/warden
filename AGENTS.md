@@ -22,6 +22,13 @@ prevails.
    that uses a feature it never declared still compiles.
 7. Explicitly list **every deviation** from the specification in each milestone
    report.
+8. Commit messages follow Conventional Commits as `committed.toml` configures it: one
+   of its listed types (`feat`, `fix`, `docs`, `test`, `refactor`, `perf`, `build`,
+   `ci`, `chore`, `revert`), a subject of at most 72 characters with no trailing
+   period, body lines of at most 80. `mise install` wires `.githooks/commit-msg` so
+   `committed` checks each message as it is written, `mise run ci` checks the branch,
+   and ci.yml's "commit convention" job runs the same check on the pull request. A
+   plan that prescribes commit subjects writes them in this form.
 
 ## Boundaries enforced by the compiler
 
