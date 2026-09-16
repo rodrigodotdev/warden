@@ -1322,7 +1322,7 @@ a download takes both steps:
 
 ```bash
 sha256sum --check --ignore-missing SHA256SUMS
-gh attestation verify warden-v0.2.0-x86_64-unknown-linux-gnu.tar.gz \
+gh attestation verify warden-v0.3.0-x86_64-unknown-linux-gnu.tar.gz \
   --repo rodrigodotdev/warden
 ```
 

@@ -11,6 +11,20 @@ implementation details before `1.0` and change without notice (`SPEC.md` section
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [0.3.0] - 2026-09-15
+
+A hardening release. Warden now bounds the size of what it reads before it parses or
+decodes it, refuses to start a PostgreSQL connection whose role could make a trusted
+built-in resolve to somebody else's function, and audits a tool call it refuses before
+any attempt exists. Neither the MCP tool schemas nor the configuration format changed,
+so a 0.2.0 deployment upgrades in place; two things are worth checking first. A
+PostgreSQL role that can execute a function named after a built-in the analyzer trusts
+now fails startup and `warden check` until that `EXECUTE` is revoked — the script
+`warden role` prints revokes it. And readers of the `warden.audit.v1` file must accept
+`rejection` as a third `event` value.
+
 ### Added
 
 - Audit `rejection` records for database-tool calls refused before an attempt exists:
@@ -158,6 +172,7 @@ These are documented deliberately, not oversights; `SPEC.md` section 7 and
 - A JSON document's integers above 2^53 reach a JavaScript client unquoted, and a
   PostgreSQL `time` of `24:00:00` reads back as `00:00:00`.
 
-[Unreleased]: https://github.com/rodrigodotdev/warden/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/rodrigodotdev/warden/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/rodrigodotdev/warden/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/rodrigodotdev/warden/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/rodrigodotdev/warden/releases/tag/v0.1.0
