@@ -1137,6 +1137,14 @@ ran `committed <base>..HEAD` against that, and `committed.toml` sets
 The job now checks out `github.event.pull_request.head.sha` and names both ends of the
 range explicitly.
 
+**The commit convention is checked before the pull request, not only by it.**
+`committed` was pinned in `mise.toml`, but no local task ran it and `mise run ci`
+called itself CI-equivalent without it, so twenty-one commits written to a plan whose
+suggested subjects had no Conventional type reached a pull request before anything
+objected. `mise install` now sets `core.hooksPath` to `.githooks`, whose `commit-msg`
+hook runs `committed --commit-file` on each message as it is written, and `mise run
+ci` runs `committed origin/main..HEAD`, the same range the job checks.
+
 Database integration tests run in a dedicated Docker job. CI denies warnings; do not
 force developers to deny warnings in every exploratory local command.
 

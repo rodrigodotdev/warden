@@ -27,6 +27,14 @@ taplo = "0.10.0"
 # docs/operations.md section 12.2.
 RUST_BACKTRACE = "1"
 
+[hooks]
+# `mise install` is the first command a clone runs (README.md), so it is also where
+# the repository's git hooks are wired in. `.githooks/commit-msg` runs committed on
+# every message — the same check as ci.yml's "commit convention" job — so a subject
+# CI would refuse is refused at `git commit`, not after the pull request is open.
+# Idempotent, and scoped to this repository's `.git/config`.
+postinstall = "git config core.hooksPath .githooks"
+
 [tasks.fmt]
 description = "Format Rust and TOML"
 run = ["cargo fmt --all", "taplo fmt"]
@@ -59,6 +67,14 @@ run = "cargo clippy --workspace --all-targets --all-features -- -D warnings"
 # the last part only when shellcheck is on PATH, which is why `[tools]` pins it.
 description = "Lint the GitHub Actions workflows"
 run = "actionlint -shellcheck shellcheck"
+
+[tasks.commits]
+# ci.yml's "commit convention" job runs committed over a pull request's commits, and
+# nothing here did, so twenty-one commits written to a plan whose subjects had no
+# Conventional type reached the pull request before anything objected. This is the
+# same range check: every commit on this branch that is not already on origin/main.
+description = "Check the branch's commit messages against committed.toml"
+run = "committed origin/main..HEAD"
 
 [tasks.test]
 description = "Run tests that do not require Docker"
@@ -108,6 +124,7 @@ depends = [
   "check:standalone",
   "lint",
   "lint:actions",
+  "commits",
   "doc",
   "test",
   "deny",

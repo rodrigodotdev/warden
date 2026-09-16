@@ -1,0 +1,24 @@
+#!/usr/bin/env sh
+# Checks the message being committed against committed.toml, which is the check
+# ci.yml's "commit convention" job runs over every commit of a pull request. Running
+# it here means a message that CI would refuse never gets written: the author sees
+# the error while the change is still in the editor, not after the branch is up.
+#
+# `mise install` wires this directory in through `core.hooksPath` (see mise.toml).
+# The check is deliberately identical to CI's, so a local merge commit or a `fixup!`
+# fails here exactly as it would there; `git commit --no-verify` is the escape for a
+# fixup that will be squashed before it is pushed.
+set -eu
+
+if command -v committed >/dev/null 2>&1; then
+  exec committed --commit-file "$1"
+fi
+
+# Editors and agents often run git outside an activated mise shell, where the
+# pinned committed binary is not on PATH; ask mise for it before giving up.
+if command -v mise >/dev/null 2>&1; then
+  exec mise exec -- committed --commit-file "$1"
+fi
+
+echo "commit-msg: committed is not installed; run \`mise install\` (see README.md)" >&2
+exit 1
