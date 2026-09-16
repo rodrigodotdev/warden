@@ -405,10 +405,25 @@ jobs:
       # name to use. Re-running it every release keeps the newest version marked too,
       # since `npm deprecate` applies to the versions matching the range and a fresh
       # publish is not deprecated by an earlier call.
+      #
+      # npm now finishes a publish asynchronously ("Your package is being processed")
+      # and answers a write against a version still being processed with 422. The
+      # v0.3.0 run hit that half a second after `+ warden-sql-mcp@0.3.0`, and the same
+      # command succeeded unchanged on re-run. Retrying is safe because the write is
+      # idempotent: deprecating an already deprecated version rewrites the same text.
       - name: Signpost the alias
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          VERSION: ${{ needs.verify.outputs.version }}
         run: |
           set -euo pipefail
-          npm deprecate 'warden-sql-mcp@*' \
-            'This is an alias. Install warden-db-mcp; it is the same server.'
+          for attempt in 1 2 3 4 5 6; do
+            if npm deprecate 'warden-sql-mcp@*' \
+                'This is an alias. Install warden-db-mcp; it is the same server.'; then
+              exit 0
+            fi
+            echo "warden-sql-mcp@${VERSION} may still be processing; retry ${attempt}/6 in 30 s"
+            sleep 30
+          done
+          echo "could not deprecate warden-sql-mcp@${VERSION} after six attempts" >&2
+          exit 1
