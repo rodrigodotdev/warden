@@ -11,8 +11,10 @@
 //! A denied statement, a busy connection, and a truncated-too-large result are things the
 //! agent should read and act on — refine the query, retry shortly, narrow the projection.
 //! MCP carries those as a tool result with `is_error`, leaving JSON-RPC errors for
-//! protocol faults, which is what rmcp itself does for malformed arguments and an
-//! unsupported protocol version.
+//! protocol faults such as an unsupported protocol version. Malformed arguments are on
+//! the first side of that line: they are something the agent can fix and resend, so they
+//! come back in-band as `invalid_arguments` — and since the tools take their arguments
+//! raw, it is Warden that classifies them and audits the refusal, not rmcp (ADR-0054).
 //!
 //! # Why this result repeats itself and a successful one does not
 //!
