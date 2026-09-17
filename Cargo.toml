@@ -81,7 +81,7 @@ rmcp = { version = "3.1.3", default-features = false, features = [
 # Visit/VisitMut on every AST node, so an adapter's traversal is exhaustive by
 # construction and a bypass cannot hide in a variant nobody remembered to match
 # (docs/security.md section 7.1).
-sqlparser = { version = "0.62.0", features = ["visitor"] }
+sqlparser = { version = "0.63.0", features = ["visitor"] }
 
 # DSN parsing — ADR-0031. `warden-core` validates a connection string itself rather
 # than letting a driver's URL parser decide what a DSN may contain; these are the
